@@ -173,19 +173,18 @@ explicitly so the saving is documented, not incidental.
 
 ### Tasks
 
-- [ ] **Measure first** — establish the baseline before any refactor
-  - Add a small profiling script (e.g. `scripts/profile_memory.py`)
-    that runs `generate_people` at `n ∈ {200, 500, 1000}` with a
-    fixed `--chr-length-mb` and reports peak RSS via `tracemalloc`
-    or `resource.getrusage(RUSAGE_SELF).ru_maxrss`.
-  - Capture the per-site `list[str]` overhead specifically with
-    `pympler.asizeof` or equivalent, so we know the slice we're
-    targeting.
-  - Record the numbers (and the host they were measured on) in this
-    file under a "Baseline" subsection so future work can compare.
-  - **Decision gate:** if the targeted slice is <20% of total peak
-    RSS, stop — the refactor is not worth the tradeoffs above. Land
-    `sys.intern` instead and close the phase.
+- [x] **Measure first** — establish the baseline before any refactor
+  - `scripts/profile_memory.py` runs `simulate_cohort` for one `--n`
+    at a time and reports peak RSS via
+    `resource.getrusage(RUSAGE_SELF).ru_maxrss` plus the per-site
+    `gts: list[str]` overhead measured with `sys.getsizeof` and
+    string-id deduplication.
+  - Numbers recorded in the **Baseline** subsection below, taken on
+    `nigel-test2` (Linux x86_64, CPython 3.12.3) at
+    `--chr-length-mb 5.0`.
+  - **Decision gate result:** gts share is **60.0% / 79.6% / 86.7%**
+    at `n=200/500/1000` — far above the 20% threshold. Refactor
+    proceeds; `sys.intern` fallback not taken.
 - [ ] Replace `gts: list[str]` with a numpy uint8 representation
   - Today: every site dict carries a list of `"0|1"` strings of length
     `n_people`. At `n=500, n_sites=50_000` this is ~25M Python strings
@@ -236,13 +235,46 @@ explicitly so the saving is documented, not incidental.
   section); call out the realised (measured, not projected) RAM win
   in `README.md` Performance and `TUTORIAL.md` §9.
 
-### Baseline (to be filled in by the measure-first task)
+### Baseline (filled in by `scripts/profile_memory.py`)
 
-| n | n_sites | host | peak RSS | gts overhead | gts share |
-|---|---------|------|----------|--------------|-----------|
-| 200  | TBD | TBD | TBD | TBD | TBD |
-| 500  | TBD | TBD | TBD | TBD | TBD |
-| 1000 | TBD | TBD | TBD | TBD | TBD |
+Measured 2026-05-04 on `nigel-test2` (Linux 6.17.0-1011-azure x86_64,
+glibc 2.39, CPython 3.12.3) at `--chr-length-mb 5.0 --chromosomes 22
+--demo-model OutOfAfrica_3G09 --population CEU --seed 42`.
+
+| n | n_sites | sim_secs | peak RSS (MB) | gts overhead (MB) | gts share | unique GT strings |
+|---|--------:|---------:|--------------:|------------------:|----------:|------------------:|
+| 200  | 13,610 |  2.67 |   226.3 |   135.7 | **60.0%** |  2,722,000 |
+| 500  | 18,394 |  6.45 |   577.4 |   459.9 | **79.6%** |  9,197,000 |
+| 1000 | 23,837 | 14.62 | 1,385.8 | 1,201.6 | **86.7%** | 23,837,000 |
+
+Reproduce with:
+
+```bash
+.venv/bin/python synthetic_people/scripts/profile_memory.py --n 200  --chr-length-mb 5.0
+.venv/bin/python synthetic_people/scripts/profile_memory.py --n 500  --chr-length-mb 5.0
+.venv/bin/python synthetic_people/scripts/profile_memory.py --n 1000 --chr-length-mb 5.0
+```
+
+### Decision
+
+**Proceed with the refactor.** Gate was: refactor only if gts overhead
+≥20% of peak RSS at any of the three sample sizes. The realised
+share is **60% / 79.6% / 86.7%** — three to four times the gate, and
+*growing* with `n`. A finding from the measurement that should be
+called out:
+
+- **No interning.** `unique_gt_strings == n_sites × n` at all three
+  cohort sizes, exactly. The `f"{a}|{b}"` formatter creates a fresh
+  string object every call — CPython does not intern these. The
+  worst-case "≈50 B per string" projection from the original Phase 3
+  text is therefore the realised cost, not an upper bound.
+
+The refactor described in the next subsection is therefore expected
+to recover most of the gts overhead (substituting a packed
+`numpy.uint8` matrix at ≈1 byte per haplotype slot for what is
+currently ≈55 B per slot via PyObject + small-string overhead).
+Projected post-refactor gts share: well under 5% at every cohort
+size.
 
 ### After-refactor numbers (to be filled in by the re-measure task)
 
