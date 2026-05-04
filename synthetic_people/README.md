@@ -92,7 +92,8 @@ First run only: ClinVar is downloaded (~50 MB) into
 ```
 
 - `--n` — cohort size (number of person VCFs).
-- `--chromosomes` — comma-separated list (e.g. `19,20,21,22`).
+- `--chromosomes` — list, range, or both (e.g. `22`, `19,20,21,22`,
+  `1-22`, `1-3,5,19-22,X`). Ranges must be numeric and inclusive.
 - `--chr-length-mb` — simulated prefix per chromosome, 0 = full length.
 - `--demo-model` — stdpopsim model id; `none` falls back to constant-size
   Ne = 10 000 msprime draw.
@@ -792,7 +793,7 @@ Tracked in `IMPLEMENTATION_PLAN.md`:
 | `--error-rate` | [M9] Per-call probability of a GT flip (lightweight noise model) | `0.001` |
 | `--dropout-rate` | [M9] Per-call probability of a coverage dropout (`./.:0:0:0,0`) | `0.0005` |
 | `--art` | [M9, heavy] ART read simulation + `bcftools call`. Currently rejected; needs M11 reference FASTA | `False` |
-| `--chromosomes` | [coalescent] Comma-separated chroms | `22` |
+| `--chromosomes` | [coalescent] List, range, or mix (e.g. `22`, `19,20,21,22`, `1-22`, `1-3,5,19-22,X`) | `22` |
 | `--chr-length-mb` | [coalescent] Simulated prefix per chrom | `5.0` |
 | `--demo-model` | [coalescent] stdpopsim model id; `none` for uniform | `OutOfAfrica_3G09` |
 | `--population` | [coalescent] Sampling population | `CEU` |

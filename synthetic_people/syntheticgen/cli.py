@@ -69,6 +69,54 @@ from .truth import TruthBedWriter
 from .writer import write_person_vcf
 
 
+def parse_chromosomes(spec: str, build: str) -> list[str]:
+    """Parse a --chromosomes spec into an ordered, deduplicated list.
+
+    Accepts comma-separated tokens. Each token is either a single contig
+    (e.g. ``22``, ``X``) or a numeric range like ``1-10`` (inclusive).
+    Ranges only span autosomes; mix singletons with ranges freely:
+    ``1-3,5,19-22,X``.
+
+    Every resulting contig must exist in the chosen build's contig table.
+    """
+    contigs = BUILDS[build]["contigs"]
+    seen: set = set()
+    out: list = []
+    for raw in spec.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        if "-" in token and not token.startswith("-"):
+            lo_str, hi_str = token.split("-", 1)
+            lo_str, hi_str = lo_str.strip(), hi_str.strip()
+            if not (lo_str.isdigit() and hi_str.isdigit()):
+                raise ValueError(
+                    f"chromosome range {token!r} must be numeric "
+                    "(e.g. '1-22')"
+                )
+            lo, hi = int(lo_str), int(hi_str)
+            if lo > hi:
+                raise ValueError(
+                    f"chromosome range {token!r} is empty: "
+                    f"start {lo} > end {hi}"
+                )
+            members = [str(i) for i in range(lo, hi + 1)]
+        else:
+            members = [token]
+        for c in members:
+            if c not in contigs:
+                raise ValueError(
+                    f"unknown chromosome {c!r} for build {build}; "
+                    f"valid: {sorted(contigs)}"
+                )
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+    if not out:
+        raise ValueError("--chromosomes resolved to an empty list")
+    return out
+
+
 OPTIONAL_PYTHON_DEPS = [
     # These aren't used in M1 but will be required from M2+. `--check-deps`
     # reports their absence so a user can install ahead of time.
@@ -161,9 +209,10 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                         "demography — retained for comparison and "
                         "offline-only use.")
     p.add_argument("--chromosomes", default="22",
-                   help="[coalescent] Comma-separated chromosomes to "
-                        "simulate (e.g. '19,20,21,22'). Shorter list = "
-                        "faster run.")
+                   help="[coalescent] Chromosomes to simulate. Accepts a "
+                        "comma-separated list, numeric ranges, or both: "
+                        "'22', '19,20,21,22', '1-22', '1-3,5,19-22,X'. "
+                        "Shorter list = faster run.")
     p.add_argument("--chr-length-mb", type=float,
                    default=DEFAULT_CHR_LENGTH_MB,
                    help="[coalescent] Simulated prefix length per "
@@ -284,6 +333,11 @@ def main(argv: list[str] | None = None) -> int:
             "--dropout-rate) for now."
         )
 
+    try:
+        chromosomes = parse_chromosomes(args.chromosomes, args.build)
+    except ValueError as exc:
+        sys.exit(f"--chromosomes: {exc}")
+
     rng = random.Random(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -326,8 +380,6 @@ def main(argv: list[str] | None = None) -> int:
             rng,
         )
     elif args.admixture:
-        chromosomes = [c.strip() for c in args.chromosomes.split(",")
-                       if c.strip()]
         proportions = (args.eur_frac, args.sas_frac, args.afr_frac)
         print(
             f"Simulating UK admixed cohort: {args.n} people across "
@@ -344,8 +396,6 @@ def main(argv: list[str] | None = None) -> int:
             rng=rng, verbose=True,
         )
     else:
-        chromosomes = [c.strip() for c in args.chromosomes.split(",")
-                       if c.strip()]
         demo_model = None if args.demo_model.lower() == "none" \
             else args.demo_model
         print(
@@ -370,9 +420,6 @@ def main(argv: list[str] | None = None) -> int:
         "cosmic_injected": 0,
     }
     if not args.legacy_background:
-        chromosomes = [c.strip() for c in args.chromosomes.split(",")
-                       if c.strip()]
-
         # ClinVar annotation: catch any natural collision before injection
         # rewrites coordinates. With msprime simulating positions
         # 1..sim_length and ClinVar at real chromosome coordinates the
@@ -479,16 +526,14 @@ def main(argv: list[str] | None = None) -> int:
     # contig length (no sim window).
     if args.legacy_background:
         sv_chrom_span = max(
-            (BUILDS[args.build]["contigs"].get(c, 0)
-             for c in args.chromosomes.split(",") if c.strip()),
+            (BUILDS[args.build]["contigs"][c] for c in chromosomes),
             default=0,
         )
     else:
         sv_chrom_span = int(args.chr_length_mb * 1_000_000) \
             if args.chr_length_mb > 0 else max(
                 BUILDS[args.build]["contigs"].values())
-    sv_chromosomes = [c.strip() for c in args.chromosomes.split(",")
-                      if c.strip()]
+    sv_chromosomes = chromosomes
     sv_total = 0
 
     print(f"Writing {args.n} person VCFs into {args.output_dir}",
@@ -599,8 +644,7 @@ def main(argv: list[str] | None = None) -> int:
         "build": args.build,
         "n_people": args.n,
         "mode": mode,
-        "chromosomes": [c.strip() for c in args.chromosomes.split(",")
-                        if c.strip()],
+        "chromosomes": chromosomes,
         "seed": args.seed,
         "people": manifest_people,
     }

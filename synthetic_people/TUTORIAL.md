@@ -483,16 +483,34 @@ the empirical literature.
 
 ### 5.8 Multi-chromosome cohorts
 
-Pass a comma-separated chromosome list. Each chromosome runs as a
-separate `msprime` simulation, then the cohort sites are concatenated
-in genome order before per-person VCFs are written:
+Pass a comma-separated chromosome list, a numeric range, or a mix of
+both. Each chromosome runs as a separate `msprime` simulation, then the
+cohort sites are concatenated in genome order before per-person VCFs are
+written:
 
 ```bash
+# explicit list
 .venv/bin/python synthetic_people/generate_people.py \
     --n 30 --seed 17 \
     --chromosomes 19,20,21,22 --chr-length-mb 5.0 \
     --output-dir multichr
+
+# numeric range — all autosomes
+.venv/bin/python synthetic_people/generate_people.py \
+    --n 30 --seed 17 \
+    --chromosomes 1-22 --chr-length-mb 5.0 \
+    --output-dir all-autosomes
+
+# mix ranges with singletons (autosomes + X)
+.venv/bin/python synthetic_people/generate_people.py \
+    --n 30 --seed 17 \
+    --chromosomes 1-22,X --chr-length-mb 5.0 \
+    --output-dir autosomes-plus-x
 ```
+
+Ranges are inclusive and must be numeric (`1-22` works, `X-Y` does not).
+Duplicates collapse silently and the resolved order follows the order
+you wrote.
 
 Memory cost scales with `n_people × n_chromosomes × chr_length_mb`.
 For full-chromosome runs use `--chr-length-mb 0` (slower, RAM-hungrier
