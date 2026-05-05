@@ -1,132 +1,217 @@
-# 1000 Genomes — rs12913832 Extraction
+# synthetic-people
 
-## Goal
+**Generate realistic synthetic whole-genome VCFs — at any cohort size,
+under a published demographic model, with truth sets baked in — for
+methods research, variant-caller benchmarking, teaching, and any
+analysis where the cohort you need is bigger, more diverse, or more
+controlled than the one you have access to.**
 
-Extract the **rs12913832** variant from the 1000 Genomes Project Phase 3 data
-and produce a per-sample genotype table suitable for downstream analysis
-(e.g. population-stratified allele-frequency work).
+The headline tool, `synthetic_people/generate_people.py`, drives
+[`msprime`](https://tskit.dev/msprime/) under
+[`stdpopsim`](https://popsim-consortium.github.io/stdpopsim-docs/)'s
+`HomSap` demographic catalogue (default `OutOfAfrica_3G09`,
+[Gutenkunst et al. 2009](https://doi.org/10.1371/journal.pgen.1000695);
+admixed UK-cohort pulse via [`demes`](https://popsim-consortium.github.io/demes-spec-docs/)),
+grounds the resulting cohort sites against ClinVar / dbSNP / COSMIC at
+real chromosome coordinates, layers in structural variants and a
+tunable sequencing-noise model, and emits one VCF per person plus
+per-person BED4 truth tracks listing every variant the model placed and
+every noise event it injected.
 
-rs12913832 is a single-nucleotide polymorphism in intron 86 of the **HERC2**
-gene, upstream of **OCA2**. It is the primary genetic determinant of
-blue-vs-brown eye colour in Europeans — the `G` allele is associated with
-blue eyes.
+---
 
-| Field | Value |
+## Who this is for
+
+- **Variant-caller and pipeline developers** who need a per-call truth set to grade against — every flip and dropout the noise model injects lands in `noise.bed`; every ClinVar / SV / rsID injected lands in `golden.bed`. Realised FDR is reported in `manifest.json` so the requested vs. observed error rate is directly checkable.
+- **Statistical-genetics methods researchers** prototyping new analyses (LD-aware fine-mapping, ancestry inference, SV-aware imputation, PRS calibration) on cohorts whose composition you can dial in. The published demography means realised LD decay, SFS shape, and ancestry proportions track theoretical expectations rather than the artefacts of a particular real cohort.
+- **Clinical-variant pipeline builders** who want ClinVar-grounded VCFs that exercise `CLNSIG` / `CLNDN` handling — and ClinVar-coordinate accuracy — without needing controlled-access patient data on the test bench.
+- **Instructors** preparing reproducible teaching material for population genetics, coalescent theory, or VCF handling. Same `--seed` gives every student byte-identical files; cohort sizes can be tuned to whatever fits the lab session.
+- **Methods papers and supplementary code** that needs to be runnable by reviewers and readers without a DUA-gated data dependency.
+
+Outputs are *statistically plausible* human data, not real human data.
+They are designed to be appropriate for methods development and
+benchmarking; they are **not** appropriate for downstream analyses that
+need real allele-frequency-by-population estimates, real pedigree
+structure, or any conclusion that depends on the data being a sample of
+actual humans.
+
+---
+
+## What "realistic" means here
+
+| Statistical property | How it's produced | What's realised |
+|---|---|---|
+| **LD structure** | Coalescent simulation via `msprime` under stdpopsim's `HomSap` catalogue (default `OutOfAfrica_3G09`, Gutenkunst et al. 2009) | Monotone r² decay; chr22, 200 samples: mean r² ≈ 0.55 (100–500 bp) → 0.46 (0.5–1 kb) → 0.20 (5–20 kb) → < 0.01 (≥ 500 kb) |
+| **Allele-frequency spectrum** | Inherited from the coalescent under the demographic model; legacy mode uses a power-law SFS sampler with α = 2.0 | Singleton-dominated — ~62% singleton fraction in 50-person legacy batches, matching gnomAD-like spectra |
+| **Ti/Tv** | de-novo SNVs from a transition-biased sampler (`syntheticgen/titv.py`) calibrated against a target ratio | Long-run Ti/Tv ≈ 2.1 (the empirical human-WGS value); 50-person chr22 batches realise 2.11 |
+| **Het/Hom balance** | Per-site allele-count draw + exact haplotype slotting (no HWE re-smoothing) | Het/Hom-alt ≈ 2.0 at single-pop default settings |
+| **Per-call quality metrics** | DP ~ Poisson(λ = 30), AD ~ Binomial(DP, p) with 5% het ref-bias, Phred GQ capped at 99 with depth-dependent ceiling | Realistic GT:DP:GQ:AD; flipped calls land low-GQ because AD still reflects the truth |
+| **Admixed ancestry** | Three-source (EUR / SAS / AFR) `demes` pulse into a UK deme ~20 generations ago; source sizes mirror the OOA_3G09 parameterisation | Per-person ancestry BED tracks; cohort PCA captures ~20% on PC1 with separable EUR / SAS / AFR clusters |
+| **Variant grounding** | ClinVar pathogenic + dbSNP rsID + (optional) COSMIC overlays | Real chromosome coordinates, real `CLNSIG` / `CLNDN`, real rs numbers |
+| **Structural variants** | Log-uniform-length DEL / DUP / INV with the full SV INFO tag set (`SVTYPE` / `SVLEN` / `END` / `CIPOS`) | Per-person SV count, length range, and type mix all configurable |
+| **Sequencing noise** | Per-call GT flip + coverage dropout applied *after* the truth-state AD draw | Realised FDR matches requested rate; mis-call signal is faithful (low GQ where reads disagree with the call) |
+| **Reproducibility** | Master `random.Random(seed)`; per-chromosome and per-person seeds pre-derived before any worker fan-out | Same `--seed` + same flags → byte-identical VCFs, regardless of `--workers` |
+
+### Honest limitations
+
+- **Uniform recombination** — the coalescent path uses a constant rate, so short-range r² caps at ~0.55 rather than the ~0.9 a HapMap recombination map would give. `HapMapII_GRCh38` hit a `stdpopsim` "missing data" error on sub-chromosome regions and is on the to-do list.
+- **Placeholder anchor REF on SVs** — symbolic-ALT records carry a single random standard base because the GRCh38 FASTA isn't loaded on disk yet. Wiring the reference in is tracked in `synthetic_people/IMPLEMENTATION_PLAN.md`.
+- **Lightweight noise model only** — the heavy-path ART read-simulation + `bcftools call` route is gated and currently rejected, for the same FASTA-on-disk reason.
+- **VCF-spec output, not BAM/CRAM** — there is no upstream alignment to model. If your method consumes reads rather than calls, this tool is the wrong layer.
+
+---
+
+## Pipeline
+
+```mermaid
+flowchart LR
+    A[stdpopsim + msprime<br/>demographic model] --> B[Cohort sites<br/>LD + SFS correct]
+    B --> C[ClinVar inject<br/>CLNSIG / CLNDN]
+    B --> D[dbSNP rsID inject]
+    B --> E[COSMIC overlay<br/>--somatic]
+    C --> F[Per-person SVs<br/>DEL / DUP / INV]
+    D --> F
+    E --> F
+    F --> G[Sequencing noise<br/>GT flips + dropouts]
+    G --> H[person_NNNN.vcf.gz<br/>+ .tbi]
+    G --> I[golden.bed + noise.bed<br/>truth tracks]
+    H --> J[validate_batch.py<br/>LD / AF / Ti/Tv / PCA]
+    I --> J
+```
+
+Each stage is independently togglable via CLI flags — see the full
+flag table in [`synthetic_people/README.md`](synthetic_people/README.md#cli-reference).
+
+---
+
+## Quick start
+
+```bash
+sudo apt install bcftools tabix              # htslib binaries
+python3 -m venv .venv
+.venv/bin/pip install -r synthetic_people/requirements.txt
+
+.venv/bin/python synthetic_people/generate_people.py \
+    --n 50 --seed 42 \
+    --chromosomes 22 --chr-length-mb 5 \
+    --demo-model OutOfAfrica_3G09 --population CEU
+```
+
+After the run:
+
+```
+out/
+├── person_0001.vcf.gz + .tbi          # one per person
+├── person_0002.vcf.gz + .tbi
+├── ...
+├── manifest.json                      # everything cataloged + realised stats (Ti/Tv, FDR, …)
+├── truth/
+│   ├── person_0001.golden.bed         # every "truth" variant the model placed
+│   └── person_0001.noise.bed          # every GT flip / dropout the model injected
+└── summary/sfs.tsv                    # cohort allele-count histogram
+```
+
+Then validate the batch end-to-end:
+
+```bash
+.venv/bin/python synthetic_people/validate_batch.py out/
+```
+
+`out/validation/` gains LD-decay, AF-histogram, indel-length, and
+cohort-PCA PNGs plus a Markdown report — the same artefacts you'd want
+in the supplementary material of a methods paper.
+
+For a UK-style admixed cohort instead:
+
+```bash
+.venv/bin/python synthetic_people/generate_people.py \
+    --n 50 --seed 42 \
+    --chromosomes 22 --chr-length-mb 5 \
+    --admixture --eur-frac 0.60 --sas-frac 0.25 --afr-frac 0.15
+```
+
+Per-person local-ancestry BEDs land under `out/ancestry/`, and the
+realised cohort-mean ancestry shows up in `manifest.json`.
+
+---
+
+## Capabilities at a glance
+
+| Capability | Flag(s) | Notes |
+|---|---|---|
+| Coalescent backbone | `--demo-model` `--population` | Default `OutOfAfrica_3G09` / CEU; any stdpopsim `HomSap` model is accepted |
+| Three-way admixture | `--admixture --eur-frac --sas-frac --afr-frac` | UK-cohort `demes` pulse demography; emits per-person ancestry BED |
+| ClinVar pathogenic injection | `--clinvar-inject-density` | Real chromosome coordinates with `CLNSIG` / `CLNDN` |
+| dbSNP rsID grounding | `--rsid-density` `--dbsnp-vcf` | Default source = cached ClinVar `INFO/RS`; no extra download |
+| COSMIC somatic overlay | `--somatic --cosmic-vcf` | Registration-gated; supply local file |
+| Structural variants | `--svs-per-person` `--sv-length-min/max` | DEL / DUP / INV with full SV INFO tag set |
+| Sequencing noise | `--error-rate` `--dropout-rate` | Per-call GT flips + coverage dropouts; recomputed GQ reflects flip |
+| Per-call quality metrics | always on | DP ~ Poisson(30), AD ~ Binomial(DP, p), GQ Phred-capped |
+| Truth-set BEDs | always on | `golden.bed` + `noise.bed` per person, BED4, sort-clean |
+| Reproducibility | `--seed` | Same seed + same flags → byte-identical output, regardless of `--workers` |
+| Parallel generation | `--workers` | Per-chromosome simulation + per-person VCF write fan-out |
+| Cohort validation | `validate_batch.py` | LD decay, allele-freq, Ti/Tv, het/hom, PCA, plot artefacts |
+
+A 5-person × 0.5 Mb chr22 smoke test runs end-to-end (generation +
+validation, every artefact verified on disk) in **under 2 minutes** on a
+laptop:
+
+```bash
+bash synthetic_people/scripts/smoke.sh
+```
+
+---
+
+## Documentation
+
+| Document | Audience |
 |---|---|
-| rsID | rs12913832 |
-| Gene | HERC2 (intron 86) |
-| Build | GRCh37 / hg19 |
-| Location | `chr15:28,365,618` |
-| Alleles | A (ref) / G (alt) |
-| Global AF (G) | ≈ 0.28 |
-| EUR AF (G) | ≈ 0.78 |
-| AFR AF (G) | ≈ 0.02 |
+| [`synthetic_people/README.md`](synthetic_people/README.md) | Reference: install, every flag, output layout, milestone history |
+| [`synthetic_people/TUTORIAL.md`](synthetic_people/TUTORIAL.md) | Recipe book — guided walkthrough aimed at scientists / academic users |
+| [`synthetic_people/SYHTHETIC_PROJECT.md`](synthetic_people/SYHTHETIC_PROJECT.md) | Technical specification the implementation is built against |
+| [`synthetic_people/IMPLEMENTATION_PLAN.md`](synthetic_people/IMPLEMENTATION_PLAN.md) | Per-milestone build plan + status |
+| [`synthetic_people/PERFORMANCE_PLAN.md`](synthetic_people/PERFORMANCE_PLAN.md) | Phased runtime / memory optimisation tracker |
+| [`CLAUDE.md`](CLAUDE.md) | Working notes on the local 1000 Genomes data files |
 
-## Data
+---
 
-The variant lives on chromosome 15, so the `ALL.chr19…` – `ALL.chr22…` files
-already in this directory do **not** contain it. Download chr15 from the
-1000 Genomes FTP:
+## Repository layout
 
-```bash
-BASE="https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502"
-FILE="ALL.chr15.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz"
-
-wget "$BASE/$FILE" "$BASE/$FILE.tbi"
+```
+.
+├── synthetic_people/             # the generator — most of the code lives here
+│   ├── generate_people.py        # CLI entry point
+│   ├── validate_batch.py         # cohort validation suite
+│   ├── syntheticgen/             # package: coalescent, admixture, overlays, SVs, errors, truth, …
+│   ├── tests/                    # ~235 tests; run via python -m unittest discover
+│   └── scripts/smoke.sh          # end-to-end smoke test
+├── nextflow_pipeline/            # adjacent: a small Nextflow pipeline + qc_validate.py used as a strictness oracle
+├── extract_rs12913832.sh         # adjacent: pulls the HERC2 eye-colour SNP from chr15 1000G data
+├── download_release_20130502.sh  # adjacent: bulk-fetches the 1000 Genomes Phase 3 release
+└── CLAUDE.md                     # working notes on the chr19–22 1000G files kept in this dir
 ```
 
-All autosomes in the 20130502 release use the `v5b` suffix. `.vcf.gz` and
-`.tbi` files are covered by `.gitignore` and will not be committed.
+The `extract_rs12913832.sh` flow and the chr19–22 1000G files predate
+the synthetic-people work; they remain in the tree as worked examples
+of real-data extraction and as the reference data the legacy
+`--legacy-background` mode draws from. Most contributors will only
+touch `synthetic_people/`.
 
-## Variant browsers
+---
 
-Useful for sanity-checking coordinates, alleles, and flanking context:
+## Citing the underlying methods
 
-| Resource | URL |
-|---|---|
-| dbSNP | https://www.ncbi.nlm.nih.gov/snp/rs12913832 |
-| Ensembl (GRCh37) | https://grch37.ensembl.org/Homo_sapiens/Variation/Explore?v=rs12913832 |
-| UCSC (hg19) | https://genome.ucsc.edu/cgi-bin/hgTracks?db=hg19&position=rs12913832 |
+If you use `synthetic-people` in published work, please cite the
+underlying simulation stack:
 
-Programmatic lookup via NCBI E-utilities:
+- **msprime** — Baumdicker et al., *Genetics* (2022). https://tskit.dev/msprime/
+- **stdpopsim** — Adrion et al., *eLife* (2020). https://popsim-consortium.github.io/stdpopsim-docs/
+- **OutOfAfrica_3G09 demography** — Gutenkunst, Hernandez, Williamson, Bustamante, *PLoS Genetics* (2009). https://doi.org/10.1371/journal.pgen.1000695
+- **demes** (admixture mode) — Gower et al., *Genetics* (2022). https://popsim-consortium.github.io/demes-spec-docs/
+- **ClinVar / dbSNP** — NCBI public catalogues used as overlay sources.
 
-```bash
-curl -s "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=snp&id=12913832&retmode=json" \
-  | jq '.result."12913832" | {chr, pos: .chrpos, pos37: .chrpos_prev_assm}'
-```
+---
 
-## Script: `extract_rs12913832.sh`
+## License
 
-Usage:
-
-```bash
-./extract_rs12913832.sh                  # uses default chr15 VCF in cwd
-./extract_rs12913832.sh path/to/vcf.gz   # explicit path
-```
-
-What it does:
-
-1. **Region query** via tabix (`bcftools view -r 15:28365618-28365618`) — fast
-   random access, no full-file scan.
-2. **rsID filter** (`-i 'ID="rs12913832"'`) — guards against other variants
-   at the same position.
-3. Writes a single-variant VCF `rs12913832.vcf.gz` + `.tbi` index.
-4. Writes a per-sample genotype table `rs12913832.genotypes.tsv` with
-   columns: `sample`, `GT` (e.g. `0|0`, `0|1`, `1|1`), `alt_dosage` (0/1/2).
-5. Prints global allele frequency via `bcftools +fill-tags`.
-
-Requires `bcftools` (tested with 1.19).
-
-## Troubleshooting
-
-### Symptom: `rs12913832.genotypes.tsv` has a header but no rows
-
-The header is emitted by awk's `BEGIN{}` regardless of input — an empty TSV
-means `bcftools query` returned zero rows. Work through these checks:
-
-```bash
-VCF=ALL.chr15.phase3_shapeit2_mvncall_integrated_v5b.20130502.genotypes.vcf.gz
-
-# 1. Is anything at the expected position?
-bcftools view -r 15:28365618 -H "$VCF" | head
-
-# 2. Widen the window — 1 kb around the target
-bcftools view -r 15:28365000-28366000 -H "$VCF" | awk '{print $1,$2,$3,$4,$5}'
-
-# 3. Authoritative full-file search (slow)
-bcftools view "$VCF" | grep -m1 rs12913832
-
-# 4. Confirm the file really is chr15 and check contig naming (15 vs chr15)
-bcftools view -h "$VCF" | grep "^##contig" | head
-bcftools index -s "$VCF"
-```
-
-Interpreting results:
-
-- **Step 4 shows contigs other than `15`** → wrong file. 1000G Phase 3 uses
-  unprefixed contig names (`15`, not `chr15`). Re-download chr15.
-- **Step 1 is empty but step 2 shows neighbouring variants** → the variant
-  may have been repositioned in a later dbSNP build; update `REGION` in the
-  script to the coordinate reported in step 2.
-- **Step 1 shows the variant but the ID field is e.g. `rs12913832;rsXXXX`**
-  → strict `ID="rs12913832"` match fails. Change the filter in the script
-  to a regex match:
-  ```bash
-  bcftools view -r "$REGION" -i 'ID~"rs12913832"' "$VCF"
-  ```
-- **Step 3 finds the variant but steps 1 and 2 are empty** → the tabix
-  index is stale or mismatched. Re-download the `.tbi` file or rebuild with
-  `tabix -p vcf "$VCF"`.
-
-## Follow-on analysis
-
-To stratify genotype counts by super-population, join
-`rs12913832.genotypes.tsv` against the 1000G sample panel on the `sample`
-column:
-
-```bash
-wget https://ftp.1000genomes.ebi.ac.uk/vol1/ftp/release/20130502/integrated_call_samples_v3.20130502.ALL.panel
-```
-
-The panel file maps each sample ID to population (`pop`) and
-super-population (`super_pop`: AFR, AMR, EAS, EUR, SAS).
+GNU General Public License v3 — see [`LICENSE`](LICENSE).
