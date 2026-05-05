@@ -1,0 +1,5 @@
+# Nextflow runtime artefacts — created on every run.
+.nextflow/
+.nextflow.log*
+work/
+results/

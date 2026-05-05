@@ -89,6 +89,34 @@ class PipelineE2ETest(unittest.TestCase):
                 f"missing output: {name}",
             )
 
+        # MultiQC report is best-effort: only assert it lands when
+        # multiqc is importable on this host. Some CI runners (e.g. the
+        # minimal stdlib-only one the existing pipeline assumes) won't
+        # have it — skip the assertion rather than fail.
+        try:
+            import multiqc  # noqa: F401
+        except ImportError:
+            pass
+        else:
+            html = os.path.join(self.outdir, "multiqc_report.html")
+            self.assertTrue(os.path.isfile(html),
+                            f"missing MultiQC report: {html}")
+            data_dir = os.path.join(self.outdir, "multiqc_data")
+            self.assertTrue(os.path.isdir(data_dir),
+                            f"missing MultiQC data dir: {data_dir}")
+            # Custom-content sidecar should land in the parsed data — both
+            # samples should appear under the vcf_qc table.
+            with open(os.path.join(data_dir, "multiqc_data.json")) as fh:
+                mqc_data = json.load(fh)
+            saved = mqc_data.get("report_saved_raw_data", {})
+            vcf_qc = saved.get("multiqc_vcf_qc_table", {})
+            self.assertEqual(len(vcf_qc), 2,
+                             f"expected 2 samples in vcf_qc table, got {vcf_qc}")
+            # Bcftools-stats native module should also have ingested both.
+            bcft = saved.get("multiqc_bcftools_stats", {})
+            self.assertEqual(len(bcft), 2,
+                             f"expected 2 samples in bcftools_stats, got {bcft}")
+
         with open(os.path.join(self.outdir, "qc_report.md")) as fh:
             qc_md = fh.read()
         # Both synthetic files should pass QC cleanly.

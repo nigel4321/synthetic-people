@@ -23,6 +23,11 @@ pipeline; they surface in qc_report.md for the user to eyeball:
 
 Always writes the JSON output file. In --strict mode, also exits 1 when
 any hard check fails, which aborts the Nextflow workflow.
+
+Optional --mqc-out writes a MultiQC custom-content sidecar (a
+``*_mqc.json`` file) containing the same per-file findings reshaped as a
+table section — one section per VCF, merged into the cohort MultiQC
+report when the pipeline runs the MULTIQC stage.
 """
 
 import argparse
@@ -283,11 +288,74 @@ def _result(name: str, vcf_path: str, errors: list[str],
     }
 
 
+def build_mqc_payload(result: dict) -> dict:
+    """Reshape a qc_validate result into a MultiQC custom-content section.
+
+    MultiQC merges files that share the top-level ``id`` by concatenating
+    their ``data`` dicts, so each invocation emits one section with one
+    sample and the cohort report stitches itself together at MultiQC time.
+
+    The headers list defines the column order, scaling, and tooltips; we
+    keep it identical across files so the merged table stays consistent.
+    """
+    c = result.get("checks", {})
+    if c.get("info_has_af"):
+        af_acan = "AF"
+    elif c.get("info_has_ac_an"):
+        af_acan = "AC+AN"
+    else:
+        af_acan = "-"
+    sample = result["name"]
+    row = {
+        "qc_status": "PASS" if result.get("pass") else "FAIL",
+        "n_errors": len(result.get("errors", [])),
+        "n_warnings": len(result.get("warnings", [])),
+        "reference_build": c.get("reference_build") or "-",
+        "n_variants": c.get("n_variants") if c.get("n_variants") is not None else 0,
+        "sample_count": c.get("sample_count", 0),
+        "has_gt": "yes" if c.get("has_format_gt") else "no",
+        "has_af_or_acan": af_acan,
+        "non_human_contigs": len(c.get("non_human_contigs", []) or []),
+    }
+    return {
+        "id": "vcf_qc",
+        "section_name": "VCF QC checks",
+        "section_anchor": "vcf-qc",
+        "description": (
+            "Custom QC from qc_validate.py — header completeness, contig "
+            "sanity, INFO/FORMAT presence, position sanity."
+        ),
+        "plot_type": "table",
+        "pconfig": {
+            "id": "vcf_qc_table",
+            "title": "VCF QC",
+            "save_file": True,
+            "no_violin": True,
+        },
+        "headers": {
+            "qc_status":         {"title": "QC",              "description": "PASS or FAIL — hard checks",                "scale": False},
+            "n_errors":          {"title": "Errors",          "description": "Hard-check error count",                    "scale": "Reds",    "format": "{:,d}"},
+            "n_warnings":        {"title": "Warns",           "description": "Soft-check warning count",                  "scale": "Oranges", "format": "{:,d}"},
+            "reference_build":   {"title": "Build",           "description": "Detected reference build (GRCh37/GRCh38)",  "scale": False},
+            "n_variants":        {"title": "# variants",      "description": "Total variant records (from index)",        "format": "{:,d}"},
+            "sample_count":      {"title": "# samples",       "description": "Sample columns in #CHROM",                  "format": "{:,d}"},
+            "has_gt":            {"title": "GT",              "description": "FORMAT=GT declared",                        "scale": False},
+            "has_af_or_acan":    {"title": "AF/AC+AN",        "description": "Frequency-classifiable INFO available",     "scale": False},
+            "non_human_contigs": {"title": "Non-human ctgs",  "description": "Indexed contigs not on standard human list", "scale": "Oranges", "format": "{:,d}"},
+        },
+        "data": {sample: row},
+    }
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--vcf", required=True)
     p.add_argument("--name", required=True)
     p.add_argument("--out", required=True, help="Output JSON path")
+    p.add_argument("--mqc-out",
+                   help="Optional path for a MultiQC custom-content "
+                        "_mqc.json sidecar (one section per file, merged "
+                        "by sample at report time)")
     p.add_argument("--strict", action="store_true",
                    help="Exit 1 if any hard check fails")
     args = p.parse_args()
@@ -296,6 +364,10 @@ def main() -> int:
 
     with open(args.out, "w") as fh:
         json.dump(result, fh, indent=2)
+
+    if args.mqc_out:
+        with open(args.mqc_out, "w") as fh:
+            json.dump(build_mqc_payload(result), fh, indent=2)
 
     if result["errors"]:
         print(f"[qc_validate] HARD FAILURES for {args.name}:", file=sys.stderr)

@@ -19,12 +19,15 @@ from fixtures import (
 from synthetic_vcf import Variant, write_vcf
 
 
-def _run_qc(vcf_path: str, name: str, out_dir: str, strict: bool = False):
+def _run_qc(vcf_path: str, name: str, out_dir: str, strict: bool = False,
+            mqc_out: bool = False):
     out_json = os.path.join(out_dir, f"{name}.qc.json")
     cmd = [
         sys.executable, bin_script("qc_validate.py"),
         "--vcf", vcf_path, "--name", name, "--out", out_json,
     ]
+    if mqc_out:
+        cmd += ["--mqc-out", os.path.join(out_dir, f"{name}_qc_mqc.json")]
     if strict:
         cmd.append("--strict")
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -259,6 +262,97 @@ class QcValidateHardFailuresTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertFalse(result["pass"])
         self.assertTrue(result["errors"])
+
+
+class QcValidateMqcSidecarTest(unittest.TestCase):
+    """`--mqc-out` writes a MultiQC custom-content section keyed by sample.
+
+    The sidecar must be JSON-parseable, declare a stable ``id`` so multiple
+    files merge into one section in the cohort report, expose the table
+    schema MultiQC needs (``plot_type``, ``headers``, ``data``), and key
+    the data dict by the per-VCF ``--name`` so the MultiQC table column
+    matches the bcftools-stats sample column.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        require_tools("bcftools", "tabix", "bgzip")
+        cls.tmpdir = tempfile.mkdtemp(prefix="qc_mqc_")
+        cls.vcf = write_vcf(
+            standard_filename(cls.tmpdir, "15"), "15",
+            in_range_variants(), default_cohort(),
+        )
+
+    def _read_mqc(self, name: str) -> dict:
+        with open(os.path.join(self.tmpdir, f"{name}_qc_mqc.json")) as fh:
+            return json.load(fh)
+
+    def test_sidecar_written_when_flag_passed(self):
+        proc, _ = _run_qc(self.vcf, "chr15", self.tmpdir, mqc_out=True)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertTrue(os.path.isfile(
+            os.path.join(self.tmpdir, "chr15_qc_mqc.json")))
+
+    def test_sidecar_not_written_when_flag_omitted(self):
+        proc, _ = _run_qc(self.vcf, "chr15_nosidecar", self.tmpdir,
+                          mqc_out=False)
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        self.assertFalse(os.path.isfile(
+            os.path.join(self.tmpdir, "chr15_nosidecar_qc_mqc.json")))
+
+    def test_sidecar_shape_for_multiqc(self):
+        _run_qc(self.vcf, "chr15", self.tmpdir, mqc_out=True)
+        mqc = self._read_mqc("chr15")
+        # Stable id so multiple per-VCF files merge into one section in
+        # the cohort MultiQC report.
+        self.assertEqual(mqc["id"], "vcf_qc")
+        self.assertEqual(mqc["plot_type"], "table")
+        # Data must be keyed by sample name so MultiQC lines it up against
+        # the bcftools-stats general-stats row.
+        self.assertEqual(list(mqc["data"].keys()), ["chr15"])
+        # Required-by-MultiQC: every header key must have a corresponding
+        # data column (otherwise MultiQC silently drops the column).
+        row = mqc["data"]["chr15"]
+        for key in mqc["headers"]:
+            self.assertIn(key, row, msg=f"missing data column {key}")
+
+    def test_sidecar_reflects_pass_state(self):
+        _run_qc(self.vcf, "passing", self.tmpdir, mqc_out=True)
+        row = self._read_mqc("passing")["data"]["passing"]
+        self.assertEqual(row["qc_status"], "PASS")
+        self.assertEqual(row["n_errors"], 0)
+        self.assertEqual(row["n_warnings"], 0)
+        self.assertEqual(row["reference_build"], "GRCh37")
+        self.assertEqual(row["has_gt"], "yes")
+        self.assertEqual(row["has_af_or_acan"], "AF")
+        self.assertEqual(row["sample_count"], 20)
+        self.assertEqual(row["non_human_contigs"], 0)
+
+    def test_sidecar_reflects_warning_state(self):
+        # Build a VCF whose reference does not look human — qc warns but
+        # still passes hard checks.
+        vcf = write_vcf(
+            standard_filename(self.tmpdir, "15") + ".warn.vcf.gz", "15",
+            [Variant(pos=28365618, ref="A", alt="G",
+                     af_by_pop={"ALL": 0.1})],
+            default_cohort(),
+            reference="mm10.fa",
+        )
+        _run_qc(vcf, "mouse", self.tmpdir, mqc_out=True)
+        row = self._read_mqc("mouse")["data"]["mouse"]
+        self.assertEqual(row["qc_status"], "PASS")
+        self.assertGreaterEqual(row["n_warnings"], 1)
+        self.assertEqual(row["reference_build"], "-")
+
+    def test_sidecar_reflects_hard_failure(self):
+        missing = os.path.join(self.tmpdir, "ghost.vcf.gz")
+        _run_qc(missing, "ghost", self.tmpdir, mqc_out=False, strict=False)
+        # Re-run with the sidecar so we exercise the hard-failure branch
+        # of build_mqc_payload (early return, partial checks).
+        _run_qc(missing, "ghost", self.tmpdir, mqc_out=True, strict=False)
+        row = self._read_mqc("ghost")["data"]["ghost"]
+        self.assertEqual(row["qc_status"], "FAIL")
+        self.assertGreaterEqual(row["n_errors"], 1)
 
 
 if __name__ == "__main__":

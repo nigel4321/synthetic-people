@@ -1,12 +1,13 @@
 # variant-scan — Nextflow pipeline
 
-Scan a directory of VCF files for a target variant, producing four markdown reports plus a carrier-level TSV:
+Scan a directory of VCF files for a target variant, producing four markdown reports plus a carrier-level TSV plus a cohort MultiQC HTML:
 
 1. **`qc_report.md`** — per-file validation run before anything else happens: file integrity, tabix index, header parseability, sample/variant presence, plus soft checks that the file looks like human genomic data (recognised reference build, human chromosome names, `FORMAT=GT`, `AF`/`AC`+`AN` present). Hard failures abort the pipeline in strict mode (the default).
 2. **`metadata_report.md`** — cohort-level and per-file overview for researchers orienting themselves to an unfamiliar dataset.
 3. **`variant_report.md`** — which files contain the target variant within an acceptable allele-frequency range, with per-population breakdowns.
 4. **`carriers_report.md`** — how many individuals carry the alt allele, split by heterozygous / homozygous, with integrity checks against cohort AC.
 5. **`carriers.tsv`** — one row per (file, sample) where the individual carries the alt allele. Suitable for downstream joins with a sample/population panel.
+6. **`multiqc_report.html`** + `multiqc_data/` — interactive cohort report from `bcftools stats` (Ti/Tv per sample, indel-length distribution, SNP/indel/multi-allelic counts, substitution-by-type) plus a custom-content table of `qc_validate.py`'s checks (build, contig sanity, INFO/FORMAT presence, warning/error counts) — suitable for supplementary material of a methods paper or a single-page cohort overview.
 
 Designed for a standalone VM (local executor). Scales to hundreds of VCFs via per-file parallelism.
 
@@ -14,7 +15,7 @@ Designed for a standalone VM (local executor). Scales to hundreds of VCFs via pe
 
 - Nextflow ≥ 22.10 — `curl -s https://get.nextflow.io | bash`
 - `bcftools` ≥ 1.9 on PATH
-- Python 3.8+ (stdlib only — no pip install required)
+- Python 3.8+ — `bin/` scripts use stdlib only; the MultiQC stage additionally needs `multiqc>=1.18` importable as a module (`pip install multiqc` or `apt install python3-multiqc`). Invoked as `python3 -m multiqc` so the console-script shim doesn't need to be on PATH.
 - Each input VCF must be bgzipped (`.vcf.gz`) with a matching tabix index (`.vcf.gz.tbi`)
 
 ## Usage
@@ -58,12 +59,14 @@ nextflow_pipeline/
 ├── main.nf                          # entry workflow
 ├── nextflow.config                  # executor, resources, params
 ├── modules/
-│   ├── qc_validate.nf               # per-VCF QC + validation (first stage)
+│   ├── qc_validate.nf               # per-VCF QC + validation (first stage); also emits MultiQC sidecar
+│   ├── bcftools_stats.nf            # per-VCF `bcftools stats -s -` for MultiQC's native parser
+│   ├── multiqc.nf                   # cohort-level interactive HTML report
 │   ├── inspect_vcf.nf               # per-VCF metadata collection
 │   ├── scan_variant.nf              # per-VCF variant lookup
 │   └── reports.nf                   # markdown aggregation
 ├── bin/                             # scripts auto-added to PATH by Nextflow
-│   ├── qc_validate.py
+│   ├── qc_validate.py               # --mqc-out emits a MultiQC custom-content sidecar
 │   ├── inspect_vcf.py
 │   ├── scan_variant.py              # also emits per-file carriers.tsv
 │   ├── build_qc_report.py
@@ -77,11 +80,12 @@ nextflow_pipeline/
 
 ## Execution model
 
-Per input VCF, Nextflow runs QC first, then two independent parallel tasks:
+Per input VCF, Nextflow runs QC first, then three independent parallel tasks:
 
-- `QC_VALIDATE` — runs before any downstream processing. Hard checks: file readable, tabix index present, header parseable, at least one sample column, at least one variant record. Soft checks (warnings only): reference names a known human build (hg19/GRCh37/hg38/GRCh38), indexed contigs are recognised human chromosomes, `FORMAT=GT` declared, INFO declares `AF` or both `AC`+`AN`, variant positions fit inside plausible human chromosome lengths. In strict mode (default) a hard failure aborts the whole pipeline; soft warnings never abort.
+- `QC_VALIDATE` — runs before any downstream processing. Hard checks: file readable, tabix index present, header parseable, at least one sample column, at least one variant record. Soft checks (warnings only): reference names a known human build (hg19/GRCh37/hg38/GRCh38), indexed contigs are recognised human chromosomes, `FORMAT=GT` declared, INFO declares `AF` or both `AC`+`AN`, variant positions fit inside plausible human chromosome lengths. In strict mode (default) a hard failure aborts the whole pipeline; soft warnings never abort. Emits both `<name>.qc.json` (consumed by `build_qc_report.py`) and `<name>_qc_mqc.json` (a MultiQC custom-content sidecar).
 - `INSPECT_VCF` — contigs, sample count, variant count, reference build heuristic, pipeline/date tags, sample-list hash (to detect cohort mismatches across files).
 - `SCAN_VARIANT` — tabix region query, strict REF/ALT match, AF extraction from INFO (or recomputed via `bcftools +fill-tags` if missing), classification into one of seven statuses, **and per-sample genotype extraction** for any file where the variant is present.
+- `BCFTOOLS_STATS` — per-VCF `bcftools stats -s -` output. Consumed by MultiQC's built-in bcftools-stats parser to produce per-sample Ti/Tv, indel-length distribution, substitution-by-type, and singleton stats — none of which the markdown reports compute.
 
 Each `SCAN_VARIANT` task emits two files:
 
@@ -94,6 +98,7 @@ Aggregation runs once all per-file fan-outs finish:
 - `METADATA_REPORT` → `metadata_report.md`
 - `VARIANT_REPORT` → `variant_report.md` (highlights files where the variant is in range)
 - `CARRIER_REPORT` → `carriers.tsv` + `carriers_report.md` (concatenates per-file carrier TSVs, totals het/hom counts, verifies `het + 2·hom == cohort AC`)
+- `MULTIQC` → `multiqc_report.html` + `multiqc_data/` (cohort-level interactive report combining `bcftools stats` and the QC sidecar)
 
 ### Carrier extraction scope
 
@@ -129,7 +134,9 @@ results/
 ├── metadata_report.md       # cohort overview (one section per input file)
 ├── variant_report.md        # file-level classification + AF per population
 ├── carriers_report.md       # individual-level summary: het, hom, totals
-└── carriers.tsv             # full per-carrier table (file, sample, GT, dosage)
+├── carriers.tsv             # full per-carrier table (file, sample, GT, dosage)
+├── multiqc_report.html      # cohort-level interactive HTML (bcftools stats + QC sidecar)
+└── multiqc_data/            # MultiQC's parsed-data drop, including multiqc_data.json (machine-readable)
 ```
 
 Per-file intermediate JSONs and carrier TSVs stay in Nextflow's `work/` directory and can be inspected for debugging.

@@ -1,7 +1,11 @@
-# No pip dependencies — all bin/ scripts run on Python 3.8+ stdlib only
-# (argparse, glob, hashlib, json, os, re, subprocess, collections).
-#
+# bin/ scripts run on Python 3.8+ stdlib only (argparse, glob, hashlib,
+# json, os, re, subprocess, collections). The MULTIQC Nextflow process
+# additionally needs MultiQC available as a Python module (`python3 -m
+# multiqc`) — install once at the executor host:
+multiqc>=1.18
+
 # System binaries required on PATH (invoked via subprocess, not installable
 # via pip):
-#   - bcftools   (htslib) — VCF querying, index inspection, fill-tags
+#   - bcftools   (htslib) — VCF querying, index inspection, fill-tags,
+#                           per-sample stats for the MULTIQC report
 #   - tabix      (htslib) — fallback contig listing
