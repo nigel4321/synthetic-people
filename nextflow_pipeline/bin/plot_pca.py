@@ -55,12 +55,24 @@ def _query_genotypes(vcf: str, max_variants: int):
 
     Returns ``samples`` as a list of strings and ``dosage_rows`` as a list
     of lists of floats. Each row is one variant; columns line up with
-    ``samples``. Stops after ``max_variants`` rows are collected.
+    ``samples``. Stops after ``max_variants`` rows are collected — the
+    rest of the bcftools output is discarded by closing our read end of
+    the pipe, which lets bcftools exit on its next write (SIGPIPE).
+
+    A non-zero bcftools exit code only means real trouble when we read
+    every record bcftools intended to emit. If we voluntarily stopped
+    early, the exit status is irrelevant — bcftools was killed by our
+    pipe close, not by anything wrong with the input.
     """
     samples_proc = subprocess.run(
         ["bcftools", "query", "-l", vcf],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=False,
     )
+    if samples_proc.returncode != 0:
+        raise RuntimeError(
+            f"bcftools query -l failed (exit {samples_proc.returncode}): "
+            f"{samples_proc.stderr.strip()[:200]}"
+        )
     samples = [s for s in samples_proc.stdout.splitlines() if s.strip()]
     if not samples:
         return samples, []
@@ -73,35 +85,45 @@ def _query_genotypes(vcf: str, max_variants: int):
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     assert proc.stdout is not None
+    assert proc.stderr is not None
     rows: list[list[float]] = []
     n_cols = len(samples)
-    for line in proc.stdout:
-        line = line.rstrip("\n")
-        if not line:
-            continue
-        cells = line.split("\t")
-        # Strip the trailing empty cell from the format string's final \t.
-        if cells and cells[-1] == "":
-            cells = cells[:-1]
-        if len(cells) != n_cols:
-            # Defensive: skip malformed rows rather than mis-align the
-            # matrix. bcftools should emit one cell per sample but
-            # multi-allelic + custom format strings can occasionally
-            # surprise us; better to drop the row than to corrupt PCA.
-            continue
-        rows.append([_gt_to_dosage(g) for g in cells])
-        if len(rows) >= max_variants:
-            # Drain the rest so bcftools doesn't get a SIGPIPE that we'd
-            # then have to interpret.
-            proc.stdout.close()
-            proc.terminate()
-            proc.wait()
-            break
-    proc.wait()
-    if proc.returncode not in (0, None):
-        stderr = (proc.stderr.read() if proc.stderr else "").strip()
+    truncated = False
+    try:
+        for line in proc.stdout:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            cells = line.split("\t")
+            # Strip the trailing empty cell from the format string's
+            # final \t.
+            if cells and cells[-1] == "":
+                cells = cells[:-1]
+            if len(cells) != n_cols:
+                # Defensive: skip malformed rows rather than mis-align
+                # the matrix. bcftools should emit one cell per sample
+                # but multi-allelic + custom format strings can
+                # occasionally surprise us; better to drop the row than
+                # to corrupt PCA.
+                continue
+            rows.append([_gt_to_dosage(g) for g in cells])
+            if len(rows) >= max_variants:
+                truncated = True
+                break
+    finally:
+        # Closing our read end signals EOF to bcftools's writer. It
+        # exits on its next write — usually with SIGPIPE (negative
+        # returncode 13 on POSIX) or 141. We only treat that as an
+        # error when we did NOT voluntarily stop reading.
+        proc.stdout.close()
+        stderr_text = proc.stderr.read()
+        proc.stderr.close()
+        proc.wait()
+
+    if not truncated and proc.returncode not in (0, None):
         raise RuntimeError(
-            f"bcftools query failed (exit {proc.returncode}): {stderr[:200]}"
+            f"bcftools query failed (exit {proc.returncode}): "
+            f"{stderr_text.strip()[:500] or '(no stderr captured)'}"
         )
     return samples, rows
 
@@ -136,7 +158,14 @@ def main() -> int:
 
     # Cheap gates first — these don't need numpy / sklearn / matplotlib
     # so a "too small" skip is honest even on hosts without those deps.
-    samples, rows = _query_genotypes(args.vcf, args.max_variants)
+    try:
+        samples, rows = _query_genotypes(args.vcf, args.max_variants)
+    except RuntimeError as exc:
+        # Surface a clean, single-line error message rather than a Python
+        # traceback — Nextflow logs are noisy enough already, and the
+        # captured bcftools stderr in the message is the actionable bit.
+        print(f"[plot_pca] {exc}", file=sys.stderr)
+        return 1
     if len(samples) < args.min_samples:
         _write_skip(
             args.out_json,

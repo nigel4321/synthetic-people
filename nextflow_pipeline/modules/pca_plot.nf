@@ -39,10 +39,13 @@ process PCA_PLOT {
     script:
     """
     plot_pca.py \\
-        --vcf      "${vcf}" \\
-        --name     "${name}" \\
-        --out-png  "${name}.pca.png" \\
-        --out-json "${name}.pca.json"
+        --vcf           "${vcf}" \\
+        --name          "${name}" \\
+        --out-png       "${name}.pca.png" \\
+        --out-json      "${name}.pca.json" \\
+        --min-samples   ${params.pca_min_samples} \\
+        --min-variants  ${params.pca_min_variants} \\
+        --max-variants  ${params.pca_max_variants}
 
     cp "${name}.pca.png" "${name}_pca_mqc.png"
     """

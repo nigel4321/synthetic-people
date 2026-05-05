@@ -44,6 +44,9 @@ All variant fields can also be passed as CLI flags (`--variant_name`, `--variant
 | `--variant_max_af` | no | Upper AF bound (default 1.0) |
 | `--outdir` | no | Output directory (default `results`) |
 | `--strict_qc` | no | Abort pipeline if any file hard-fails QC (default `true`). Set `false` to run downstream stages even on broken inputs; QC issues are still reported in `qc_report.md`. |
+| `--pca_min_samples` | no | Skip PCA when a VCF has fewer samples (default `3`). Below 3 a 2-component fit isn't meaningful. |
+| `--pca_min_variants` | no | Skip PCA when fewer variable sites remain after zero-variance pruning (default `10`). |
+| `--pca_max_variants` | no | Cap on variants fed into PCA (default `10000`, file-order prefix). Raise for very large cohorts whose first 10k variants are not representative; lower to speed up exploratory runs. |
 
 ### Adding new variants
 

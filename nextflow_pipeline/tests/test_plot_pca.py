@@ -194,6 +194,64 @@ class PlotPcaErrorPathTest(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("missing input", proc.stderr)
 
+    def test_corrupt_vcf_surfaces_bcftools_stderr(self):
+        # Build a valid VCF, then truncate it so bcftools fails on read.
+        # The error message should carry bcftools's own diagnostic so a
+        # user can tell what's wrong without consulting the work dir.
+        vcf = write_vcf(
+            standard_filename(self.tmpdir, "15") + ".corrupt.vcf.gz",
+            "15", _structured_variants(n_variants=20)[:20], default_cohort(),
+        )
+        with open(vcf, "r+b") as fh:
+            fh.truncate(100)  # bgzip footer chopped off → unreadable
+        proc, _, _ = _run_plot_pca(vcf, "broken", self.tmpdir)
+        self.assertNotEqual(proc.returncode, 0)
+        # Single-line plot_pca prefix + bcftools's own stderr should both
+        # appear; we don't care exactly which BGZF error bcftools raises
+        # so long as it's a real diagnostic and not a phantom failure.
+        self.assertIn("[plot_pca]", proc.stderr)
+        self.assertIn("bcftools query", proc.stderr)
+
+
+@unittest.skipUnless(_heavy_deps_available(),
+                     "numpy / sklearn / matplotlib not available")
+class PlotPcaMaxVariantsTest(unittest.TestCase):
+    """``--max-variants`` should cap the matrix without failing the
+    process — regression test for the SIGTERM-on-cap bug where bcftools
+    was being killed by ``proc.terminate()`` and the resulting -15
+    returncode was being raised as a phantom failure.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        require_tools("bcftools", "tabix", "bgzip")
+        cls.tmpdir = tempfile.mkdtemp(prefix="plot_pca_cap_")
+        cls.vcf = write_vcf(
+            standard_filename(cls.tmpdir, "15"), "15",
+            _structured_variants(n_variants=80), default_cohort(),
+        )
+
+    def test_cap_below_available_succeeds(self):
+        # Cap at 25 even though 80 are available. Pre-fix this exited 1
+        # with `bcftools query failed (exit -15)`.
+        out_png = os.path.join(self.tmpdir, "capped.pca.png")
+        out_json = os.path.join(self.tmpdir, "capped.pca.json")
+        proc = subprocess.run(
+            [sys.executable, bin_script("plot_pca.py"),
+             "--vcf", self.vcf, "--name", "capped",
+             "--out-png", out_png, "--out-json", out_json,
+             "--max-variants", "25"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, msg=proc.stderr)
+        with open(out_json) as fh:
+            summary = json.load(fh)
+        self.assertNotIn("skipped", summary)
+        # Used variants should be at most the cap (some may be pruned
+        # for zero variance after mean imputation).
+        self.assertLessEqual(summary["n_variants_used"], 25)
+        self.assertGreater(summary["n_variants_used"], 5)
+
 
 if __name__ == "__main__":
     unittest.main()
