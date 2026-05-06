@@ -168,6 +168,93 @@ class CohortStreamedMultiChromTest(unittest.TestCase):
     and _HAVE_MSPRIME and _HAVE_STDPOPSIM,
     "needs bcftools/tabix/bgzip + msprime + stdpopsim",
 )
+class CohortStreamedStdpopsimMutationModelTest(unittest.TestCase):
+    """The default ``OutOfAfrica_3G09`` path goes through stdpopsim's
+    engine, which uses ``JC69MutationModel`` by default. JC69 produces
+    multi-allelic sites (allele indices > 1) at low rates when a
+    recurrent mutation hits the same position. Pre-fix, cohort sites
+    declared a single ALT but emitted raw GT indices, so a site with
+    three alleles produced ``GT="2|0"`` rows that referenced a
+    non-existent ALT. ``bcftools view -s`` rejects this on read-back
+    with ``Incorrect allele ("2") in <SAMPLE>``.
+
+    This test reproduces the path: simulate a sizeable stdpopsim
+    cohort, write it to a per-chrom BCF, then derive per-person via
+    ``bcftools view -s`` for several samples. If any cohort site
+    leaked a multi-allelic GT, the per-sample view would fail.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        # 50 samples × 5 Mb gives a few thousand sites, more than
+        # enough for the JC69 multi-allelic rate (~1 in a few
+        # thousand) to surface a regression. Larger than the rest of
+        # the streaming-test fixtures because the bug is rate-driven.
+        cls.tmpdir = Path(tempfile.mkdtemp(
+            prefix="cohort_stream_jc69_"))
+        rc = cli_module.main([
+            "--n", "50",
+            "--seed", "45",
+            "--build", "GRCh38",
+            "--chromosomes", "22",
+            "--chr-length-mb", "5.0",
+            "--demo-model", "OutOfAfrica_3G09",
+            "--population", "CEU",
+            "--rsid-density", "0",
+            "--clinvar-inject-density", "0",
+            "--svs-per-person", "0",
+            "--error-rate", "0",
+            "--dropout-rate", "0",
+            "--workers", "1",
+            "--output-dir", str(cls.tmpdir),
+            "--cache-dir", str(cls.tmpdir / "cache"),
+            "--mode", "cohort",
+        ])
+        if rc != 0:
+            raise RuntimeError(f"cli.main exited {rc}")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def test_per_sample_extract_succeeds_for_every_sample(self):
+        bcf = self.tmpdir / "cohort" / "cohort.chr22.bcf"
+        # Run `bcftools view -s SAMPLE -e 'GT="ref"'` for every
+        # sample — the same pipeline cohort_derivation uses. Pre-fix,
+        # bcftools exited 1 on at least one sample with the
+        # `Incorrect allele` diagnostic.
+        all_samples = subprocess.run(
+            ["bcftools", "query", "-l", str(bcf)],
+            capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
+        for sample in all_samples:
+            view = subprocess.Popen(
+                ["bcftools", "view", "-s", sample, str(bcf)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            drop_ref = subprocess.run(
+                ["bcftools", "view", "-e", 'GT="ref"'],
+                stdin=view.stdout, capture_output=True, text=True,
+            )
+            view.stdout.close()
+            view_stderr = view.stderr.read().decode("utf-8")
+            view.stderr.close()
+            view.wait()
+            self.assertEqual(
+                view.returncode, 0,
+                msg=f"`bcftools view -s {sample}` exit "
+                    f"{view.returncode}: {view_stderr}")
+            self.assertEqual(
+                drop_ref.returncode, 0,
+                msg=f"per-sample drop-ref exit {drop_ref.returncode} "
+                    f"for {sample}: {drop_ref.stderr}")
+
+
+@unittest.skipUnless(
+    _HAVE_BCFTOOLS and _HAVE_TABIX and _HAVE_BGZIP
+    and _HAVE_MSPRIME and _HAVE_STDPOPSIM,
+    "needs bcftools/tabix/bgzip + msprime + stdpopsim",
+)
 class CohortStreamedDeterminismTest(unittest.TestCase):
     """Same seed → identical streamed BCFs across two re-runs.
 

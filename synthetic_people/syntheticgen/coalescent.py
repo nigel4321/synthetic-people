@@ -119,10 +119,18 @@ def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
         used_positions.add(pos)
 
         # var.genotypes: array of allele indices per haplotype slot.
-        # For BinaryMutationModel this is {0, 1}; genotypes > 0 carry
-        # the derived allele (ALT). Multi-allelic would need per-allele
-        # handling; at M5 we stick to biallelic.
+        # For BinaryMutationModel this is {0, 1}; for stdpopsim's
+        # default JC69MutationModel, recurrent mutations at the same
+        # position can produce alleles 2+ (multi-allelic). The cohort
+        # site dict declares a single ALT base, so emitting GT="2|0"
+        # references an ALT that doesn't exist — bcftools rejects it
+        # downstream with `Incorrect allele ("2") in <SAMPLE>`.
+        # Multi-allelic would need per-alt accounting (one ALT base
+        # per index, per-alt AC/AF, multi-alt VCF output); for now we
+        # keep cohort sites strictly biallelic and skip the rest.
         gts_arr = var.genotypes
+        if int(gts_arr.max(initial=0)) > 1:
+            continue
         n_alt_haplotypes = int((gts_arr > 0).sum())
         if n_alt_haplotypes == 0 or n_alt_haplotypes == n_haplotypes:
             # Fixed sites (no variation across cohort) are not variants.
