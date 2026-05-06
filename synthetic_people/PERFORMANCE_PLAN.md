@@ -545,6 +545,107 @@ Phase 5b2 once per-person derivation closes the loop.
 
 ---
 
+## Phase 5c — sparse in-memory genotype storage
+
+**Goal:** drop the per-chromosome RAM ceiling that 5b's streaming
+inherited. Phase 5b bounded peak at one chromosome's working set,
+but each chromosome's working set is `n × n_sites × ~100 B` for the
+dense `gts: list[str]` representation — at `n=3 000 × chr1×70 Mb`
+that's already ~30 GB, OOMs a 32 GB host. 5c stores cohort-site
+genotypes sparsely (carriers list of `(haplotype_idx, allele_idx)`
+for non-zero entries only), so per-chromosome RAM scales with alt
+observations rather than `n × n_sites`. SFS is singleton-dominated,
+so total alt observations grow as `n_sites × log(n)` — flat enough
+that n=100k+ fits comfortably on a workstation.
+
+**Branch:** `perf/phase5c-sparse-carriers`
+
+### Memory model
+
+Per chromosome at full chr1 (~70 Mb, ~100 k cohort sites):
+
+| `--n` | Dense `list[str]` (5b) | Sparse `carriers` (5c) |
+|---|--------:|--------:|
+| 500 | ~5 GB | ~10 MB |
+| 3 000 | ~30 GB (OOMs 32 GB host) | ~50 MB |
+| 100 000 | ~1 TB (infeasible) | ~600 MB |
+| 1 000 000 | ~10 TB (infeasible) | ~6 GB |
+
+Numbers reflect cohort-sites RAM only; tskit's own tree-sequence
+overhead is independent and adds ~1-2 GB at 1M scale. Sparse storage
+reaches n=100k cleanly and gets within reach of n=1M; the next
+bottleneck at 1M is the writer side — see Phase 5d below.
+
+### Tasks
+
+- [ ] **Add `cohort_sites.py` helper module** with
+  `carriers_from_dense_gts()`, `dense_gts_from_carriers()`,
+  `gt_for_person()`. Tests can keep building site fixtures from
+  dense GT lists; the helpers convert at the boundary.
+- [ ] **Refactor `coalescent._tree_sequence_to_sites`** to emit
+  sparse carriers from `var.genotypes` instead of dense
+  `list[str]`. Per-record memory drops from `O(n_people)` strings to
+  `O(non-zero entries)` int tuples.
+- [ ] **Refactor `admixture` simulator** the same way (it walks
+  tree sequences identically).
+- [ ] **Refactor `cohort.draw_cohort_background`** (legacy 1000G
+  path) to emit carriers from the slot array `assign_haplotypes`
+  already produces. Drops `_gts_from_slots`.
+- [ ] **Refactor `cohort.person_records_from_cohort`** to derive
+  this person's GT by scanning the carriers list rather than
+  indexing into a dense `gts` list. Per-site cost is O(carriers in
+  this site) — typically a small constant under SFS-realistic
+  cohorts.
+- [ ] **Refactor `bcf_writer.CohortBcfWriter.write_site`** to expand
+  carriers to dense GT strings at write time. Keep accepting
+  `site["gts"]` as a fallback for incremental fixture migration.
+- [ ] **Tests.** Update fixtures that hand-build cohort sites to
+  go through the helper. Add a regression test that runs
+  `simulate_cohort_iter` at moderately-large `n` and asserts
+  per-chromosome RAM stays under a sparse bound.
+- [x] **Quick measurement** at `n = 500 × chr22 × 70 Mb` (the
+  full-chromosome case the user originally failed on at n=30):
+  peak RSS **2.4 GB**, wall **1:19**. Cohort-sites RAM has dropped
+  from ~9 GB pre-5c (dense `list[str]`) to ~50 MB (sparse
+  carriers); the remaining 2 GB is tskit's tree sequence + ClinVar
+  load (independent of the cohort-sites refactor).
+- [ ] **Full benchmark at `n = 1 000 / 10 000 / 100 000`** —
+  follow-up. The 5c PR ships the path itself; a multi-hour
+  benchmark sweep lands separately.
+- [x] **Docs** — README + TUTORIAL: the sparse refactor is
+  internal, users see the same CLI and the same output. Plan
+  table shows projected vs realised peak RSS.
+
+---
+
+## Phase 5d — direct binary BCF writes (path to n=1M+)
+
+**Goal:** get past the writer-side bottleneck that emerges once
+sparse storage takes RAM out of the picture. At `n=1M × ~500 k
+sites` per chromosome, the text-VCF representation we currently
+pipe through `bcftools view -O b` is roughly 2 TB per chromosome
+(GT block is `n × ~3 B` per record). Bgzip throughput caps the
+write at ~5 hours per chromosome, ~5 days total — slow even on
+a fat workstation.
+
+**Status:** stub only. Keep on the plan so we can revisit when the
+1M scale becomes a real ask.
+
+**Approach:** swap the `bcftools view -O b -` subprocess for a
+direct binary BCF writer. Two viable libraries:
+
+- `pysam` — the obvious choice. Adds a ~30 MB compiled wheel to
+  the dep tree (its own htslib build with C extensions). Already
+  evaluated and rejected in 5a as a transitive dep cost; revisit
+  the cost/benefit at 1M scale.
+- A hand-rolled BCF encoder using `htslib` via `ctypes`. Lower
+  install cost, much higher implementation cost.
+
+**Out of scope for the current PR.** Phase 5c gets to n=100k
+cleanly; n=1M waits for 5d when it's actually needed.
+
+---
+
 ## Phase 6 — SQLite for side-state at scale
 
 **Goal:** consolidate the per-person side files

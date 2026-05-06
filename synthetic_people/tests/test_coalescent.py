@@ -46,7 +46,11 @@ class TestSimulateChromosome(unittest.TestCase):
             self.assertEqual(len(s["alts"]), 1)
             self.assertEqual(len(s["acs"]), 1)
             self.assertEqual(len(s["afs"]), 1)
-            self.assertEqual(len(s["gts"]), 6)
+            # Phase 5c: site shape carries n_haplotypes + sparse
+            # carriers rather than a dense gts list. n_people=6 →
+            # 12 haplotypes.
+            self.assertEqual(s["n_haplotypes"], 12)
+            self.assertIn("carriers", s)
 
     def test_positions_strictly_increasing(self):
         sites = self._run()
@@ -57,11 +61,11 @@ class TestSimulateChromosome(unittest.TestCase):
     def test_realised_ac_matches_declared(self):
         sites = self._run()
         for s in sites:
-            realised = 0
-            for gt in s["gts"]:
-                for tok in gt.split("|"):
-                    if int(tok) >= 1:
-                        realised += 1
+            # Sparse carriers: every entry is a non-zero allele, so
+            # AC equals the carriers count for biallelic sites.
+            realised = sum(
+                1 for _, allele in s["carriers"] if allele >= 1
+            )
             self.assertEqual(realised, s["acs"][0],
                              f"AC mismatch at {s['pos']}")
 
@@ -80,7 +84,8 @@ class TestSimulateChromosome(unittest.TestCase):
         for s1, s2 in zip(a, b):
             self.assertEqual(s1["pos"], s2["pos"])
             self.assertEqual(s1["acs"], s2["acs"])
-            self.assertEqual(s1["gts"], s2["gts"])
+            # Phase 5c: compare carriers (sparse) instead of gts.
+            self.assertEqual(s1["carriers"], s2["carriers"])
 
     def test_different_seeds_give_different_output(self):
         a = self._run(seed=1)
@@ -119,14 +124,14 @@ class TestSimulateChromosome(unittest.TestCase):
         sites = self._run(seed=42, demo_model="OutOfAfrica_3G09",
                           length_mb=0.3, n_people=5)
         self.assertGreater(len(sites), 5)
-        # Positions are still integer-valued, GTs well-formed, AC exact.
+        # Positions are still integer-valued; sparse carriers carry
+        # only allele index 1 (multi-allelic JC69 sites are dropped
+        # upstream so the cohort BCF stays biallelic-spec-clean).
         for s in sites:
             self.assertIsInstance(s["pos"], int)
-            for gt in s["gts"]:
-                parts = gt.split("|")
-                self.assertEqual(len(parts), 2)
-                for p in parts:
-                    self.assertIn(p, ("0", "1"))
+            for hap_idx, allele in s["carriers"]:
+                self.assertEqual(allele, 1)
+                self.assertLess(hap_idx, s["n_haplotypes"])
 
 
 @unittest.skipUnless(_HAVE_DEPS, "msprime/stdpopsim not installed")

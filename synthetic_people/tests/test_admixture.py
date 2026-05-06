@@ -94,8 +94,9 @@ class TestSimulateChromosome(unittest.TestCase):
     def test_realised_ac_matches_declared(self):
         sites, _ = self._run()
         for s in sites:
-            realised = sum(int(tok) for gt in s["gts"]
-                           for tok in gt.split("|"))
+            # Phase 5c sparse carriers — sum allele indices
+            # (binary mutation model, so all 1).
+            realised = sum(allele for _, allele in s["carriers"])
             self.assertEqual(realised, s["acs"][0],
                              f"AC mismatch at {s['pos']}")
 
@@ -106,7 +107,7 @@ class TestSimulateChromosome(unittest.TestCase):
         self.assertEqual(segs_a, segs_b)
         for s1, s2 in zip(sites_a, sites_b):
             self.assertEqual(s1["pos"], s2["pos"])
-            self.assertEqual(s1["gts"], s2["gts"])
+            self.assertEqual(s1["carriers"], s2["carriers"])
 
     def test_different_seeds_give_different_output(self):
         sites_a, _ = self._run(seed=1)

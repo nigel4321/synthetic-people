@@ -12,6 +12,16 @@ SFS matches the SFS we drew from — no smoothing from independent HWE
 resampling at every site. The pairing step inherits a mild
 hypergeometric-vs-HWE correction, which is if anything more realistic
 for a finite cohort than strict HWE draws.
+
+Phase 5c: per-site genotypes are stored as sparse ``carriers`` —
+``[(haplotype_idx, allele_idx), ...]`` for non-zero entries only —
+instead of the dense ``gts: list[str]`` shape earlier phases used.
+RAM scales with alt observations rather than ``n × n_sites``, so
+cohort sizes that previously OOM-killed (≥ 3 000 with full 22-chrom
+× 70 Mb input) finish on a workstation. See ``cohort_sites.py`` for
+the helper functions that round-trip between dense GT strings and
+sparse carriers — used by tests, the BCF writer, and the in-memory
+per-person fan-out.
 """
 
 from __future__ import annotations
@@ -47,9 +57,17 @@ def assign_haplotypes(n_haplotypes: int, allele_counts: list,
     return slots
 
 
-def _gts_from_slots(slots: list, n_people: int) -> list:
-    """Pair consecutive haplotype slots into phased diploid GT strings."""
-    return [f"{slots[2 * i]}|{slots[2 * i + 1]}" for i in range(n_people)]
+def _carriers_from_slots(slots: list) -> list:
+    """Convert a dense slot array to sparse carriers (Phase 5c).
+
+    ``slots[i]`` is the allele index assigned to haplotype slot ``i``;
+    we keep only the non-zero entries. The slot array can be released
+    by the caller once carriers are extracted, so RAM is bounded by
+    alt observations rather than ``n_haplotypes``.
+    """
+    return [
+        (idx, allele) for idx, allele in enumerate(slots) if allele > 0
+    ]
 
 
 def draw_cohort_background(pool: list, n_people: int, n_sites: int,
@@ -75,7 +93,6 @@ def draw_cohort_background(pool: list, n_people: int, n_sites: int,
         counts = draw_allele_counts(n_haplotypes, n_alts, alpha, rng)
         afs = [c / n_haplotypes for c in counts]
         slots = assign_haplotypes(n_haplotypes, counts, rng)
-        gts = _gts_from_slots(slots, n_people)
         sites.append({
             "chrom": entry["chrom"],
             "pos": entry["pos"],
@@ -84,7 +101,8 @@ def draw_cohort_background(pool: list, n_people: int, n_sites: int,
             "alts": list(entry["alts"]),
             "afs": afs,
             "acs": counts,
-            "gts": gts,
+            "n_haplotypes": n_haplotypes,
+            "carriers": _carriers_from_slots(slots),
         })
     return sites
 
@@ -95,12 +113,26 @@ def person_records_from_cohort(sites: list, person_index: int) -> list:
     Carries the M7 annotation fields (clnsig, clndn, cosmic_id,
     cosmic_gene) through to the per-person record dict so the writer can
     emit the corresponding INFO tags for that sample.
+
+    Phase 5c: scans the per-site sparse carriers list to find this
+    person's GT rather than indexing into a dense ``gts`` list.
+    Per-site cost is ``O(carriers)`` — a small constant under
+    SFS-realistic cohorts where most sites carry a handful of alt
+    observations.
     """
+    target_lo = 2 * person_index
+    target_hi = target_lo + 1
     records = []
     for site in sites:
-        gt = site["gts"][person_index]
-        if all(tok == "0" for tok in gt.split("|")):
+        a1 = a2 = 0
+        for hap_idx, allele_idx in site.get("carriers", ()):
+            if hap_idx == target_lo:
+                a1 = allele_idx
+            elif hap_idx == target_hi:
+                a2 = allele_idx
+        if a1 == 0 and a2 == 0:
             continue
+        gt = f"{a1}|{a2}"
         rec = {
             "chrom": site["chrom"],
             "pos": site["pos"],

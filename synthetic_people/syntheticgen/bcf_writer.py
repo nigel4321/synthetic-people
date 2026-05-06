@@ -27,6 +27,7 @@ import subprocess
 from pathlib import Path
 
 from .builds import BUILDS
+from .cohort_sites import dense_gts_from_carriers
 from .header import _ALT_SV, _FORMAT, _INFO_CORE, _INFO_SV
 
 
@@ -156,21 +157,34 @@ class CohortBcfWriter:
     def write_site(self, site: dict) -> None:
         """Write one cohort-site row.
 
-        The site dict is the same shape produced by ``simulate_cohort``
-        (chrom / pos / id / ref / alts / acs / gts plus optional
-        overlay metadata). Only the cohort-level GT block is emitted
-        here; per-call DP/GQ/AD are layered in at per-person derivation
+        Phase 5c: accepts either ``site["carriers"]`` (sparse
+        ``[(haplotype_idx, allele_idx), ...]`` — the canonical form
+        emitted by simulate_cohort_iter) or ``site["gts"]`` (legacy
+        dense list of ``"a|b"`` strings — kept as a fallback for
+        tests and any caller that hasn't migrated). Carriers expand
+        to dense GT strings at write time.
+
+        Per-call DP/GQ/AD are layered in at per-person derivation
         time, identical to today's writer.py behaviour.
         """
         if self._fh is None:
             raise RuntimeError("write_site called outside `with` block")
-        gts = site.get("gts")
-        if gts is None or len(gts) != self.n_people:
+
+        if "carriers" in site:
+            gts = dense_gts_from_carriers(site["carriers"], self.n_people)
+        elif site.get("gts") is not None:
+            gts = site["gts"]
+            if len(gts) != self.n_people:
+                raise ValueError(
+                    f"site at {site.get('chrom')}:{site.get('pos')} has "
+                    f"{len(gts)} GTs; expected {self.n_people}"
+                )
+        else:
             raise ValueError(
                 f"site at {site.get('chrom')}:{site.get('pos')} has "
-                f"{len(gts) if gts is not None else 'no'} GTs; expected "
-                f"{self.n_people}"
+                f"neither `carriers` nor `gts`; expected one"
             )
+
         # FORMAT carries GT only at the cohort level — DP/GQ/AD are
         # per-person and get drawn during per-person derivation.
         sample_block = "\t".join(gts)

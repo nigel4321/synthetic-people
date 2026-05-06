@@ -62,8 +62,10 @@ class SimulateCohortIterTest(unittest.TestCase):
         for chrom, sites in chunks:
             self.assertGreater(len(sites), 0)
             for s in sites:
-                # Same site dict shape the flat-list path produces.
-                for key in ("chrom", "pos", "ref", "alts", "gts"):
+                # Phase 5c shape: chrom/pos/ref/alts plus sparse
+                # carriers + n_haplotypes.
+                for key in ("chrom", "pos", "ref", "alts",
+                            "carriers", "n_haplotypes"):
                     self.assertIn(key, s)
                 self.assertEqual(s["chrom"], chrom)
 

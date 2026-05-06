@@ -23,7 +23,14 @@ from syntheticgen.dbsnp import _normalise_rsid, inject_rsids
 
 def _site(chrom: str, pos: int, ref: str, alt: str,
           gts: list | None = None) -> dict:
-    """Build a cohort site dict matching the M5 shape."""
+    """Build a cohort site dict matching the post-Phase-5c shape.
+
+    Tests still pass a human-readable list of GT strings;
+    ``carriers_from_dense_gts`` converts to the sparse storage shape
+    that production code emits, so overlay round-trips exercise the
+    same data path.
+    """
+    from syntheticgen.cohort_sites import carriers_from_dense_gts
     if gts is None:
         gts = ["0|0", "0|1", "1|1"]
     nalt = sum(int(t) for gt in gts for t in gt.split("|"))
@@ -32,7 +39,8 @@ def _site(chrom: str, pos: int, ref: str, alt: str,
         "chrom": chrom, "pos": pos, "id": ".",
         "ref": ref, "alts": [alt],
         "afs": [nalt / n_haps], "acs": [nalt],
-        "gts": list(gts),
+        "n_haplotypes": n_haps,
+        "carriers": carriers_from_dense_gts(gts),
     }
 
 
@@ -96,16 +104,20 @@ class TestInjectClinvar(unittest.TestCase):
             self.assertTrue(s["id"].startswith("VCV"))
 
     def test_preserves_gt_block(self):
+        from syntheticgen.cohort_sites import carriers_from_dense_gts
         gts = ["0|0", "0|1", "1|1", "0|0"]
+        expected_carriers = carriers_from_dense_gts(gts)
         sites = [_site("22", i * 100, "A", "G", gts=gts)
                  for i in range(1, 6)]
         records = [_clinvar_rec("22", 1_000_000 + i, "C", "T")
                    for i in range(10)]
         rng = random.Random(1)
         inject_clinvar(sites, records, density=0.4, rng=rng)
-        # Every site still carries the original GT string list.
+        # Every site still carries the original GT block — sparse
+        # carriers under Phase 5c, but representing the same per-
+        # person genotypes.
         for s in sites:
-            self.assertEqual(s["gts"], gts)
+            self.assertEqual(s["carriers"], expected_carriers)
 
     def test_keeps_sites_sorted(self):
         sites = [_site("22", i * 100, "A", "G") for i in range(1, 21)]
@@ -176,13 +188,15 @@ class TestInjectRsids(unittest.TestCase):
         self.assertEqual(len(with_id), 3)
 
     def test_preserves_gt_block(self):
+        from syntheticgen.cohort_sites import carriers_from_dense_gts
         gts = ["0|1", "1|0", "0|0"]
+        expected_carriers = carriers_from_dense_gts(gts)
         sites = [_site("22", i * 100, "A", "G", gts=gts)
                  for i in range(1, 6)]
         rng = random.Random(1)
         inject_rsids(sites, self._pool(), density=0.6, rng=rng)
         for s in sites:
-            self.assertEqual(s["gts"], gts)
+            self.assertEqual(s["carriers"], expected_carriers)
 
     def test_reserve_indices_excluded(self):
         sites = [_site("22", i * 100, "A", "G") for i in range(1, 6)]

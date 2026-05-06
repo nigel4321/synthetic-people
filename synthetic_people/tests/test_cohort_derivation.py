@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from syntheticgen.bcf_writer import CohortBcfWriter
 from syntheticgen.cohort import person_records_from_cohort
 from syntheticgen.cohort_derivation import derive_person_records
+from syntheticgen.cohort_sites import carriers_from_dense_gts
 
 
 _HAVE_BCFTOOLS = shutil.which("bcftools") is not None
@@ -39,6 +40,12 @@ def _site(pos: int, ref: str, alt: str, gts: list,
           chrom: str = "22", site_id: str = ".",
           **extra) -> dict:
     nalt = sum(int(t) for gt in gts for t in gt.split("|"))
+    # Phase 5c: site stores sparse carriers — derived from the
+    # human-readable dense GTs the test passed in. The BCF writer's
+    # dense-gts fallback accepts either form, but
+    # person_records_from_cohort now requires carriers, so we go
+    # through the sparse shape here for both branches to share a
+    # fixture.
     site = {
         "chrom": chrom,
         "pos": pos,
@@ -47,7 +54,8 @@ def _site(pos: int, ref: str, alt: str, gts: list,
         "alts": [alt],
         "afs": [nalt / (2 * len(gts)) if gts else 0],
         "acs": [nalt],
-        "gts": list(gts),
+        "n_haplotypes": 2 * len(gts),
+        "carriers": carriers_from_dense_gts(list(gts)),
     }
     site.update(extra)
     return site

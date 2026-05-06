@@ -147,6 +147,14 @@ def simulate_chromosome(chrom: str, build: str, n_people: int,
 def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
                             rng: random.Random,
                             titv_target: float) -> list:
+    """Phase 5c: emits sparse carriers, matching coalescent.py.
+
+    The admixture path uses BinaryMutationModel (only allele indices
+    {0, 1}), so the multi-allelic skip in coalescent's converter is
+    unnecessary here — but the rest of the structure stays in sync
+    so a downstream consumer doesn't have to know which path
+    produced a given site.
+    """
     n_haplotypes = 2 * n_people
     sites: list = []
     used: set = set()
@@ -165,8 +173,10 @@ def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
         alt = choose_alt(ref, rng, target=titv_target)
         assert alt is not None
 
-        gts = [f"{int(gts_arr[2 * i])}|{int(gts_arr[2 * i + 1])}"
-               for i in range(n_people)]
+        carriers = [
+            (int(idx), int(allele))
+            for idx, allele in enumerate(gts_arr) if allele > 0
+        ]
         sites.append({
             "chrom": chrom,
             "pos": pos,
@@ -175,7 +185,8 @@ def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
             "alts": [alt],
             "afs": [nalt / n_haplotypes],
             "acs": [nalt],
-            "gts": gts,
+            "n_haplotypes": n_haplotypes,
+            "carriers": carriers,
         })
     return sites
 

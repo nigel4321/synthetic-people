@@ -96,10 +96,14 @@ class TestSimulateCohortDeterminism(unittest.TestCase):
 
 
 def _summary(sites: list) -> list:
-    """Project a sites list to its serialisable, comparable contents."""
+    """Project a sites list to its serialisable, comparable contents.
+
+    Phase 5c: cohort sites carry sparse carriers rather than dense
+    GT lists; sort the carrier tuples for stable comparison.
+    """
     return [
         (s["chrom"], s["pos"], s["ref"], tuple(s["alts"]),
-         tuple(s["acs"]), tuple(s["gts"]))
+         tuple(s["acs"]), tuple(sorted(s["carriers"])))
         for s in sites
     ]
 

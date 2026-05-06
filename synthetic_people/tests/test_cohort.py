@@ -14,6 +14,28 @@ from syntheticgen.cohort import (  # noqa: E402
     draw_cohort_background,
     person_records_from_cohort,
 )
+from syntheticgen.cohort_sites import (  # noqa: E402
+    carriers_from_dense_gts,
+    dense_gts_from_carriers,
+)
+
+
+def _site_with_dense_gts(gts, n_people=None, **fields):
+    """Test helper — build a Phase-5c-shaped site dict from a
+    human-readable list of GT strings.
+
+    Tests stay readable (gts as ``["0|1", "1|1", ...]``) while the
+    storage on the site itself matches what production code emits
+    (sparse carriers).
+    """
+    if n_people is None:
+        n_people = len(gts)
+    site = {
+        "n_haplotypes": 2 * n_people,
+        "carriers": carriers_from_dense_gts(gts),
+    }
+    site.update(fields)
+    return site
 
 
 def _pool(n: int = 50, seed: int = 99) -> list:
@@ -79,7 +101,9 @@ class TestDrawCohortBackground(unittest.TestCase):
         sites = draw_cohort_background(pool, n_people=10, n_sites=25,
                                        alpha=2.0, rng=rng)
         for site in sites:
-            self.assertEqual(len(site["gts"]), 10)
+            # Phase 5c: GTs live as sparse carriers; n_haplotypes
+            # tracks the cohort cardinality.
+            self.assertEqual(site["n_haplotypes"], 2 * 10)
             self.assertEqual(len(site["acs"]), len(site["alts"]))
             self.assertEqual(len(site["afs"]), len(site["alts"]))
 
@@ -92,11 +116,12 @@ class TestDrawCohortBackground(unittest.TestCase):
                                        alpha=2.0, rng=rng)
         for site in sites:
             for alt_idx, expected in enumerate(site["acs"], start=1):
-                realised = 0
-                for gt in site["gts"]:
-                    for tok in gt.split("|"):
-                        if int(tok) == alt_idx:
-                            realised += 1
+                # Sparse carriers: the count of (_, allele) tuples
+                # whose allele matches alt_idx is the realised AC.
+                realised = sum(
+                    1 for _, allele in site["carriers"]
+                    if allele == alt_idx
+                )
                 self.assertEqual(realised, expected,
                                  f"AC mismatch at {site['chrom']}:{site['pos']}")
 
@@ -122,18 +147,19 @@ class TestDrawCohortBackground(unittest.TestCase):
             self.assertEqual(s1["chrom"], s2["chrom"])
             self.assertEqual(s1["pos"], s2["pos"])
             self.assertEqual(s1["acs"], s2["acs"])
-            self.assertEqual(s1["gts"], s2["gts"])
+            # Phase 5c: compare carriers (sparse) instead of dense GTs.
+            self.assertEqual(s1["carriers"], s2["carriers"])
 
 
 class TestPersonRecordsFromCohort(unittest.TestCase):
     def test_drops_hom_ref(self):
         sites = [
-            {"chrom": "1", "pos": 100, "id": ".", "ref": "A", "alts": ["G"],
-             "afs": [0.2], "acs": [1],
-             "gts": ["0|1", "0|0", "1|1"]},
-            {"chrom": "1", "pos": 200, "id": ".", "ref": "C", "alts": ["T"],
-             "afs": [0.1], "acs": [1],
-             "gts": ["0|0", "0|0", "0|1"]},
+            _site_with_dense_gts(
+                ["0|1", "0|0", "1|1"], chrom="1", pos=100, id=".",
+                ref="A", alts=["G"], afs=[0.2], acs=[1]),
+            _site_with_dense_gts(
+                ["0|0", "0|0", "0|1"], chrom="1", pos=200, id=".",
+                ref="C", alts=["T"], afs=[0.1], acs=[1]),
         ]
         # Person 0: one het, one hom-ref → 1 record.
         self.assertEqual(len(person_records_from_cohort(sites, 0)), 1)
@@ -144,9 +170,9 @@ class TestPersonRecordsFromCohort(unittest.TestCase):
 
     def test_carries_coords_and_gt(self):
         sites = [
-            {"chrom": "22", "pos": 42, "id": "rs1", "ref": "A",
-             "alts": ["G"], "afs": [0.3], "acs": [2],
-             "gts": ["0|1"]},
+            _site_with_dense_gts(
+                ["0|1"], chrom="22", pos=42, id="rs1",
+                ref="A", alts=["G"], afs=[0.3], acs=[2]),
         ]
         recs = person_records_from_cohort(sites, 0)
         self.assertEqual(recs[0]["chrom"], "22")

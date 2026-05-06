@@ -105,7 +105,15 @@ def simulate_chromosome(chrom: str, build: str, n_people: int,
 def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
                             rng: random.Random,
                             titv_target: float) -> list:
-    """Convert an msprime TreeSequence to cohort site dicts."""
+    """Convert an msprime TreeSequence to cohort site dicts.
+
+    Phase 5c: emits sparse ``carriers`` rather than dense
+    ``gts: list[str]``. Per-site memory drops from
+    ``O(n_people)`` GT strings to ``O(non-zero entries)`` int
+    tuples — the difference between hundreds of MB and a few MB
+    per site at ``n=100 000``. See ``cohort_sites.py`` for the
+    helper functions that round-trip between the two shapes.
+    """
     n_haplotypes = 2 * n_people
     sites = []
     used_positions: set = set()
@@ -122,12 +130,13 @@ def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
         # For BinaryMutationModel this is {0, 1}; for stdpopsim's
         # default JC69MutationModel, recurrent mutations at the same
         # position can produce alleles 2+ (multi-allelic). The cohort
-        # site dict declares a single ALT base, so emitting GT="2|0"
-        # references an ALT that doesn't exist — bcftools rejects it
-        # downstream with `Incorrect allele ("2") in <SAMPLE>`.
-        # Multi-allelic would need per-alt accounting (one ALT base
-        # per index, per-alt AC/AF, multi-alt VCF output); for now we
-        # keep cohort sites strictly biallelic and skip the rest.
+        # site dict declares a single ALT base, so emitting allele
+        # index 2+ references an ALT that doesn't exist — bcftools
+        # rejects it downstream with `Incorrect allele ("2") in
+        # <SAMPLE>`. Multi-allelic would need per-alt accounting (one
+        # ALT base per index, per-alt AC/AF, multi-alt VCF output);
+        # for now we keep cohort sites strictly biallelic and skip
+        # the rest.
         gts_arr = var.genotypes
         if int(gts_arr.max(initial=0)) > 1:
             continue
@@ -142,8 +151,15 @@ def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
         alt = choose_alt(ref, rng, target=titv_target)
         assert alt is not None  # ref is always a standard base
 
-        gts = [f"{int(gts_arr[2 * i])}|{int(gts_arr[2 * i + 1])}"
-               for i in range(n_people)]
+        # Sparse carriers: only emit the non-zero entries. With binary
+        # mutations every non-zero entry is allele index 1, so
+        # ``carriers`` reduces to a list of haplotype indices paired
+        # with the constant 1; we still store the tuple form for shape
+        # parity with the multi-allelic legacy path.
+        carriers = [
+            (int(idx), int(allele))
+            for idx, allele in enumerate(gts_arr) if allele > 0
+        ]
         sites.append({
             "chrom": chrom,
             "pos": pos,
@@ -152,7 +168,8 @@ def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
             "alts": [alt],
             "afs": [n_alt_haplotypes / n_haplotypes],
             "acs": [n_alt_haplotypes],
-            "gts": gts,
+            "n_haplotypes": n_haplotypes,
+            "carriers": carriers,
         })
     return sites
 
