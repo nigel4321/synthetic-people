@@ -856,6 +856,63 @@ visible progress without flooding stderr. You'll see things like:
 Small cohorts that finish in under twenty seconds skip the
 intermediate logs and just print the final summary.
 
+### 9.5 Chunked simulation — `--chr-chunk-mb` (Phase 5f)
+
+At cohort sizes around `n=3000` and full-chromosome lengths,
+msprime's working memory during a single chromosome's simulation
+can exceed available RAM on workstation-class hosts (8-16+ GB at
+`n=3000 × chr1 × 70 Mb × OutOfAfrica_3G09`). Phase 5f splits each
+chromosome into independent sub-chunks so per-chunk working memory
+fits the host:
+
+```bash
+generate_people.py --n 3000 --seed 45 --chromosomes 1-22 \
+    --chr-length-mb 70 --output-dir ~/out
+# auto-picks --chr-chunk-mb based on free RAM and --workers
+```
+
+The default (`--chr-chunk-mb 0`) auto-picks a chunk size at run
+start using `psutil.virtual_memory().available` and the
+configured worker count, aiming for the per-chunk working set
+(estimated from `n × chunk_size × demo_model_factor`) to stay
+under ~50% of free RAM. The chosen value is logged so the user
+sees what was picked:
+
+```
+  --chr-chunk-mb auto-picked 8.74 Mb (available RAM 16.0 GB,
+  --workers 4, n=3000)
+```
+
+To pin a specific chunk size — useful for reproducibility across
+heterogeneous hosts, or to force smaller chunks for safety —
+pass an explicit value:
+
+```bash
+generate_people.py … --chr-chunk-mb 5
+```
+
+**Cross-chunk LD caveat.** Chunks simulate independently, so
+linkage disequilibrium decays sharply at chunk boundaries.
+Each chunk simulates ~5-10% past its declared end (boundary
+smoothing — variants past the chunk end are dropped at write
+time, but their presence makes the central region's coalescent
+context less truncated), but this isn't true cross-chunk LD
+recovery. Effects on common analyses:
+
+| Analysis | Impact under chunking |
+|---|---|
+| Ti/Tv | unaffected |
+| Allele frequency spectrum | unaffected |
+| Per-person genotype lists | unaffected (each chunk's haplotypes stay consistent across the cohort) |
+| ClinVar / dbSNP / COSMIC overlay placement | unaffected (overlays operate within chunks) |
+| Short-range LD (≤ chunk size) | preserved within chunks |
+| Long-range LD (> chunk size) | NOT realistic — analyses requiring chr-scale haplotype block structure should not use chunked mode |
+
+If your analysis depends on chr-scale LD, use
+`--chr-chunk-mb N` with `N ≥ chr_length_mb` (or pass `0` on a
+host with enough RAM that auto-pick keeps the full chromosome
+in one chunk).
+
 ---
 
 ## 10. Troubleshooting

@@ -25,3 +25,9 @@ stdpopsim>=0.2
 matplotlib>=3.7
 scikit-allel>=1.3
 scikit-learn>=1.3
+
+# Phase 5f (chunked simulation auto-pick): query available system RAM
+# at run start to size each chunk so the per-chunk msprime working
+# memory fits the host. `--chr-chunk-mb 0` (default) needs psutil;
+# explicit `--chr-chunk-mb N` works without it.
+psutil>=5.9

@@ -31,6 +31,87 @@ DEFAULT_MU = 1.29e-8           # human average mutation rate
 DEFAULT_CHR_LENGTH_MB = 5.0    # simulated span per chromosome (0 = full)
 
 
+# ---------------------------------------------------------------------------
+# Phase 5f — chunked simulation memory model
+# ---------------------------------------------------------------------------
+# Auto-pick a per-chunk simulation length such that msprime's working
+# memory fits the host. Calibrated empirically: at n=3000 × 70 Mb ×
+# OutOfAfrica_3G09, a single full-chromosome sim's working set was
+# ~12-16 GB on the user's failing run. That works out to about
+# 80 KiB of working memory per (sample × Mb). Constant-Ne msprime
+# (`--demo-model none`) is roughly 5× cheaper because there are no
+# bottleneck spikes in the active-lineage count.
+#
+# These constants are intentionally pessimistic — better to pick a
+# slightly smaller chunk than the host strictly needs and waste a bit
+# of throughput than to OOM mid-simulation. Users with surprising
+# working memory can override via `--chr-chunk-mb N`.
+CHUNK_RAM_BYTES_PER_SAMPLE_PER_MB_OOA = 80 * 1024
+CHUNK_RAM_BYTES_PER_SAMPLE_PER_MB_CONSTANT_NE = 16 * 1024
+
+# Each chunk simulates a small overlap margin past its declared end so
+# the central region's coalescent context isn't truncated abruptly at
+# the boundary. Variants in the trailing overlap are dropped at write
+# time so the per-chrom BCF stays duplicate-free. Documented as
+# *boundary smoothing*, not true cross-chunk LD recovery — chunks are
+# still independent simulations.
+CHUNK_OVERLAP_FRACTION = 0.10   # 10% of chunk size
+CHUNK_OVERLAP_MIN_BP = 500_000  # 0.5 Mb floor — too small and the
+                                # overlap doesn't help the boundary
+CHUNK_OVERLAP_MAX_BP = 5_000_000  # 5 Mb ceiling — past that we'd be
+                                  # paying for simulation we won't use
+
+
+def estimate_chunk_ram_bytes(n_people: int, chunk_size_mb: float,
+                             demo_model: str | None) -> int:
+    """Estimate msprime's per-chunk peak working memory in bytes.
+
+    Used by the auto-pick path to pick the largest chunk size whose
+    estimated working set fits the host. Pessimistic by design — the
+    cost of a slight under-pick is wasted throughput; the cost of an
+    over-pick is OOM mid-run.
+    """
+    if demo_model is None or (
+        isinstance(demo_model, str) and demo_model.lower() == "none"
+    ):
+        rate = CHUNK_RAM_BYTES_PER_SAMPLE_PER_MB_CONSTANT_NE
+    else:
+        rate = CHUNK_RAM_BYTES_PER_SAMPLE_PER_MB_OOA
+    return int(rate * n_people * chunk_size_mb)
+
+
+def auto_pick_chunk_size_mb(n_people: int, length_mb: float,
+                            demo_model: str | None,
+                            available_bytes: int,
+                            workers: int = 1,
+                            target_fraction: float = 0.5) -> float:
+    """Pick the largest chunk size whose estimated working set fits
+    in ``target_fraction × available_bytes / workers``.
+
+    Workers are accounted for because each parallel worker holds one
+    chunk's tree sequence simultaneously — peak system RAM is
+    ``workers × per-chunk RAM``.
+
+    Returns the chunk size in megabases. If a single full-chromosome
+    simulation already fits the budget, returns ``length_mb`` (no
+    chunking needed).
+    """
+    if length_mb <= 0:
+        return 0.0
+    per_worker_target = max(
+        1, int(available_bytes * target_fraction // max(1, workers))
+    )
+    full_estimate = estimate_chunk_ram_bytes(n_people, length_mb, demo_model)
+    if full_estimate <= per_worker_target:
+        return length_mb
+    # Scale the chunk size linearly with the budget overshoot. The
+    # estimate is linear in chunk_size_mb (rate × n × mb), so the
+    # right chunk size is just length_mb × (target / full_estimate).
+    factor = per_worker_target / full_estimate
+    chunk_mb = max(1.0, length_mb * factor)
+    return chunk_mb
+
+
 def _require_deps():
     """Import msprime/stdpopsim lazily so the package works without them."""
     try:
@@ -48,7 +129,8 @@ def simulate_chromosome(chrom: str, build: str, n_people: int,
                         length_mb: float, demo_model: str | None,
                         population: str, rec_rate: float, mu: float,
                         rng: random.Random,
-                        titv_target: float = DEFAULT_TARGET_TITV) -> list:
+                        titv_target: float = DEFAULT_TARGET_TITV,
+                        chunk_size_mb: float = 0.0) -> list:
     """Simulate one chromosome and return a list of cohort site dicts.
 
     With `demo_model` set, we drive the simulation through stdpopsim so
@@ -57,25 +139,69 @@ def simulate_chromosome(chrom: str, build: str, n_people: int,
     size Ne=10_000 single-population coalescent driven directly by
     `msprime.sim_ancestry` — faster and dependency-lighter, but no LD
     map and no realistic demography.
+
+    Phase 5f: when ``chunk_size_mb > 0`` and smaller than the simulated
+    chromosome length, the chromosome is split into independent
+    sub-chunks. Each chunk is its own msprime simulation against a
+    contig of length ``chunk_size_mb + overlap_margin``; per-chunk
+    seeds derive deterministically from a chromosome seed plus the
+    chunk index, so re-running the same configuration produces
+    byte-identical chunk outputs. Variants are emitted with positions
+    offset by ``chunk_index × chunk_size_bp`` in cohort coordinates.
+    The trailing overlap region of each chunk (positions ≥
+    ``chunk_size_bp``) is dropped at write time so the per-chrom site
+    list stays duplicate-free.
+
+    Tradeoff: cross-chunk LD is lost — chunks are independent
+    simulations, so haplotypes are uncorrelated across chunk
+    boundaries. Documented as *boundary smoothing* in
+    PERFORMANCE_PLAN §"Phase 5f".
     """
     _require_deps()
-    import msprime
-    import stdpopsim
 
     if chrom not in BUILDS[build]["contigs"]:
         raise ValueError(f"unknown chromosome {chrom!r} for build {build}")
     chrom_length = BUILDS[build]["contigs"][chrom]
-    sim_length = int(chrom_length if length_mb <= 0
-                     else min(chrom_length, length_mb * 1_000_000))
+    sim_length_bp = int(chrom_length if length_mb <= 0
+                        else min(chrom_length, length_mb * 1_000_000))
 
-    # Seeds: use rng to generate a deterministic int seed for msprime so
-    # outer-level --seed controls the coalescent path too.
-    seed = rng.randint(1, 2**31 - 1)
+    chunk_size_bp = int(chunk_size_mb * 1_000_000) if chunk_size_mb > 0 else 0
+    if chunk_size_bp <= 0 or chunk_size_bp >= sim_length_bp:
+        # Single-chunk path: today's behaviour. msprime simulates the
+        # full requested length in one pass.
+        seed = rng.randint(1, 2**31 - 1)
+        ts = _simulate_one(chrom, build, n_people, sim_length_bp,
+                           demo_model, population, rec_rate, mu, seed)
+        return _tree_sequence_to_sites(
+            ts, chrom, n_people, rng, titv_target, position_offset=0)
+
+    return _simulate_chromosome_chunked(
+        chrom, build, n_people, sim_length_bp, chunk_size_bp,
+        demo_model, population, rec_rate, mu, rng, titv_target,
+    )
+
+
+def _simulate_one(chrom: str, build: str, n_people: int,
+                  sim_length_bp: int, demo_model: str | None,
+                  population: str, rec_rate: float, mu: float,
+                  seed: int):
+    """Run msprime once for a single contig of length ``sim_length_bp``.
+
+    Pulled out so both the whole-chromosome path and the chunked path
+    share the same simulation invocation. Returns the raw tree
+    sequence; the caller is responsible for iterating variants and
+    freeing the tree sequence when done.
+    """
+    import msprime
+    import stdpopsim
 
     if demo_model is not None:
         species = stdpopsim.get_species("HomSap")
-        # `right=sim_length` slices the chromosome to a prefix region.
-        contig = species.get_contig(chrom, right=sim_length)
+        # `right=sim_length_bp` slices the contig to a prefix region.
+        # Each chunk simulates *as if* it were the first
+        # sim_length_bp bp of `chrom`, with chunk-specific seeds
+        # making chunks independent.
+        contig = species.get_contig(chrom, right=sim_length_bp)
         model = species.get_demographic_model(demo_model)
         pop_names = [p.name for p in model.populations]
         if population not in pop_names:
@@ -84,27 +210,94 @@ def simulate_chromosome(chrom: str, build: str, n_people: int,
                 f"{pop_names}"
             )
         engine = stdpopsim.get_engine("msprime")
-        ts = engine.simulate(model, contig, {population: n_people},
-                             seed=seed)
-    else:
-        ts = msprime.sim_ancestry(
-            samples=n_people,
-            population_size=10_000,
-            sequence_length=sim_length,
-            recombination_rate=rec_rate,
-            random_seed=seed,
-        )
-        ts = msprime.sim_mutations(
-            ts, rate=mu, random_seed=seed,
-            model=msprime.BinaryMutationModel(),
-        )
+        return engine.simulate(model, contig, {population: n_people},
+                               seed=seed)
+    ts = msprime.sim_ancestry(
+        samples=n_people,
+        population_size=10_000,
+        sequence_length=sim_length_bp,
+        recombination_rate=rec_rate,
+        random_seed=seed,
+    )
+    return msprime.sim_mutations(
+        ts, rate=mu, random_seed=seed,
+        model=msprime.BinaryMutationModel(),
+    )
 
-    return _tree_sequence_to_sites(ts, chrom, n_people, rng, titv_target)
+
+def _chunk_overlap_bp(chunk_size_bp: int) -> int:
+    """Per-chunk overlap margin in bp — clamped to the configured min/max."""
+    overlap = int(chunk_size_bp * CHUNK_OVERLAP_FRACTION)
+    return max(CHUNK_OVERLAP_MIN_BP, min(CHUNK_OVERLAP_MAX_BP, overlap))
+
+
+def _simulate_chromosome_chunked(
+    chrom: str, build: str, n_people: int,
+    sim_length_bp: int, chunk_size_bp: int,
+    demo_model: str | None, population: str,
+    rec_rate: float, mu: float,
+    rng: random.Random, titv_target: float,
+) -> list:
+    """Drive the per-chrom simulation as a sequence of independent
+    sub-chunks. Each chunk's tree sequence is built, iterated, and
+    freed before the next chunk's simulation starts.
+
+    Determinism: a single ``chrom_seed`` is drawn from ``rng`` up
+    front, and each chunk's per-msprime seed is derived from
+    ``chrom_seed + chunk_index`` via a Knuth-style multiplicative mix.
+    This way the same ``--seed`` produces the same chunks regardless
+    of how many were already simulated in a previous resume.
+    """
+    overlap_bp = _chunk_overlap_bp(chunk_size_bp)
+    chrom_seed = rng.randint(1, 2**31 - 1)
+
+    sites: list = []
+    chunk_index = 0
+    cursor_bp = 0
+    while cursor_bp < sim_length_bp:
+        chunk_end_bp = min(cursor_bp + chunk_size_bp, sim_length_bp)
+        is_last = (chunk_end_bp >= sim_length_bp)
+        chunk_extent_bp = (chunk_end_bp - cursor_bp
+                           + (overlap_bp if not is_last else 0))
+
+        # Knuth-style multiplicative hash to mix chrom_seed and
+        # chunk_index into a uniform 31-bit chunk seed. Avoids the
+        # rng-state-dependence of `rng.randint` per chunk so a resumed
+        # run sees the same chunk seed regardless of which chunks
+        # have already been simulated.
+        chunk_seed = (chrom_seed + chunk_index * 0x9E3779B9) & 0x7FFFFFFF
+        if chunk_seed == 0:
+            chunk_seed = 1  # msprime rejects seed=0
+        chunk_rng = random.Random(chunk_seed)
+
+        ts = _simulate_one(
+            chrom, build, n_people, chunk_extent_bp,
+            demo_model, population, rec_rate, mu, chunk_seed,
+        )
+        # ``chunk_size_bp`` is the chunk's logical size in chunk-local
+        # coordinates — variants past it are in the trailing-overlap
+        # region and belong to the next chunk's simulation, so we
+        # drop them to keep the per-chrom site list dedup-free.
+        keep_below = chunk_end_bp - cursor_bp
+        chunk_sites = _tree_sequence_to_sites(
+            ts, chrom, n_people, chunk_rng, titv_target,
+            position_offset=cursor_bp,
+            keep_below_bp=keep_below,
+        )
+        # Drop the tree sequence reference so its msprime working
+        # memory can be reclaimed before the next chunk's sim.
+        del ts
+        sites.extend(chunk_sites)
+        cursor_bp = chunk_end_bp
+        chunk_index += 1
+    return sites
 
 
 def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
                             rng: random.Random,
-                            titv_target: float) -> list:
+                            titv_target: float,
+                            position_offset: int = 0,
+                            keep_below_bp: int | None = None) -> list:
     """Convert an msprime TreeSequence to cohort site dicts.
 
     Phase 5c: emits sparse ``carriers`` rather than dense
@@ -113,15 +306,37 @@ def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
     tuples — the difference between hundreds of MB and a few MB
     per site at ``n=100 000``. See ``cohort_sites.py`` for the
     helper functions that round-trip between the two shapes.
+
+    Phase 5f chunked-simulation hooks:
+
+    - ``position_offset`` shifts every emitted variant's POS by the
+      given bp count, so a chunk simulating "the first chunk_extent
+      of chr1" can land its variants at the correct cohort
+      coordinates without re-simulating the chromosome prefix.
+    - ``keep_below_bp`` (when set) drops variants whose simulated
+      position is at or above this bp threshold. Used by the chunked
+      path to discard variants in the trailing-overlap region of
+      each chunk (those positions belong to the next chunk's
+      simulation, kept dedup-free by emitting them only once from
+      whichever chunk owns them).
     """
     n_haplotypes = 2 * n_people
     sites = []
     used_positions: set = set()
     for var in ts.variants():
+        # Drop trailing-overlap variants on the chunked path. We test
+        # against the *simulated* position (pre-offset) so the
+        # comparison is straightforward: if the simulated coordinate
+        # is ≥ keep_below_bp, the variant belongs to the next chunk.
+        if (keep_below_bp is not None
+                and int(var.site.position) >= keep_below_bp):
+            continue
+
         # msprime positions are float along [0, sequence_length). VCF
         # positions are 1-based integers. Advance past collisions so no
-        # two sites land on the same POS.
-        pos = int(var.site.position) + 1
+        # two sites land on the same POS. The chunk position_offset
+        # shifts emitted POS into cohort coordinates.
+        pos = int(var.site.position) + 1 + position_offset
         while pos in used_positions:
             pos += 1
         used_positions.add(pos)
@@ -179,16 +394,20 @@ def _simulate_chromosome_from_seed(chrom: str, build: str, n_people: int,
                                    demo_model: str | None,
                                    population: str, rec_rate: float,
                                    mu: float, seed: int,
-                                   titv_target: float) -> list:
+                                   titv_target: float,
+                                   chunk_size_mb: float = 0.0) -> list:
     """Worker entry point — builds its own rng from the given seed.
 
     Module-level so it's picklable across the ProcessPoolExecutor task
-    boundary.
+    boundary. ``chunk_size_mb`` is forwarded to
+    :func:`simulate_chromosome`; ``0`` (the default) means single-pass
+    full-chromosome simulation, ``> 0`` means split into chunks.
     """
     rng = random.Random(seed)
     return simulate_chromosome(
         chrom, build, n_people, length_mb, demo_model, population,
         rec_rate, mu, rng, titv_target,
+        chunk_size_mb=chunk_size_mb,
     )
 
 
@@ -198,7 +417,8 @@ def simulate_cohort_iter(chromosomes: list, build: str, n_people: int,
                          rng: random.Random,
                          titv_target: float = DEFAULT_TARGET_TITV,
                          verbose: bool = False,
-                         workers: int = 1):
+                         workers: int = 1,
+                         chunk_size_mb: float = 0.0):
     """Yield ``(chrom, sites)`` pairs one chromosome at a time.
 
     The streaming counterpart of :func:`simulate_cohort` — used by the
@@ -230,6 +450,7 @@ def simulate_cohort_iter(chromosomes: list, build: str, n_people: int,
             sites = _simulate_chromosome_from_seed(
                 chrom, build, n_people, length_mb, demo_model,
                 population, rec_rate, mu, seed, titv_target,
+                chunk_size_mb,
             )
             if verbose:
                 print(f"    {len(sites)} variable sites on chrom "
@@ -254,6 +475,7 @@ def simulate_cohort_iter(chromosomes: list, build: str, n_people: int,
                 _simulate_chromosome_from_seed,
                 chrom, build, n_people, length_mb, demo_model,
                 population, rec_rate, mu, seed, titv_target,
+                chunk_size_mb,
             ))
             for chrom, seed in zip(chromosomes, seeds)
         ]
@@ -271,7 +493,8 @@ def simulate_cohort(chromosomes: list, build: str, n_people: int,
                     rng: random.Random,
                     titv_target: float = DEFAULT_TARGET_TITV,
                     verbose: bool = False,
-                    workers: int = 1) -> list:
+                    workers: int = 1,
+                    chunk_size_mb: float = 0.0) -> list:
     """Simulate a cohort and return all sites as a single flat list.
 
     Thin wrapper over :func:`simulate_cohort_iter` for callers that
@@ -284,6 +507,7 @@ def simulate_cohort(chromosomes: list, build: str, n_people: int,
     for _, sites in simulate_cohort_iter(
         chromosomes, build, n_people, length_mb, demo_model,
         population, rec_rate, mu, rng, titv_target, verbose, workers,
+        chunk_size_mb,
     ):
         all_sites.extend(sites)
     return all_sites

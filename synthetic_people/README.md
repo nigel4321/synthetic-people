@@ -313,6 +313,15 @@ Legacy-only flags (`--background-glob`, `--n-background`, `--af-min`,
   interrupted by OOM, SIGINT, or node failure. Param mismatches
   surface a clear error rather than silently re-using incompatible
   state.
+- `--chr-chunk-mb N` — split each chromosome's msprime simulation
+  into independent sub-chunks of `N` Mb. Bounds per-chunk peak
+  RAM for large cohorts. `0` (default) auto-picks a chunk size at
+  run start from `psutil.virtual_memory().available` and
+  `--workers`, aiming for the per-chunk working set to stay under
+  ~50% of free RAM. Positive `N` overrides. Chunks simulate
+  independently, so cross-chunk LD is lost — short-range LD inside
+  each chunk is preserved, long-range (>chunk size) is not. See
+  PERFORMANCE_PLAN §"Phase 5f" for the full memory model.
 - Long-running runs print throttled progress lines (~20 s cadence)
   during the cohort BCF write and the per-person fan-out — `cohort
   BCF: 12,345/100,000 sites (4,500/s)` and `person VCFs: 1,234/100,000
@@ -898,3 +907,4 @@ Tracked in `IMPLEMENTATION_PLAN.md`:
 | `--workers` | [perf] Worker processes for the per-chromosome pool and the per-person pool. `0` = auto (`os.cpu_count()`), `1` = serial. Linux only. | `0` |
 | `--mode` | [perf] Output shape: `per-person` (default), `cohort` (skip per-person fan-out), or `both`. All three flow through the streamed cohort pipeline — derive per-person VCFs later via `bcftools view -s` against the per-chrom cohort BCFs. | `per-person` |
 | `--no-resume` | [perf] Ignore any existing `cohort.meta.json` + cohort BCFs and start a fresh simulation. Default behaviour resumes a prior run when its params match. | `False` |
+| `--chr-chunk-mb` | [perf] Split each chromosome's msprime simulation into independent sub-chunks of this size (Mb). `0` = auto-pick from `psutil.virtual_memory().available` and `--workers`. Cross-chunk LD is lost (chunks simulate independently); short-range LD within chunks is preserved. | `0` (auto) |

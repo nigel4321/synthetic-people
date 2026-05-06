@@ -53,6 +53,7 @@ from .coalescent import (
     DEFAULT_MU,
     DEFAULT_POPULATION,
     DEFAULT_REC_RATE,
+    auto_pick_chunk_size_mb,
     simulate_cohort,
     simulate_cohort_iter,
 )
@@ -410,6 +411,17 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                    help="[coalescent] Simulated prefix length per "
                         "chromosome in Mb. 0 = full length (slow on big "
                         "chromosomes, fine for chr22).")
+    p.add_argument("--chr-chunk-mb", type=float, default=0.0,
+                   help="[coalescent, perf] Split each chromosome's "
+                        "msprime simulation into independent sub-chunks "
+                        "of this size (Mb). Bounds per-chunk peak RAM "
+                        "for large cohorts. 0 (default) = auto-pick "
+                        "from `psutil.virtual_memory().available` and "
+                        "`--workers`; positive value overrides. Larger "
+                        "chunks preserve cross-chunk LD better but use "
+                        "more peak RAM during simulation. See "
+                        "PERFORMANCE_PLAN §\"Phase 5f\" for the "
+                        "boundary-smoothing semantics.")
     p.add_argument("--demo-model", default=DEFAULT_DEMO_MODEL,
                    help="[coalescent] stdpopsim demographic model id. "
                         "Pass 'none' for a constant-size Ne=10k "
@@ -615,6 +627,50 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
             file=sys.stderr,
         )
 
+    # demo_model gets normalised once up front because both the
+    # chunk-size auto-pick (below) and the streaming loop (further
+    # below) reference it.
+    demo_model = (None if args.demo_model.lower() == "none"
+                  else args.demo_model)
+
+    # Phase 5f — auto-pick chunk size when not explicitly set. We
+    # query free RAM at run start and divide by `workers` so each
+    # parallel worker holds at most one chunk's tree sequence in its
+    # share of the budget. Explicit `--chr-chunk-mb N > 0` overrides
+    # the auto-pick.
+    chunk_size_mb = args.chr_chunk_mb
+    if chunk_size_mb <= 0 and not args.legacy_background:
+        try:
+            import psutil
+            available = psutil.virtual_memory().available
+            chunk_size_mb = auto_pick_chunk_size_mb(
+                n_people=args.n, length_mb=args.chr_length_mb,
+                demo_model=demo_model, available_bytes=available,
+                workers=workers,
+            )
+            picked_msg = (
+                f"  --chr-chunk-mb auto-picked {chunk_size_mb:.2f} Mb "
+                f"(available RAM {available / (1024**3):.1f} GB, "
+                f"--workers {workers}, n={args.n})"
+            )
+            if chunk_size_mb >= args.chr_length_mb:
+                picked_msg += " — full-chromosome sim fits, no chunking"
+            print(picked_msg, file=sys.stderr)
+        except ImportError:
+            print(
+                "  --chr-chunk-mb auto-pick needs `psutil` "
+                "(`pip install psutil`); falling back to "
+                "full-chromosome simulation. Pass `--chr-chunk-mb N` "
+                "to set a chunk size explicitly.",
+                file=sys.stderr,
+            )
+            chunk_size_mb = 0.0
+    elif chunk_size_mb > 0:
+        print(
+            f"  --chr-chunk-mb override: {chunk_size_mb:.2f} Mb",
+            file=sys.stderr,
+        )
+
     print(
         f"Simulating coalescent cohort (streamed): {args.n} people "
         f"across chroms {chromosomes} "
@@ -635,9 +691,6 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
         "rsid_injected": 0,
         "cosmic_injected": 0,
     }
-
-    demo_model = (None if args.demo_model.lower() == "none"
-                  else args.demo_model)
 
     bcf_t0 = time.monotonic()
     last_progress_log = bcf_t0
@@ -660,6 +713,7 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
         demo_model=demo_model, population=args.population,
         rec_rate=args.rec_rate, mu=args.mu,
         rng=rng, verbose=True, workers=workers,
+        chunk_size_mb=chunk_size_mb,
     ):
         # Each chromosome's overlays use a per-chrom rng seeded from
         # the resume record so they're independent of streaming order

@@ -703,65 +703,54 @@ Effect on common analyses:
 Documented as a 5f-specific caveat alongside Phase 1's
 rng-consumption note.
 
-### Tasks (when implementation starts)
+### Tasks
 
-- [ ] Add `--chr-chunk-mb N` CLI flag. Default `0` = auto-pick
+- [x] Add `--chr-chunk-mb N` CLI flag. Default `0` = auto-pick
   from available RAM at run start; explicit `N > 0` overrides.
   Chunk-size selection logged so the user sees what was picked.
-  Add `psutil>=5.9` to `synthetic_people/requirements.txt` for
-  the `virtual_memory()` query.
-- [ ] **Auto-pick logic** in `cli.py`. Estimate per-chunk peak
-  working memory as a function of `(n_people, demo_model,
-  chunk_size_bp)` — calibrate from a small benchmarking pass on
-  a known config, store coefficients in
-  `coalescent.py:CHUNK_RAM_MODEL` so the formula is testable in
-  isolation. Pick the largest chunk size whose estimate fits in
-  ≤ 50% of `psutil.virtual_memory().available`. Cap at the
-  configured `--chr-length-mb` (no point chunking smaller than
-  the chromosome itself).
-- [ ] **Chunk overlap** with default ~5-10% of chunk size. Each
-  chunk simulates `chunk_size + overlap_margin` bp; variants in
-  the overlap region of chunk K and chunk K+1 are written only
-  once (taken from chunk K) so the per-chrom BCF stays
-  duplicate-free. Overlap is documented as boundary smoothing,
-  not true LD recovery.
-- [ ] **Refactor `coalescent.simulate_chromosome`** (and its
-  admixture twin) to optionally split into sub-chunks. Each
-  sub-chunk runs the existing simulation pipeline against a
-  `species.get_contig(chrom, right=chunk_size_bp + overlap)`
-  contig (independent simulation, chunk-specific seed). Variants
-  are emitted with positions offset by `chunk_index ×
-  chunk_size`.
-- [ ] **Per-chunk seeds** derive deterministically from the
-  chromosome's seed + chunk index, so `--seed` reproducibility
-  holds across both chunked and unchunked invocations (with the
-  documented caveat that chunked vs unchunked output isn't
-  byte-identical at the same `--seed` because the chunk seeds
-  consume rng differently).
-- [ ] **Free per-chunk tree sequence** before the next chunk's
-  simulation starts. Per-chrom BCF writer accumulates chunks in
-  genome order; tree sequences are not retained.
-- [ ] **Tests.**
-  - Auto-pick exercise: stub `psutil.virtual_memory().available`
-    to known sizes (8/16/32/64 GB) at n=3000 and assert the
-    auto-picked chunk size matches expectation.
-  - Override exercise: `--chr-chunk-mb 10` always picks 10
-    regardless of available RAM.
-  - Chunked vs unchunked at small n produces equivalent
-    per-record summary statistics (counts, Ti/Tv, AF
-    distribution) within stochastic noise.
-  - Overlap dedup: simulate `--chr-length-mb 20 --chr-chunk-mb 10`
-    with overlap, assert no duplicate positions in the per-chrom
-    BCF.
-  - Memory bound: regression test runs `--n 1000 --chr-length-mb
-    70 --chr-chunk-mb 10` and asserts peak RSS scales with one
-    chunk's tree sequence (a few GB, not the unchunked 8-16 GB).
-  - Chunk-boundary determinism: same seed + same chunk size →
-    byte-identical BCFs across runs.
-- [ ] **Docs.** README + TUTORIAL: explain `--chr-chunk-mb`
-  semantics (auto-pick default, explicit override, overlap
-  behaviour), document the cross-chunk LD caveat, link the
-  auto-pick formula to the tuning section.
+  `psutil>=5.9` added to `synthetic_people/requirements.txt`.
+- [x] **Auto-pick logic** in `cli.py` calling
+  `coalescent.auto_pick_chunk_size_mb(n, length, demo_model,
+  available_bytes, workers)`. Estimate calibrated against the
+  user's failing run: ~80 KiB per (sample × Mb) for OOA-class
+  demography, ~16 KiB for constant-Ne. Auto-pick targets ≤ 50%
+  of `psutil.virtual_memory().available / workers` and caps at
+  the configured `--chr-length-mb`.
+- [x] **Chunk overlap** at 10% of chunk size, clamped to
+  `[0.5 Mb, 5 Mb]`. Each chunk simulates
+  `chunk_size + overlap_margin` bp; variants past `chunk_size`
+  in chunk-local coordinates are dropped at write time so the
+  per-chrom site list stays duplicate-free. Documented as
+  boundary smoothing rather than true cross-chunk LD recovery.
+- [x] **Refactored `coalescent.simulate_chromosome`** to
+  dispatch chunked vs single via `_simulate_chromosome_chunked`.
+  Each sub-chunk runs `_simulate_one` (the shared msprime
+  invocation) against `species.get_contig(chrom,
+  right=chunk_size + overlap)` with a chunk-specific seed. The
+  admixture path stays on the single-pass simulator for now —
+  its per-person ancestry segments interact with the tree-
+  sequence walk in ways that need a separate refactor.
+- [x] **Per-chunk seeds** derived deterministically via a
+  Knuth multiplicative mix:
+  `(chrom_seed + chunk_index * 0x9E3779B9) & 0x7FFFFFFF`. Avoids
+  rng-state-dependence so a resumed run sees the same chunk
+  seeds regardless of which chunks were already simulated.
+- [x] **Free per-chunk tree sequence** before the next chunk's
+  simulation starts. `del ts` after each chunk's variant
+  iteration; per-chrom site list accumulates the variants.
+- [x] **Tests** in `tests/test_chunked_simulation.py` (18 cases):
+  - RAM estimator linearity in n and chunk_mb, OOA vs constant-Ne
+    rate selection, "none" string handled.
+  - Auto-pick correctness (full-fits returns length, doesn't-fit
+    returns smaller, workers divide budget, constant-Ne picks
+    larger chunks than OOA).
+  - Chunked output: positions sorted, unique, in range; record
+    count within stochastic noise of unchunked; deterministic at
+    fixed seed; no duplicates at chunk boundaries.
+  - Overlap-bp clamping at floor and ceiling.
+- [x] **Docs.** `README.md` Performance section + CLI reference
+  table updated; `TUTORIAL.md` §9.5 added with a recipe and the
+  cross-chunk LD caveat table.
 
 ### Resolved decisions
 
