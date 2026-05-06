@@ -777,14 +777,18 @@ Three values:
 - `per-person` (default) — emit one bgzipped+tabixed VCF per person,
   identical to today's behaviour. No cohort BCF is written.
 - `cohort` — stream the cohort chromosome-by-chromosome straight
-  onto disk as `out/cohort/cohort.chr<N>.bcf` + CSI sidecars (Phase
-  5b1). Peak RAM is bounded by one chromosome's working set rather
-  than the whole cohort, so cohort sizes that OOM the in-memory
-  per-person path finish cleanly here. The per-person fan-out is
-  skipped entirely — derive per-person VCFs later via
+  onto disk as `out/cohort/cohort.chr<N>.bcf` + CSI sidecars. Skips
+  the per-person fan-out — derive per-person VCFs later via
   `bcftools view -s SAMPLE_ID out/cohort/cohort.chr<N>.bcf` (or
-  `bcftools concat` across chromosomes; Phase 5b2 will provide a
-  built-in derivation step).
+  `bcftools concat` across chromosomes).
+
+  Phase 5b2 made `--mode per-person` and `both` use the same
+  streamed pipeline: per-person VCFs are derived from the cohort
+  BCFs via `bcftools view -s` rather than from an in-memory
+  `cohort_sites` list. The cohort BCFs land alongside the per-person
+  VCFs as intermediates and are listed in the manifest's
+  `cohort_bcfs[]` field; users who only want per-person can `rm -rf
+  out/cohort` after the run.
 - `both` — emit both deliverables in the same run.
 
 Cohort mode is the scaling-friendly format for large `--n`. Two
@@ -820,9 +824,16 @@ bcftools concat -Oz -o out/person_HG12345.vcf.gz \
 tabix -p vcf out/person_HG12345.vcf.gz
 ```
 
-Phase 5b2 will provide this derivation as a built-in CLI step
-(`generate_people.py --mode per-person` will derive from existing
-cohort BCFs rather than re-running the simulation).
+Phase 5b2 added a resume contract for these long runs: a
+`cohort.meta.json` file alongside the per-chrom BCFs records the
+run's params + sample IDs + per-person seeds + per-chromosome
+overlay seeds + the list of chromosomes whose BCF has finished
+writing. If a run is killed by OOM / SIGINT / node failure, just
+re-run with the same flags and the same `--output-dir`; completed
+chromosomes get reused, only the missing ones are re-simulated.
+Mismatched params surface a clear error rather than silently
+re-using incompatible state. Pass `--no-resume` to wipe everything
+and start from scratch.
 
 The manifest's `shape` field records which `--mode` produced the
 run. `samples[]` is always present at the top level (any mode) so

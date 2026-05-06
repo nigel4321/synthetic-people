@@ -70,6 +70,8 @@ from .sv import (
     generate_person_svs,
 )
 from .bcf_writer import CohortBcfWriter
+from .cohort_derivation import derive_person_records
+from .resume import ResumeMismatch, load_or_create_meta
 from .truth import TruthBedWriter
 from .writer import write_person_vcf
 
@@ -93,7 +95,14 @@ def _person_worker(i: int, sid: str, seed: int) -> tuple:
     rng = random.Random(seed)
 
     candidates = state["candidates"]
-    cohort_sites = state["cohort_sites"]
+    # Phase 5b2: workers source their per-person background either from
+    # an in-memory cohort_sites list (legacy / admixture paths) or by
+    # querying the streamed per-chrom cohort BCFs from disk
+    # (non-legacy non-admixture coalescent path). The flow is otherwise
+    # identical — same per-person dict shape, same downstream writer
+    # call, same truth-BED writer.
+    cohort_sites = state.get("cohort_sites")
+    cohort_bcfs = state.get("cohort_bcfs")
     build = state["build"]
     output_dir = state["output_dir"]
     truth_dir = state["truth_dir"]
@@ -109,7 +118,10 @@ def _person_worker(i: int, sid: str, seed: int) -> tuple:
 
     hi = dict(rng.choice(candidates))
     hi["gt"] = rng.choices(("0|1", "1|1"), weights=(0.7, 0.3))[0]
-    background = person_records_from_cohort(cohort_sites, i)
+    if cohort_bcfs is not None:
+        background = derive_person_records(cohort_bcfs, sid)
+    else:
+        background = person_records_from_cohort(cohort_sites, i)
     person_svs: list = []
     if svs_per_person > 0 and sv_chrom_span > sv_length_max:
         person_svs = generate_person_svs(
@@ -495,6 +507,16 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                         "regardless of --workers, but differs from a "
                         "pre-Phase-1 run at the same seed because the "
                         "rng consumption pattern changed.")
+    p.add_argument("--no-resume", action="store_true",
+                   help="On the streamed coalescent path: ignore any "
+                        "existing out/cohort/cohort.meta.json + cohort "
+                        "BCFs and start a fresh simulation. Default "
+                        "behaviour is to resume a prior run when its "
+                        "params match — useful for multi-hour cohort "
+                        "runs that get interrupted by OOM, SIGINT, or "
+                        "node failure. Param mismatches surface a "
+                        "clear error rather than silently re-using "
+                        "incompatible state.")
     p.add_argument("--mode", choices=("per-person", "cohort", "both"),
                    default="per-person",
                    help="Output shape. per-person (default): emit one "
@@ -568,23 +590,39 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
 
     workers = resolve_workers(args.workers)
 
-    # Sample IDs are drawn from the master rng *before* the streamed
-    # simulation iterates, so each per-chrom BCF carries identical
-    # sample columns and rng consumption order is fixed regardless of
-    # how many chromosomes are processed.
-    sample_ids = [random_sample_id(rng) for _ in range(args.n)]
+    cohort_dir = args.output_dir / "cohort"
+
+    # Resume contract (Phase 5b2): load or freshly derive the cohort-
+    # identity state (sample_ids, person_seeds, per-chrom overlay
+    # seeds). When an existing cohort.meta.json matches the current
+    # run's params, we re-use its samples + seeds + completed-chrom
+    # list rather than re-drawing from rng — so a resumed run
+    # produces the same final output as the original would have on a
+    # non-interrupted machine.
+    try:
+        resume = load_or_create_meta(
+            args, chromosomes, cohort_dir, rng,
+            force_fresh=args.no_resume,
+        )
+    except ResumeMismatch as exc:
+        sys.exit(f"--resume mismatch: {exc}")
+    sample_ids = resume.samples
+    if resume.completed_chromosomes:
+        print(
+            f"  resuming run: skipping already-complete "
+            f"chromosomes {resume.completed_chromosomes} "
+            f"(use --no-resume to start fresh)",
+            file=sys.stderr,
+        )
 
     print(
         f"Simulating coalescent cohort (streamed): {args.n} people "
         f"across chroms {chromosomes} "
         f"(model={args.demo_model or 'uniform-constant-Ne'}, "
-        f"pop={args.population}, length={args.chr_length_mb} Mb, "
-        f"--mode cohort streaming path)",
+        f"pop={args.population}, length={args.chr_length_mb} Mb)",
         file=sys.stderr,
     )
 
-    cohort_dir = args.output_dir / "cohort"
-    cohort_dir.mkdir(parents=True, exist_ok=True)
     cohort_bcf_paths: list[Path] = []
 
     # Aggregate stats across chunks. SFS histograms add as Counters;
@@ -604,13 +642,30 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
     bcf_t0 = time.monotonic()
     last_progress_log = bcf_t0
 
+    chromosomes_to_simulate = [
+        c for c in chromosomes
+        if not resume.is_chromosome_done(c)
+    ]
+    # Pre-record paths for already-complete chromosomes so the
+    # manifest carries the full list whether or not we re-simulated
+    # them on this invocation.
+    for chrom in chromosomes:
+        if resume.is_chromosome_done(chrom):
+            cohort_bcf_paths.append(
+                cohort_dir / f"cohort.chr{chrom}.bcf")
+
     for chrom, sites in simulate_cohort_iter(
-        chromosomes=chromosomes, build=args.build,
+        chromosomes=chromosomes_to_simulate, build=args.build,
         n_people=args.n, length_mb=args.chr_length_mb,
         demo_model=demo_model, population=args.population,
         rec_rate=args.rec_rate, mu=args.mu,
         rng=rng, verbose=True, workers=workers,
     ):
+        # Each chromosome's overlays use a per-chrom rng seeded from
+        # the resume record so they're independent of streaming order
+        # and reproducible across resumes.
+        chrom_overlay_rng = random.Random(resume.overlay_seeds[chrom])
+
         # Apply overlays to this chunk only. Density semantics are
         # per-chrom; reservation tracking is local to the chunk.
         if clinvar_index:
@@ -619,13 +674,14 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
             if args.clinvar_inject_density > 0:
                 overlay_stats["clinvar_injected"] += inject_clinvar(
                     sites, clinvar_index,
-                    args.clinvar_inject_density, rng,
+                    args.clinvar_inject_density, chrom_overlay_rng,
                 )
         clinvar_reserved = {i for i, s in enumerate(sites)
                             if s.get("clnsig")}
         if rsid_pool and args.rsid_density > 0:
             overlay_stats["rsid_injected"] += inject_rsids(
-                sites, rsid_pool, args.rsid_density, rng,
+                sites, rsid_pool, args.rsid_density,
+                chrom_overlay_rng,
                 reserve_indices=clinvar_reserved,
             )
         all_overlay_reserved = {i for i, s in enumerate(sites)
@@ -633,7 +689,8 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
                                 s["id"].startswith("rs")}
         if cosmic_pool:
             overlay_stats["cosmic_injected"] += inject_cosmic(
-                sites, cosmic_pool, args.cosmic_inject_density, rng,
+                sites, cosmic_pool, args.cosmic_inject_density,
+                chrom_overlay_rng,
                 reserve_indices=all_overlay_reserved,
             )
 
@@ -649,7 +706,12 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
         sites.sort(key=lambda s: s["pos"])
         with CohortBcfWriter(chrom_bcf, args.build, sample_ids) as bw:
             bw.write_sites(sites)
-        cohort_bcf_paths.append(chrom_bcf)
+        # Record the BCF in the path list and persist completion to
+        # the resume record. From this point a re-run with the same
+        # params will skip this chromosome.
+        if chrom_bcf not in cohort_bcf_paths:
+            cohort_bcf_paths.append(chrom_bcf)
+        resume.mark_chromosome_done(chrom)
 
         # Drop the chunk's reference so the next chromosome's
         # simulation has the previous chunk's RAM available.
@@ -700,27 +762,17 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
               f"{args.cosmic_inject_density:.3f})",
               file=sys.stderr)
 
-    # Manifest. Same shape Phase 5a's --mode cohort early-return wrote,
-    # with cohort_bcfs[] populated for every chromosome.
     manifest_mode = (
         "legacy-background" if args.legacy_background
         else "admixture-uk" if args.admixture
         else "coalescent"
     )
-    manifest = {
-        "build": args.build,
-        "n_people": args.n,
-        "mode": manifest_mode,
-        "shape": "cohort",
-        "chromosomes": chromosomes,
-        "seed": args.seed,
-        "samples": sample_ids,
-        "cohort_bcfs": [
-            str(p.relative_to(args.output_dir)) for p in cohort_bcf_paths
-        ],
-    }
+    cohort_bcf_rels = [
+        str(p.relative_to(args.output_dir)) for p in cohort_bcf_paths
+    ]
+    overlay_block = None
     if not args.legacy_background:
-        manifest["overlays"] = {
+        overlay_block = {
             "clinvar_inject_density": args.clinvar_inject_density,
             "rsid_density": args.rsid_density,
             "dbsnp_source": (
@@ -732,15 +784,200 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
             "stats": overlay_stats,
         }
     manifest_path = args.output_dir / "manifest.json"
+
+    if args.mode == "cohort":
+        # Cohort-only deliverable: write the slim manifest pointing at
+        # the per-chrom BCFs and stop. Per-person VCFs can be derived
+        # later via `bcftools view -s SAMPLE_ID <cohort.chrN.bcf>`.
+        manifest = {
+            "build": args.build,
+            "n_people": args.n,
+            "mode": manifest_mode,
+            "shape": "cohort",
+            "chromosomes": chromosomes,
+            "seed": args.seed,
+            "samples": sample_ids,
+            "cohort_bcfs": cohort_bcf_rels,
+        }
+        if overlay_block is not None:
+            manifest["overlays"] = overlay_block
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        print(
+            f"--mode cohort (streamed): {len(cohort_bcf_paths)} "
+            f"per-chrom BCFs written under "
+            f"{cohort_dir.relative_to(args.output_dir)}/. Derive "
+            f"per-person VCFs via `bcftools view -s SAMPLE_ID "
+            f"<cohort.chrN.bcf>`.",
+            file=sys.stderr,
+        )
+        print(f"Manifest written to {manifest_path}", file=sys.stderr)
+        print("Done.", file=sys.stderr)
+        return 0
+
+    # --mode per-person or both: derive per-person VCFs from the
+    # streamed cohort BCFs (Phase 5b2). Each worker spawns its own
+    # `bcftools view -s SAMPLE | bcftools view -e 'GT="ref"'` pipeline
+    # to read its assigned sample's records back, then writes a
+    # per-person VCF the same way the in-memory path does (highlighted
+    # variant + SVs + DP/GQ/AD + sequencing noise + truth BEDs all
+    # layered identically).
+    #
+    # Person seeds come from the resume record, not freshly drawn
+    # from rng — the master rng has been consumed by the streaming
+    # loop's pre-derived per-chrom overlay seeds, so its state at
+    # this point depends on the chromosome count and isn't a stable
+    # starting point. The resume record's person_seeds were locked
+    # in at the very start of the run.
+    person_seeds = resume.person_seeds
+
+    print(f"Writing {args.n} person VCFs into {args.output_dir} "
+          f"(streamed: deriving from cohort BCFs)",
+          file=sys.stderr)
+    if args.error_rate > 0 or args.dropout_rate > 0:
+        print(
+            f"Sequencing-error model: error_rate={args.error_rate:.4f}, "
+            f"dropout_rate={args.dropout_rate:.4f}",
+            file=sys.stderr,
+        )
+
+    truth_dir = args.output_dir / "truth"
+    contig_order = {c: i for i, c
+                    in enumerate(BUILDS[args.build]["contigs"])}
+    sv_chrom_span = (int(args.chr_length_mb * 1_000_000)
+                     if args.chr_length_mb > 0
+                     else max(BUILDS[args.build]["contigs"].values()))
+    sv_chromosomes = chromosomes
+    error_stats_total = new_error_stats()
+    sv_total = 0
+
+    # Workers source their per-person background by querying the
+    # cohort BCFs on disk (cohort_bcfs key). The legacy / admixture
+    # in-memory path uses cohort_sites instead — _person_worker checks
+    # for whichever key is present. Fork-shared state inheritance
+    # avoids pickling the (small) BCF path list per task.
+    _PERSON_WORKER_STATE.update({
+        "candidates": candidates,
+        "cohort_bcfs": cohort_bcf_paths,
+        "build": args.build,
+        "output_dir": args.output_dir,
+        "truth_dir": truth_dir,
+        "contig_order": contig_order,
+        "svs_per_person": args.svs_per_person,
+        "sv_length_max": args.sv_length_max,
+        "sv_length_min": args.sv_length_min,
+        "sv_chrom_span": sv_chrom_span,
+        "sv_chromosomes": sv_chromosomes,
+        "error_rate": args.error_rate,
+        "dropout_rate": args.dropout_rate,
+        "person_ancestry": [],   # admixture not on the streamed path
+    })
+
+    fanout_workers = resolve_workers(args.workers)
+    use_pool = fanout_workers > 1 and args.n > 1
+    fanout_t0 = time.monotonic()
+    last_progress_log = fanout_t0
+    progress_log_interval = 20.0
+
+    def _maybe_log_progress(done: int) -> None:
+        nonlocal last_progress_log
+        now = time.monotonic()
+        if (now - last_progress_log) < progress_log_interval \
+                and 0 < done < args.n:
+            return
+        elapsed = now - fanout_t0
+        rate = done / elapsed if elapsed > 0 else 0.0
+        remaining = args.n - done
+        eta = remaining / rate if rate > 0 else float("inf")
+        eta_str = f"{eta:.0f}s" if eta < float("inf") else "?"
+        print(
+            f"  person VCFs: {done:,}/{args.n:,} written "
+            f"({rate:.1f}/s, elapsed {elapsed:.0f}s, eta {eta_str})",
+            file=sys.stderr,
+        )
+        last_progress_log = now
+
+    if use_pool:
+        print(f"  fan-out: {fanout_workers} worker processes "
+              f"(fork start method, --n={args.n})",
+              file=sys.stderr)
+        ctx = mp.get_context("fork")
+        results: list = [None] * args.n
+        with ProcessPoolExecutor(max_workers=fanout_workers,
+                                 mp_context=ctx) as ex:
+            futures = [
+                ex.submit(_person_worker, i, sample_ids[i],
+                          person_seeds[i])
+                for i in range(args.n)
+            ]
+            for i, fut in enumerate(futures):
+                results[i] = fut.result()
+                _maybe_log_progress(i + 1)
+    else:
+        results = []
+        for i in range(args.n):
+            results.append(_person_worker(i, sample_ids[i],
+                                          person_seeds[i]))
+            _maybe_log_progress(i + 1)
+
+    _PERSON_WORKER_STATE.clear()
+
+    manifest_people: list = []
+    for entry, person_stats, n_svs in results:
+        merge_stats(error_stats_total, person_stats)
+        sv_total += n_svs
+        manifest_people.append(entry)
+        print(_format_person_log(entry, args.n), file=sys.stderr)
+
+    realised_fdr = (
+        (error_stats_total["flipped"] + error_stats_total["dropped"]) /
+        error_stats_total["total_calls"]
+    ) if error_stats_total["total_calls"] else 0.0
+
+    manifest = {
+        "build": args.build,
+        "n_people": args.n,
+        "mode": manifest_mode,
+        "shape": args.mode,
+        "chromosomes": chromosomes,
+        "seed": args.seed,
+        "samples": sample_ids,
+        "people": manifest_people,
+    }
+    # cohort BCFs always present in the streamed path (5b2 derives
+    # per-person from them, so they exist on disk regardless of
+    # whether --mode is per-person or both). The user can rm them if
+    # they only want per-person; the manifest notes them so the
+    # downstream pipeline can find them either way.
+    manifest["cohort_bcfs"] = cohort_bcf_rels
+    manifest["svs"] = {
+        "per_person": args.svs_per_person,
+        "length_min_bp": args.sv_length_min,
+        "length_max_bp": args.sv_length_max,
+        "total": sv_total,
+    }
+    manifest["errors"] = {
+        "mode": "art" if args.art else "lightweight",
+        "error_rate": args.error_rate,
+        "dropout_rate": args.dropout_rate,
+        "stats": dict(error_stats_total),
+        "realised_fdr": round(realised_fdr, 6),
+    }
+    if overlay_block is not None:
+        manifest["overlays"] = overlay_block
+
+    if args.error_rate > 0 or args.dropout_rate > 0:
+        print(
+            f"Sequencing-error stats: "
+            f"flipped={error_stats_total['flipped']}, "
+            f"dropped={error_stats_total['dropped']}, "
+            f"total_calls={error_stats_total['total_calls']}, "
+            f"realised_fdr={realised_fdr:.4%}",
+            file=sys.stderr,
+        )
+
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
-    print(
-        f"--mode cohort (streamed): {len(cohort_bcf_paths)} per-chrom "
-        f"BCFs written under {cohort_dir.relative_to(args.output_dir)}/. "
-        f"Derive per-person VCFs via `bcftools view -s SAMPLE_ID "
-        f"<cohort.chrN.bcf>`.",
-        file=sys.stderr,
-    )
     print(f"Manifest written to {manifest_path}", file=sys.stderr)
     print("Done.", file=sys.stderr)
     return 0
@@ -848,8 +1085,17 @@ def main(argv: list[str] | None = None) -> int:
     # legacy 1000G-pool path samples sites globally up front, and the
     # admixture path emits per-person ancestry segments alongside
     # cohort sites.
-    if (not args.legacy_background and not args.admixture
-            and args.mode == "cohort"):
+    if not args.legacy_background and not args.admixture:
+        # All three --mode values now flow through the streamed
+        # pipeline on the standard coalescent path. Phase 5b2 added
+        # per-person derivation from the streamed cohort BCFs so
+        # `--mode per-person` and `both` benefit from the streaming
+        # RAM bound too — not just `--mode cohort` (which 5b1
+        # delivered first). The legacy and admixture paths keep the
+        # in-memory accumulator below because their data shapes
+        # don't fit the streaming model (legacy samples coordinates
+        # globally up front; admixture emits per-person ancestry
+        # segments alongside cohort sites).
         return _run_cohort_streamed(
             args, chromosomes, rng,
             overlay_executor, overlay_futures, candidates,

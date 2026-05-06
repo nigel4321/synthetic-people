@@ -291,18 +291,28 @@ Legacy-only flags (`--background-glob`, `--n-background`, `--af-min`,
   with msprime instead of running serially after it. No flag —
   prefetch is always on for the non-legacy path.
 - `--mode {per-person, cohort, both}` — output shape selector,
-  default `per-person` (today's behaviour, unchanged).
-  - `cohort`: streams the cohort chromosome-by-chromosome straight
-    onto disk as `out/cohort/cohort.chr<N>.bcf` + CSI sidecars (Phase
-    5b1). Peak RAM is bounded by one chromosome's working set rather
-    than the whole cohort, so cohort sizes that OOM the in-memory
-    path finish cleanly here. Skips the per-person fan-out — derive
-    per-person VCFs later via `bcftools view -s SAMPLE_ID
-    out/cohort/cohort.chr<N>.bcf`.
-  - `both`: writes the in-memory single-file `out/cohort/cohort.bcf`
-    alongside the per-person VCFs. Phase 5b2 will switch this to the
-    streamed per-chrom layout once per-person derivation runs from
-    the BCFs.
+  default `per-person`. As of Phase 5b2 all three modes flow through
+  the streamed pipeline on the standard coalescent path: cohort
+  chromosomes are simulated → overlaid → written to
+  `out/cohort/cohort.chr<N>.bcf` → freed before the next chromosome
+  is simulated. Peak RAM is bounded by one chromosome's working set
+  rather than the whole cohort.
+  - `cohort`: writes the per-chrom BCFs and stops. Per-person VCFs
+    can be derived later via `bcftools view -s SAMPLE_ID`.
+  - `per-person` (default): per-person VCFs are derived from the
+    streamed cohort BCFs via the same `bcftools view -s` pipeline.
+    The cohort BCFs land as intermediates alongside the per-person
+    VCFs; users who only want per-person can `rm -rf out/cohort`
+    after the run, or pass `--mode per-person` plus a wrapper that
+    cleans up.
+  - `both`: keeps both deliverables explicitly.
+- `--no-resume` — on the streamed coalescent path, ignore any
+  existing `out/cohort/cohort.meta.json` + cohort BCFs and start a
+  fresh simulation. Default behaviour is to resume a prior run when
+  its params match — useful for multi-hour cohort runs that get
+  interrupted by OOM, SIGINT, or node failure. Param mismatches
+  surface a clear error rather than silently re-using incompatible
+  state.
 - Long-running runs print throttled progress lines (~20 s cadence)
   during the cohort BCF write and the per-person fan-out — `cohort
   BCF: 12,345/100,000 sites (4,500/s)` and `person VCFs: 1,234/100,000
@@ -349,13 +359,12 @@ out/
 ├── person_0001.vcf.gz.tbi
 ├── person_0002.vcf.gz
 ├── ...
-├── cohort/              # cohort BCFs (one or many depending on --mode)
-│   ├── cohort.chr1.bcf  # --mode cohort: streamed per-chrom BCFs (Phase 5b1)
+├── cohort/              # streamed per-chrom BCFs (any --mode on coalescent path)
+│   ├── cohort.chr1.bcf  # per-chromosome cohort BCF (Phase 5b1+)
 │   ├── cohort.chr1.bcf.csi
 │   ├── cohort.chr2.bcf
 │   ├── ...
-│   ├── cohort.bcf       # --mode both: single combined file (Phase 5a path)
-│   └── cohort.bcf.csi   # htslib-native index — `bcftools view -s …` ready
+│   └── cohort.meta.json # resume-state record (Phase 5b2)
 ├── manifest.json        # shape, samples[], per-person summary, cohort_bcfs path list
 ├── ancestry/            # admixture mode only: per-person local-ancestry BEDs
 │   ├── person_0001.bed
@@ -379,16 +388,18 @@ Which artefacts land depends on `--mode`:
 
 | `--mode` | Per-person VCFs | Cohort BCFs (under `cohort/`) | Manifest fields |
 |---|---|---|---|
-| `per-person` (default) | yes | — | `shape=per-person`, `samples[]`, `people[]` |
-| `cohort` | — | one per chromosome: `cohort.chr<N>.bcf` (streamed) | `shape=cohort`, `samples[]`, `cohort_bcfs[]`, no `people[]` |
-| `both` | yes | single file: `cohort.bcf` (written from in-memory cohort) | `shape=both`, `samples[]`, `cohort_bcfs[]`, `people[]` |
+| `per-person` (default) | yes | per-chrom intermediates: `cohort.chr<N>.bcf` | `shape=per-person`, `samples[]`, `cohort_bcfs[]`, `people[]` |
+| `cohort` | — | per-chrom: `cohort.chr<N>.bcf` | `shape=cohort`, `samples[]`, `cohort_bcfs[]`, no `people[]` |
+| `both` | yes | per-chrom: `cohort.chr<N>.bcf` | `shape=both`, `samples[]`, `cohort_bcfs[]`, `people[]` |
 
 The top-level `samples[]` list always lands so a downstream tool
 wanting "every sample ID" reads one field regardless of `--mode`.
-`cohort_bcfs` is a list — singleton for `--mode both` (one combined
-file), one entry per chromosome for `--mode cohort` (streamed
-per-chrom layout). `--mode both` will switch to the per-chrom layout
-in Phase 5b2 once per-person derivation runs from the BCFs directly.
+`cohort_bcfs` is a list with one entry per chromosome (parity with
+the 1000G layout). All three modes flow through the streamed
+pipeline as of Phase 5b2 — `cohort_bcfs` is always populated. The
+legacy and admixture paths are exceptions: they keep the in-memory
+cohort accumulator and write a single combined `cohort.bcf` only
+when `--mode` includes the cohort deliverable.
 
 To derive a per-person VCF from cohort BCFs later (e.g. when `--mode
 cohort` was used to keep memory bounded on a 100k-person run):
@@ -885,4 +896,5 @@ Tracked in `IMPLEMENTATION_PLAN.md`:
 | `--af-min` | [legacy] Minimum AF when loading the pool | `0.05` |
 | `--sfs-alpha` | [legacy] Power-law exponent for the SFS | `2.0` |
 | `--workers` | [perf] Worker processes for the per-chromosome pool and the per-person pool. `0` = auto (`os.cpu_count()`), `1` = serial. Linux only. | `0` |
-| `--mode` | [perf] Output shape: `per-person` (today's behaviour, unchanged), `cohort` (single multi-sample BCF, skip per-person fan-out), or `both`. Cohort mode is the scaling-friendly path for large `--n` — derive per-person VCFs later via `bcftools view -s`. | `per-person` |
+| `--mode` | [perf] Output shape: `per-person` (default), `cohort` (skip per-person fan-out), or `both`. All three flow through the streamed cohort pipeline — derive per-person VCFs later via `bcftools view -s` against the per-chrom cohort BCFs. | `per-person` |
+| `--no-resume` | [perf] Ignore any existing `cohort.meta.json` + cohort BCFs and start a fresh simulation. Default behaviour resumes a prior run when its params match. | `False` |

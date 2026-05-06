@@ -11,10 +11,12 @@ msprime/stdpopsim importability — same gating pattern as
 
 What we're guarding against:
 
-- ``--mode per-person`` (the default) must remain byte-equivalent to
-  today: no cohort/ directory should appear, manifest should not
-  carry a ``cohort_bcfs`` field. A regression here would surprise
-  every existing user.
+- ``--mode per-person`` (the default) writes per-person VCFs.
+  Phase 5b2 sources the per-person background by deriving from
+  streamed cohort BCFs, so a ``cohort/`` directory now lands as an
+  intermediate alongside the per-person VCFs. Users who only want
+  per-person can ``rm -rf out/cohort`` after the run; the manifest
+  exposes both so downstream tooling can find either.
 - ``--mode cohort`` must skip per-person fan-out entirely and emit a
   cohort BCF whose per-sample columns match the cohort the
   simulator produced.
@@ -95,22 +97,34 @@ class CliModePerPersonTest(unittest.TestCase):
             self.assertTrue((vcf.with_suffix(".gz.tbi")).is_file()
                             or Path(str(vcf) + ".tbi").is_file())
 
-    def test_no_cohort_bcf_written(self):
-        # --mode per-person must not silently add a cohort BCF — that
-        # would change the deliverable shape for every existing user.
+    def test_cohort_bcfs_written_as_intermediate(self):
+        # Phase 5b2: per-person mode now derives the per-person
+        # background from streamed cohort BCFs, so the cohort/
+        # directory exists as an intermediate alongside the
+        # per-person VCFs. The fixture only simulates chr22 so we
+        # expect one BCF in there.
         cohort_dir = self.tmpdir / "cohort"
-        self.assertFalse(cohort_dir.exists(),
-                         f"unexpected cohort dir at {cohort_dir}")
+        self.assertTrue(cohort_dir.is_dir())
+        bcfs = sorted(cohort_dir.glob("cohort.chr*.bcf"))
+        self.assertEqual([p.name for p in bcfs],
+                         ["cohort.chr22.bcf"])
 
     def test_manifest_marks_shape(self):
         manifest = json.loads(
             (self.tmpdir / "manifest.json").read_text())
         self.assertEqual(manifest.get("shape"), "per-person")
-        self.assertNotIn("cohort_bcfs", manifest)
+        # Phase 5b2: cohort BCFs are written as the source for
+        # per-person derivation, so manifest carries cohort_bcfs[]
+        # in per-person mode too. Same per-chrom shape as cohort
+        # mode.
+        self.assertEqual(
+            manifest.get("cohort_bcfs"),
+            ["cohort/cohort.chr22.bcf"],
+        )
         # `people` list still populated as before.
         self.assertEqual(len(manifest["people"]), 3)
-        # Top-level `samples` list now lands in every mode so callers
-        # get one code path for "list of sample IDs" lookup.
+        # Top-level `samples` list lands in every mode so callers get
+        # one code path for "list of sample IDs" lookup.
         self.assertEqual(
             manifest["samples"],
             [p["sample_id"] for p in manifest["people"]],
@@ -207,8 +221,11 @@ class CliModeBothTest(unittest.TestCase):
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
     def test_both_deliverables_present(self):
+        # Phase 5b2: both mode now also goes through the streamed
+        # pipeline, so per-chrom BCFs land instead of a single combined
+        # cohort.bcf.
         self.assertTrue(
-            (self.tmpdir / "cohort" / "cohort.bcf").is_file())
+            (self.tmpdir / "cohort" / "cohort.chr22.bcf").is_file())
         for i in range(1, 4):
             self.assertTrue(
                 (self.tmpdir / f"person_{i:04d}.vcf.gz").is_file())
@@ -218,7 +235,8 @@ class CliModeBothTest(unittest.TestCase):
             (self.tmpdir / "manifest.json").read_text())
         self.assertEqual(manifest.get("shape"), "both")
         self.assertEqual(
-            manifest.get("cohort_bcfs"), ["cohort/cohort.bcf"],
+            manifest.get("cohort_bcfs"),
+            ["cohort/cohort.chr22.bcf"],
         )
         self.assertEqual(len(manifest["people"]), 3)
         # Top-level samples mirrors the per-person list's IDs in order.
@@ -228,7 +246,7 @@ class CliModeBothTest(unittest.TestCase):
         )
 
     def test_bcf_samples_match_per_person_files(self):
-        bcf = self.tmpdir / "cohort" / "cohort.bcf"
+        bcf = self.tmpdir / "cohort" / "cohort.chr22.bcf"
         bcf_samples = subprocess.run(
             ["bcftools", "query", "-l", str(bcf)],
             capture_output=True, text=True, check=True,
@@ -237,7 +255,8 @@ class CliModeBothTest(unittest.TestCase):
             (self.tmpdir / "manifest.json").read_text())
         per_person_samples = [p["sample_id"] for p in manifest["people"]]
         # Same IDs in the same order — they were drawn from the same
-        # rng pass against the same seed.
+        # rng pass against the same seed and the per-person derivation
+        # in 5b2 reads from this exact BCF.
         self.assertEqual(bcf_samples, per_person_samples)
 
 

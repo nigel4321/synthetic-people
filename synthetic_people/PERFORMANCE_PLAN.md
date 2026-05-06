@@ -475,47 +475,60 @@ per-person VCFs by design — derive them later via `bcftools view -s`).
 A full benchmark at `n = 1 000 / 10 000 / 100 000` lands alongside
 Phase 5b2 once per-person derivation closes the loop.
 
-### Phase 5b2 tasks (per-person derivation + resume) — planned
-- [ ] **Per-person derivation from cohort BCF.** Replace today's
-  in-memory per-person fan-out (which still runs in 5b1 for
-  `--mode per-person` / `both`) with `bcftools view -s SAMPLE_ID
-  -Oz` against the per-chrom cohort BCFs from 5b1. Trivially
-  parallel across `--workers`. The cohort-BCF equivalent of
-  Phase 3's pre-bucketed `carriers[i]` is `bcftools view -s
-  SAMPLE -e 'GT="0/0" || GT="0|0" || GT="./."'`, which bcftools
-  does natively.
-- [ ] **Write a resume contract.** `out/cohort/cohort.meta.json`
-  records `seed`, `chromosomes`, `n_people`, `demo_model`,
-  `population`, `chr_length_mb`, plus a list of which chromosome
-  BCFs are complete. On resume, completed chromosomes skip
-  simulation; mismatched parameters force re-simulation with a clear
-  message. `--no-resume` overrides for explicit re-runs.
-- [ ] **Re-measure.** Run `scripts/profile_memory.py` (or a Phase 5
-  equivalent) at `n = 100, 1 000, 10 000, 100 000` with the new path.
-  Record the realised peak RSS and total wall time alongside the
-  Phase 3 baseline so the cost/benefit is captured. Expected
-  outcome: peak RSS bounded by one chromosome's working set
-  (single-digit GB at any cohort size), total wall time roughly
-  linear in `n × n_sites` because per-person derivation is the new
-  dominant cost.
-- [ ] **Tests.**
-  - Round-trip: streamed `simulate_cohort` writes per-chromosome
-    BCFs that `bcftools view -h` parses cleanly with site counts
-    matching the in-RAM 5a path.
-  - Determinism: same seed + same flags → byte-identical cohort BCF
-    set (modulo the timestamp in the BCF header — strip before
-    comparing).
-  - Per-person derivation: `bcftools view -s SAMPLE` from the cohort
-    BCF produces the same record set as the Phase 5a in-memory
-    fan-out at the same seed. (May not be byte-identical because
-    BCF→VCF can normalise INFO field order; assert per-record
-    equivalence instead.)
-  - Resume: run, kill mid-cohort, re-run, confirm the second run
-    skips already-completed chromosomes and produces the same final
-    output.
-- [ ] **Docs.** Update README Performance / Output layout, TUTORIAL
-  §9.3, IMPLEMENTATION_PLAN architecture section to reflect the
-  per-chromosome BCF layout and the resume contract.
+### Phase 5b2 tasks (per-person derivation + resume) — completed
+- [x] **Per-person derivation from cohort BCF.** New
+  `syntheticgen/cohort_derivation.py` runs a two-step
+  `bcftools view -s SAMPLE | bcftools view -e 'GT="ref"'` pipeline
+  against each per-chrom cohort BCF and parses the records into the
+  same dict shape `person_records_from_cohort` returns, so
+  `write_person_vcf` consumes either source identically. The
+  pipelined form is necessary because `bcftools view -s SAMPLE -e
+  'GT="ref"'` evaluates the filter against the multi-sample GT
+  before sample subset is applied — fixed in 5b2 by chaining two
+  views.
+- [x] **Streamed pipeline now drives all three modes.** The 5b1
+  diversion check widened: any `--mode` value on the non-legacy
+  non-admixture coalescent path now goes through
+  `_run_cohort_streamed`, which after streaming branches on mode —
+  cohort mode early-returns (today's 5b1 behaviour), per-person and
+  both run a fan-out fed by `derive_person_records`.
+- [x] **Resume contract via `cohort.meta.json`.** New
+  `syntheticgen/resume.py` persists the resume-identity-relevant
+  params (seed, n, build, chromosomes, chr_length_mb, demo_model,
+  population, rec_rate, mu) plus the sample IDs, per-person seeds,
+  and per-chromosome overlay seeds drawn at run start. Each
+  chromosome's completion appends to `completed_chromosomes` via an
+  atomic-rename write, so a SIGINT mid-flush leaves the prior
+  version intact. On startup, a matching meta.json skips already-
+  complete chromosomes; mismatched params raise `ResumeMismatch`
+  with a clear `--no-resume` hint.
+- [x] **Per-chrom overlay seeds.** Each chromosome's overlay rng is
+  now seeded from `resume.overlay_seeds[chrom]` rather than the
+  master rng. Required for resume to be deterministic — without it,
+  the master rng's state at chrom_K depends on K's predecessors, so
+  a resume after chrom K-1 would consume rng differently than a
+  non-interrupted run did.
+- [ ] **Full re-measure at large n.** A focused benchmark at
+  `n = 1 000 / 10 000 / 100 000` with the streamed pipeline + the
+  new BCF-based per-person derivation, measuring peak RSS and total
+  wall time. Lands as a follow-up — the 5b2 PR ships the path
+  itself; we don't gate the merge on a multi-hour benchmark run.
+- [x] **Tests.**
+  - Cohort-derivation parity:
+    `tests/test_cohort_derivation.py` round-trips a cohort through
+    the BCF writer + derivation module and asserts per-record
+    equivalence vs `person_records_from_cohort`.
+  - End-to-end: `tests/test_cli_modes.py` updated for the new
+    streamed-with-derivation behaviour under all three `--mode`
+    values; cohort BCFs land as intermediates under per-person too.
+  - Resume: `tests/test_resume.py` covers the fresh-start, matching-
+    params reuse, mismatched-params error, `--no-resume` wipe paths,
+    plus an end-to-end test that deletes one chromosome's BCF mid-
+    run and re-runs to confirm the surviving chrom's BCF is
+    untouched (mtime preserved) while the deleted one regenerates.
+- [x] **Docs.** README Performance / Output layout updated for the
+  resume contract and `--no-resume` flag; TUTORIAL §9.3 walks
+  through resuming an interrupted run.
 
 ### Open questions for review
 
