@@ -442,26 +442,48 @@ Phase 6.
   lands). Per-person `people[]` entries only emitted when the
   per-person fan-out ran.
 
-### Phase 5b tasks (streaming refactor + per-person derivation)
+### Phase 5b1 tasks (streaming `--mode cohort` only)
 
-- [ ] **Stream chromosome-by-chromosome in `simulate_cohort`.** No
-  global `cohort_sites` list. For each chromosome: simulate → apply
-  overlays in-RAM (one chromosome's sites is small) → write BCF →
-  free → next chromosome. Determinism preserved by the existing
-  per-chromosome seed derivation from Phase 1.
-- [ ] **Per-chromosome BCF layout** when streaming —
-  `out/cohort/cohort.chr<N>.bcf` files alongside or replacing the
-  single-file 5a layout. Pairs naturally with 1000G's per-chromosome
-  shape. Surfaces in the manifest as `cohort_bcfs[]` populated with
-  one entry per chromosome (the list shape is already in place from
-  5a).
+- [x] **Stream chromosome-by-chromosome in `simulate_cohort`.** New
+  `simulate_cohort_iter` generator yields one chunk per chromosome;
+  the legacy flat-list `simulate_cohort` is now a thin wrapper for
+  callers (admixture path, fixture builders) that need the full
+  cohort materialised. Per-chromosome seeds are still pre-derived
+  before any worker fan-out, so determinism within the streamed path
+  is preserved at fixed `--seed`.
+- [x] **Per-chromosome BCF layout** when streaming —
+  `out/cohort/cohort.chr<N>.bcf` files. Pairs naturally with 1000G's
+  per-chromosome shape. Manifest's `cohort_bcfs[]` (list shape from
+  5a) populated with one entry per chromosome.
+- [x] **`--mode cohort` only** in 5b1. Per-person and both modes
+  keep today's in-memory path, unified in 5b2.
+
+### Phase 5b1 measurements
+
+Quick comparison at `n=500` × `chromosomes=20,21,22` × `--chr-length-mb=5`
+(no overlays / no SVs / no errors), Linux x86_64, CPython 3.12.3:
+
+| `--mode` | Peak RSS | Wall time | Notes |
+|---|--------:|--------:|---|
+| `per-person` | 1.9 GB | 2:27 | in-memory cohort_sites + per-person fan-out |
+| `cohort` (streamed) | 0.85 GB | 0:19 | per-chrom BCFs, no per-person fan-out |
+
+The peak-RSS halving comes from never materialising the whole cohort
+in RAM at once; the wall-time speedup is partly that and partly
+skipping the per-person fan-out entirely (cohort mode doesn't write
+per-person VCFs by design — derive them later via `bcftools view -s`).
+A full benchmark at `n = 1 000 / 10 000 / 100 000` lands alongside
+Phase 5b2 once per-person derivation closes the loop.
+
+### Phase 5b2 tasks (per-person derivation + resume) — planned
 - [ ] **Per-person derivation from cohort BCF.** Replace today's
-  in-memory per-person fan-out (which uses `cohort_sites` directly)
-  with `bcftools view -s SAMPLE_ID -Oz` against the cohort BCF.
-  Trivially parallel across `--workers`. The cohort-BCF equivalent
-  of Phase 3's pre-bucketed `carriers[i]` is `bcftools view -s
+  in-memory per-person fan-out (which still runs in 5b1 for
+  `--mode per-person` / `both`) with `bcftools view -s SAMPLE_ID
+  -Oz` against the per-chrom cohort BCFs from 5b1. Trivially
+  parallel across `--workers`. The cohort-BCF equivalent of
+  Phase 3's pre-bucketed `carriers[i]` is `bcftools view -s
   SAMPLE -e 'GT="0/0" || GT="0|0" || GT="./."'`, which bcftools
-  does natively and is what users expect.
+  does natively.
 - [ ] **Write a resume contract.** `out/cohort/cohort.meta.json`
   records `seed`, `chromosomes`, `n_people`, `demo_model`,
   `population`, `chr_length_mb`, plus a list of which chromosome

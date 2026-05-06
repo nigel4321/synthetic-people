@@ -54,6 +54,7 @@ from .coalescent import (
     DEFAULT_POPULATION,
     DEFAULT_REC_RATE,
     simulate_cohort,
+    simulate_cohort_iter,
 )
 from .cohort import draw_cohort_background, person_records_from_cohort
 from .sfs import (
@@ -512,6 +513,239 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
     return p
 
 
+def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
+                         overlay_executor, overlay_futures: dict,
+                         candidates: list) -> int:
+    """Streaming cohort flow for ``--mode cohort`` (Phase 5b1).
+
+    Replaces the in-memory cohort_sites accumulator with a chromosome-
+    by-chromosome pipeline: simulate one chromosome → apply overlays
+    in-place on that chunk → write to ``cohort/cohort.chr<N>.bcf`` →
+    free the chunk → repeat. Peak RAM is bounded by one chromosome's
+    working set rather than the whole cohort, so cohort sizes that
+    OOM the in-memory path (anywhere past `n ≈ 1 000-5 000` on a
+    typical workstation, depending on `--chr-length-mb`) finish
+    cleanly here.
+
+    Determinism: same `--seed` produces the same per-chromosome BCFs
+    in the streamed path; rng consumption order is fixed (sample IDs
+    drawn first, then overlays applied per chunk in chromosome order).
+    Output at a given seed differs from the 5a in-memory cohort path
+    because the overlay rng is consumed per-chunk, not globally —
+    same caveat as Phase 1 for parallel chromosome simulation.
+
+    Overlay-density semantics: ``--rsid-density 0.20`` and
+    ``--clinvar-inject-density 0.01`` apply *per chromosome* in the
+    streamed path rather than over the whole cohort site list. Net
+    counts are roughly equal; per-chrom is arguably more correct
+    biologically since chromosomes have different lengths and ClinVar
+    densities.
+    """
+    # Resolve overlay futures up front so a malformed source fails
+    # fast (before the first chromosome is simulated).
+    clinvar_index: list = []
+    rsid_pool: list = []
+    cosmic_pool: list = []
+    if overlay_futures.get("clinvar_index") is not None:
+        print(f"Awaiting ClinVar overlay index for {chromosomes}...",
+              file=sys.stderr)
+        clinvar_index = overlay_futures["clinvar_index"].result()
+        print(f"  {len(clinvar_index)} ClinVar pathogenic records "
+              "available for overlay", file=sys.stderr)
+    if overlay_futures.get("rsid_pool") is not None:
+        print(f"Awaiting rsID pool...", file=sys.stderr)
+        rsid_pool = overlay_futures["rsid_pool"].result()
+        print(f"  {len(rsid_pool)} rsID-bearing records available",
+              file=sys.stderr)
+    if overlay_futures.get("cosmic_pool") is not None:
+        print(f"Awaiting COSMIC pool from {args.cosmic_vcf}...",
+              file=sys.stderr)
+        cosmic_pool = overlay_futures["cosmic_pool"].result()
+        print(f"  {len(cosmic_pool)} COSMIC records available",
+              file=sys.stderr)
+    if overlay_executor is not None:
+        overlay_executor.shutdown(wait=True)
+
+    workers = resolve_workers(args.workers)
+
+    # Sample IDs are drawn from the master rng *before* the streamed
+    # simulation iterates, so each per-chrom BCF carries identical
+    # sample columns and rng consumption order is fixed regardless of
+    # how many chromosomes are processed.
+    sample_ids = [random_sample_id(rng) for _ in range(args.n)]
+
+    print(
+        f"Simulating coalescent cohort (streamed): {args.n} people "
+        f"across chroms {chromosomes} "
+        f"(model={args.demo_model or 'uniform-constant-Ne'}, "
+        f"pop={args.population}, length={args.chr_length_mb} Mb, "
+        f"--mode cohort streaming path)",
+        file=sys.stderr,
+    )
+
+    cohort_dir = args.output_dir / "cohort"
+    cohort_dir.mkdir(parents=True, exist_ok=True)
+    cohort_bcf_paths: list[Path] = []
+
+    # Aggregate stats across chunks. SFS histograms add as Counters;
+    # overlay counters add as ints.
+    from collections import Counter
+    sfs_total: Counter = Counter()
+    overlay_stats = {
+        "clinvar_annotated": 0,
+        "clinvar_injected": 0,
+        "rsid_injected": 0,
+        "cosmic_injected": 0,
+    }
+
+    demo_model = (None if args.demo_model.lower() == "none"
+                  else args.demo_model)
+
+    bcf_t0 = time.monotonic()
+    last_progress_log = bcf_t0
+
+    for chrom, sites in simulate_cohort_iter(
+        chromosomes=chromosomes, build=args.build,
+        n_people=args.n, length_mb=args.chr_length_mb,
+        demo_model=demo_model, population=args.population,
+        rec_rate=args.rec_rate, mu=args.mu,
+        rng=rng, verbose=True, workers=workers,
+    ):
+        # Apply overlays to this chunk only. Density semantics are
+        # per-chrom; reservation tracking is local to the chunk.
+        if clinvar_index:
+            overlay_stats["clinvar_annotated"] += annotate_clinvar(
+                sites, clinvar_index)
+            if args.clinvar_inject_density > 0:
+                overlay_stats["clinvar_injected"] += inject_clinvar(
+                    sites, clinvar_index,
+                    args.clinvar_inject_density, rng,
+                )
+        clinvar_reserved = {i for i, s in enumerate(sites)
+                            if s.get("clnsig")}
+        if rsid_pool and args.rsid_density > 0:
+            overlay_stats["rsid_injected"] += inject_rsids(
+                sites, rsid_pool, args.rsid_density, rng,
+                reserve_indices=clinvar_reserved,
+            )
+        all_overlay_reserved = {i for i, s in enumerate(sites)
+                                if s.get("clnsig") or
+                                s["id"].startswith("rs")}
+        if cosmic_pool:
+            overlay_stats["cosmic_injected"] += inject_cosmic(
+                sites, cosmic_pool, args.cosmic_inject_density, rng,
+                reserve_indices=all_overlay_reserved,
+            )
+
+        # SFS contribution from this chunk.
+        sfs_total.update(sfs_histogram(sites))
+
+        # Per-chrom BCF — `cohort.chr<N>.bcf`. The relative path goes
+        # straight into the manifest's cohort_bcfs list.
+        chrom_bcf = cohort_dir / f"cohort.chr{chrom}.bcf"
+        # Sort within-chrom by pos for genome-order output (overlays
+        # may have re-sorted but injection helpers do that too — be
+        # defensive).
+        sites.sort(key=lambda s: s["pos"])
+        with CohortBcfWriter(chrom_bcf, args.build, sample_ids) as bw:
+            bw.write_sites(sites)
+        cohort_bcf_paths.append(chrom_bcf)
+
+        # Drop the chunk's reference so the next chromosome's
+        # simulation has the previous chunk's RAM available.
+        del sites
+
+        now = time.monotonic()
+        if now - last_progress_log > 20.0:
+            elapsed = now - bcf_t0
+            done = len(cohort_bcf_paths)
+            remaining = len(chromosomes) - done
+            rate_chr = done / elapsed if elapsed > 0 else 0.0
+            eta = (remaining / rate_chr) if rate_chr > 0 else float("inf")
+            eta_str = f"{eta:.0f}s" if eta < float("inf") else "?"
+            print(
+                f"  cohort BCFs: {done}/{len(chromosomes)} chromosomes "
+                f"written (elapsed {elapsed:.0f}s, eta {eta_str})",
+                file=sys.stderr,
+            )
+            last_progress_log = now
+
+    print(
+        f"  cohort sites: {sum(sfs_total.values())} alt observations "
+        f"across {len(chromosomes)} chromosomes; singletons: "
+        f"{sfs_total.get(1, 0)} ({singleton_fraction(sfs_total):.1%})",
+        file=sys.stderr,
+    )
+    summary_dir = args.output_dir / "summary"
+    sfs_path = summary_dir / "sfs.tsv"
+    write_sfs_tsv(sfs_path, dict(sfs_total))
+    print(f"  SFS histogram written to {sfs_path}", file=sys.stderr)
+
+    if overlay_stats["clinvar_annotated"]:
+        print(f"  annotated {overlay_stats['clinvar_annotated']} "
+              "natural ClinVar collisions across cohort",
+              file=sys.stderr)
+    if overlay_stats["clinvar_injected"]:
+        print(f"  injected {overlay_stats['clinvar_injected']} "
+              "ClinVar pathogenic records (per-chrom density="
+              f"{args.clinvar_inject_density:.3f})",
+              file=sys.stderr)
+    if overlay_stats["rsid_injected"]:
+        print(f"  injected {overlay_stats['rsid_injected']} rsIDs "
+              f"(per-chrom density={args.rsid_density:.3f})",
+              file=sys.stderr)
+    if overlay_stats["cosmic_injected"]:
+        print(f"  injected {overlay_stats['cosmic_injected']} COSMIC "
+              "records (per-chrom density="
+              f"{args.cosmic_inject_density:.3f})",
+              file=sys.stderr)
+
+    # Manifest. Same shape Phase 5a's --mode cohort early-return wrote,
+    # with cohort_bcfs[] populated for every chromosome.
+    manifest_mode = (
+        "legacy-background" if args.legacy_background
+        else "admixture-uk" if args.admixture
+        else "coalescent"
+    )
+    manifest = {
+        "build": args.build,
+        "n_people": args.n,
+        "mode": manifest_mode,
+        "shape": "cohort",
+        "chromosomes": chromosomes,
+        "seed": args.seed,
+        "samples": sample_ids,
+        "cohort_bcfs": [
+            str(p.relative_to(args.output_dir)) for p in cohort_bcf_paths
+        ],
+    }
+    if not args.legacy_background:
+        manifest["overlays"] = {
+            "clinvar_inject_density": args.clinvar_inject_density,
+            "rsid_density": args.rsid_density,
+            "dbsnp_source": (
+                str(args.dbsnp_vcf) if args.dbsnp_vcf
+                else "clinvar:INFO/RS"),
+            "somatic": bool(args.somatic),
+            "cosmic_inject_density": (
+                args.cosmic_inject_density if args.somatic else 0.0),
+            "stats": overlay_stats,
+        }
+    manifest_path = args.output_dir / "manifest.json"
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(
+        f"--mode cohort (streamed): {len(cohort_bcf_paths)} per-chrom "
+        f"BCFs written under {cohort_dir.relative_to(args.output_dir)}/. "
+        f"Derive per-person VCFs via `bcftools view -s SAMPLE_ID "
+        f"<cohort.chrN.bcf>`.",
+        file=sys.stderr,
+    )
+    print(f"Manifest written to {manifest_path}", file=sys.stderr)
+    print("Done.", file=sys.stderr)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     script_dir = Path(__file__).resolve().parent.parent
     args = _parser(script_dir).parse_args(argv)
@@ -601,6 +835,24 @@ def main(argv: list[str] | None = None) -> int:
             f"  prefetching overlay loaders in background: "
             f"{', '.join(scheduled)}",
             file=sys.stderr,
+        )
+
+    # Phase 5b1 — streaming cohort flow.
+    # When --mode cohort is set on the standard coalescent path, divert
+    # before the in-memory cohort_sites accumulator. Each chromosome's
+    # sites are simulated, overlaid, written to its own per-chrom BCF,
+    # and freed before the next chromosome is simulated, so peak RAM
+    # stays bounded by one chromosome's working set rather than the
+    # whole cohort. Legacy and admixture paths keep today's behaviour
+    # because their data shapes don't fit the streaming model: the
+    # legacy 1000G-pool path samples sites globally up front, and the
+    # admixture path emits per-person ancestry segments alongside
+    # cohort sites.
+    if (not args.legacy_background and not args.admixture
+            and args.mode == "cohort"):
+        return _run_cohort_streamed(
+            args, chromosomes, rng,
+            overlay_executor, overlay_futures, candidates,
         )
 
     person_ancestry: list = []  # admixture path fills per-person segments

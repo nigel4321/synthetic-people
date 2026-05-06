@@ -167,29 +167,36 @@ def _simulate_chromosome_from_seed(chrom: str, build: str, n_people: int,
     )
 
 
-def simulate_cohort(chromosomes: list, build: str, n_people: int,
-                    length_mb: float, demo_model: str | None,
-                    population: str, rec_rate: float, mu: float,
-                    rng: random.Random,
-                    titv_target: float = DEFAULT_TARGET_TITV,
-                    verbose: bool = False,
-                    workers: int = 1) -> list:
-    """Simulate a cohort across one or more chromosomes.
+def simulate_cohort_iter(chromosomes: list, build: str, n_people: int,
+                         length_mb: float, demo_model: str | None,
+                         population: str, rec_rate: float, mu: float,
+                         rng: random.Random,
+                         titv_target: float = DEFAULT_TARGET_TITV,
+                         verbose: bool = False,
+                         workers: int = 1):
+    """Yield ``(chrom, sites)`` pairs one chromosome at a time.
 
-    With ``workers > 1`` and more than one chromosome to simulate, each
-    chromosome runs in its own process via ``ProcessPoolExecutor``.
-    Per-chromosome seeds are pre-derived from ``rng`` *before* spawning,
-    so the cohort output is deterministic for a given master seed
-    regardless of the worker count. Note: the rng consumption pattern
-    changed in Phase 1 (one ``rng.randint`` per chromosome up front,
-    each chromosome then uses its own child rng), so output differs
-    from pre-Phase-1 runs at the same ``--seed``.
+    The streaming counterpart of :func:`simulate_cohort` — used by the
+    Phase 5b cohort-streaming path so the in-memory footprint at any
+    moment is bounded by a single chromosome's sites rather than the
+    whole cohort. The flat-list :func:`simulate_cohort` below stays as
+    a thin wrapper for callers (admixture, tests) that need everything
+    materialised.
+
+    Determinism: per-chromosome seeds are pre-derived from ``rng``
+    *before* spawning workers, identical to :func:`simulate_cohort`,
+    so the same ``--seed`` yields the same per-chrom site list whether
+    the caller iterates lazily or collects upfront.
+
+    With ``workers > 1`` and more than one chromosome, msprime runs
+    each chromosome in its own fork-pool worker. Yields are emitted in
+    submission order (not completion order) so a downstream BCF writer
+    sees chromosomes in the requested order.
     """
     seeds = [rng.randint(1, 2**31 - 1) for _ in chromosomes]
 
     use_pool = workers > 1 and len(chromosomes) > 1
     if not use_pool:
-        all_sites: list = []
         for chrom, seed in zip(chromosomes, seeds):
             if verbose:
                 print(f"  simulating chrom {chrom} (length {length_mb} "
@@ -202,8 +209,8 @@ def simulate_cohort(chromosomes: list, build: str, n_people: int,
             if verbose:
                 print(f"    {len(sites)} variable sites on chrom "
                       f"{chrom}", file=sys.stderr)
-            all_sites.extend(sites)
-        return all_sites
+            yield chrom, sites
+        return
 
     if verbose:
         print(f"  simulating {len(chromosomes)} chromosomes "
@@ -216,20 +223,42 @@ def simulate_cohort(chromosomes: list, build: str, n_people: int,
     # via copy-on-write — much faster startup than spawn, which would
     # re-import them per worker.
     ctx = mp.get_context("fork")
-    futures = []
     with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
-        for chrom, seed in zip(chromosomes, seeds):
-            futures.append((chrom, ex.submit(
+        futures = [
+            (chrom, ex.submit(
                 _simulate_chromosome_from_seed,
                 chrom, build, n_people, length_mb, demo_model,
                 population, rec_rate, mu, seed, titv_target,
-            )))
-
-        all_sites = []
+            ))
+            for chrom, seed in zip(chromosomes, seeds)
+        ]
         for chrom, fut in futures:
             sites = fut.result()
             if verbose:
                 print(f"    {len(sites)} variable sites on chrom "
                       f"{chrom}", file=sys.stderr)
-            all_sites.extend(sites)
+            yield chrom, sites
+
+
+def simulate_cohort(chromosomes: list, build: str, n_people: int,
+                    length_mb: float, demo_model: str | None,
+                    population: str, rec_rate: float, mu: float,
+                    rng: random.Random,
+                    titv_target: float = DEFAULT_TARGET_TITV,
+                    verbose: bool = False,
+                    workers: int = 1) -> list:
+    """Simulate a cohort and return all sites as a single flat list.
+
+    Thin wrapper over :func:`simulate_cohort_iter` for callers that
+    need the full cohort materialised (admixture path, fixture builders
+    in tests). Phase 5b's cohort-streaming flow uses
+    :func:`simulate_cohort_iter` directly so peak RAM stays bounded by
+    one chromosome's working set.
+    """
+    all_sites: list = []
+    for _, sites in simulate_cohort_iter(
+        chromosomes, build, n_people, length_mb, demo_model,
+        population, rec_rate, mu, rng, titv_target, verbose, workers,
+    ):
+        all_sites.extend(sites)
     return all_sites

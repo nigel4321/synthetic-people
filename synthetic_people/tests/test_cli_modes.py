@@ -137,11 +137,17 @@ class CliModeCohortTest(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
-    def test_cohort_bcf_and_index_exist(self):
-        bcf = self.tmpdir / "cohort" / "cohort.bcf"
+    def test_cohort_bcfs_and_indices_exist(self):
+        # Phase 5b1 streams cohort mode chromosome-by-chromosome and
+        # lands one BCF per chromosome rather than a single combined
+        # file. The fixture only simulates chr22 so we expect exactly
+        # one cohort.chr22.bcf + its CSI sidecar.
+        bcf = self.tmpdir / "cohort" / "cohort.chr22.bcf"
         self.assertTrue(bcf.is_file(), f"missing {bcf}")
         self.assertTrue(Path(str(bcf) + ".csi").is_file(),
                         f"missing CSI index for {bcf}")
+        bcfs = sorted((self.tmpdir / "cohort").glob("cohort.chr*.bcf"))
+        self.assertEqual(len(bcfs), 1)
 
     def test_no_per_person_vcfs(self):
         # The point of cohort mode is to skip per-person fan-out
@@ -156,11 +162,12 @@ class CliModeCohortTest(unittest.TestCase):
         manifest = json.loads(
             (self.tmpdir / "manifest.json").read_text())
         self.assertEqual(manifest.get("shape"), "cohort")
-        # `cohort_bcfs` is a list (forward-compatible with Phase 5b's
-        # per-chromosome BCF split — list of one in 5a, list of N in
-        # 5b without changing consumer code).
+        # Phase 5b1 — streamed cohort mode lands per-chromosome BCFs.
+        # The cohort_bcfs list shape (already in place from 5a) carries
+        # one entry per chromosome simulated.
         self.assertEqual(
-            manifest.get("cohort_bcfs"), ["cohort/cohort.bcf"],
+            manifest.get("cohort_bcfs"),
+            ["cohort/cohort.chr22.bcf"],
         )
         # No per-person list in cohort mode.
         self.assertNotIn("people", manifest)
@@ -169,7 +176,7 @@ class CliModeCohortTest(unittest.TestCase):
         self.assertEqual(len(manifest["samples"]), 3)
 
     def test_bcf_has_three_sample_columns(self):
-        bcf = self.tmpdir / "cohort" / "cohort.bcf"
+        bcf = self.tmpdir / "cohort" / "cohort.chr22.bcf"
         proc = subprocess.run(
             ["bcftools", "query", "-l", str(bcf)],
             capture_output=True, text=True, check=True,

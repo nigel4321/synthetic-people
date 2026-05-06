@@ -776,29 +776,53 @@ Three values:
 
 - `per-person` (default) — emit one bgzipped+tabixed VCF per person,
   identical to today's behaviour. No cohort BCF is written.
-- `cohort` — emit a single multi-sample BCF
-  (`out/cohort/cohort.bcf` + CSI) and **skip the per-person fan-out
-  entirely**. The cohort BCF carries every site's genotype block for
-  the whole cohort. Per-person VCFs can be derived later via
-  `bcftools view -s SAMPLE_ID out/cohort/cohort.bcf`.
+- `cohort` — stream the cohort chromosome-by-chromosome straight
+  onto disk as `out/cohort/cohort.chr<N>.bcf` + CSI sidecars (Phase
+  5b1). Peak RAM is bounded by one chromosome's working set rather
+  than the whole cohort, so cohort sizes that OOM the in-memory
+  per-person path finish cleanly here. The per-person fan-out is
+  skipped entirely — derive per-person VCFs later via
+  `bcftools view -s SAMPLE_ID out/cohort/cohort.chr<N>.bcf` (or
+  `bcftools concat` across chromosomes; Phase 5b2 will provide a
+  built-in derivation step).
 - `both` — emit both deliverables in the same run.
 
-Cohort mode is the scaling-friendly format for large `--n`. The
-per-person fan-out forks N worker processes that each touch the
-in-memory cohort_sites payload, dirtying COW pages and inflating
-peak system RAM by ~`workers ×` the cohort footprint. Cohort mode
-skips the fan-out entirely, so the same host that OOM-kills today on
-`--n 30 --chromosomes 1-22 --chr-length-mb 70` finishes cleanly with
-`--mode cohort`.
+Cohort mode is the scaling-friendly format for large `--n`. Two
+things compose to keep peak RAM down:
 
-Example: derive a single sample's VCF from a cohort BCF after the
+1. The streaming cohort flow (Phase 5b1) holds at most one
+   chromosome's worth of cohort sites in memory at a time — the
+   chromosome is simulated, overlaid, written to its own
+   `cohort.chr<N>.bcf`, and freed before the next chromosome is
+   simulated.
+2. The per-person fan-out is skipped entirely — no fork-pool of N
+   worker processes each touching the cohort_sites payload and
+   dirtying COW pages.
+
+The same host that OOM-kills on `--n 30 --chromosomes 1-22
+--chr-length-mb 70` under `--mode per-person` finishes cleanly under
+`--mode cohort`. Quick comparison at `n=500 × 3 chroms × 5 Mb`: peak
+RSS drops from ~1.9 GB (per-person) to ~0.85 GB (cohort streamed),
+wall time from ~2:27 to ~0:19.
+
+Example: derive a single sample's VCF from cohort BCFs after the
 fact:
 
 ```bash
+# Single chromosome
 bcftools view -s HG12345 -Oz \
-    out/cohort/cohort.bcf > out/person_HG12345.vcf.gz
+    out/cohort/cohort.chr22.bcf > out/person_HG12345.chr22.vcf.gz
+
+# All chromosomes — concat per-chrom slices
+bcftools concat -Oz -o out/person_HG12345.vcf.gz \
+    <(bcftools view -s HG12345 -Ou out/cohort/cohort.chr1.bcf) \
+    ...
 tabix -p vcf out/person_HG12345.vcf.gz
 ```
+
+Phase 5b2 will provide this derivation as a built-in CLI step
+(`generate_people.py --mode per-person` will derive from existing
+cohort BCFs rather than re-running the simulation).
 
 The manifest's `shape` field records which `--mode` produced the
 run. `samples[]` is always present at the top level (any mode) so

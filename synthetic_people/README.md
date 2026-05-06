@@ -291,14 +291,18 @@ Legacy-only flags (`--background-glob`, `--n-background`, `--af-min`,
   with msprime instead of running serially after it. No flag —
   prefetch is always on for the non-legacy path.
 - `--mode {per-person, cohort, both}` — output shape selector,
-  default `per-person` (today's behaviour, unchanged). `cohort` emits
-  a single multi-sample BCF (`out/cohort/cohort.bcf` + CSI) and skips
-  the per-person fan-out — derive per-person VCFs later via
-  `bcftools view -s SAMPLE_ID out/cohort/cohort.bcf`. `both` emits
-  both deliverables. The cohort BCF is the scaling-friendly format
-  for large `--n` because it avoids the per-person fork-pool memory
-  amplification; per-person stays the default so existing users see
-  no behaviour change unless they opt in.
+  default `per-person` (today's behaviour, unchanged).
+  - `cohort`: streams the cohort chromosome-by-chromosome straight
+    onto disk as `out/cohort/cohort.chr<N>.bcf` + CSI sidecars (Phase
+    5b1). Peak RAM is bounded by one chromosome's working set rather
+    than the whole cohort, so cohort sizes that OOM the in-memory
+    path finish cleanly here. Skips the per-person fan-out — derive
+    per-person VCFs later via `bcftools view -s SAMPLE_ID
+    out/cohort/cohort.chr<N>.bcf`.
+  - `both`: writes the in-memory single-file `out/cohort/cohort.bcf`
+    alongside the per-person VCFs. Phase 5b2 will switch this to the
+    streamed per-chrom layout once per-person derivation runs from
+    the BCFs.
 - Long-running runs print throttled progress lines (~20 s cadence)
   during the cohort BCF write and the per-person fan-out — `cohort
   BCF: 12,345/100,000 sites (4,500/s)` and `person VCFs: 1,234/100,000
@@ -345,9 +349,13 @@ out/
 ├── person_0001.vcf.gz.tbi
 ├── person_0002.vcf.gz
 ├── ...
-├── cohort/              # (--mode cohort | both): single multi-sample BCF
-│   ├── cohort.bcf       #   genotype matrix for the whole cohort
-│   └── cohort.bcf.csi   #   htslib-native index — `bcftools view -s …` ready
+├── cohort/              # cohort BCFs (one or many depending on --mode)
+│   ├── cohort.chr1.bcf  # --mode cohort: streamed per-chrom BCFs (Phase 5b1)
+│   ├── cohort.chr1.bcf.csi
+│   ├── cohort.chr2.bcf
+│   ├── ...
+│   ├── cohort.bcf       # --mode both: single combined file (Phase 5a path)
+│   └── cohort.bcf.csi   # htslib-native index — `bcftools view -s …` ready
 ├── manifest.json        # shape, samples[], per-person summary, cohort_bcfs path list
 ├── ancestry/            # admixture mode only: per-person local-ancestry BEDs
 │   ├── person_0001.bed
@@ -369,25 +377,36 @@ out/
 
 Which artefacts land depends on `--mode`:
 
-| `--mode` | per-person VCFs | `cohort/cohort.bcf` | manifest fields |
+| `--mode` | Per-person VCFs | Cohort BCFs (under `cohort/`) | Manifest fields |
 |---|---|---|---|
 | `per-person` (default) | yes | — | `shape=per-person`, `samples[]`, `people[]` |
-| `cohort` | — | yes | `shape=cohort`, `samples[]`, `cohort_bcfs[]`, no `people[]` |
-| `both` | yes | yes | `shape=both`, `samples[]`, `cohort_bcfs[]`, `people[]` |
+| `cohort` | — | one per chromosome: `cohort.chr<N>.bcf` (streamed) | `shape=cohort`, `samples[]`, `cohort_bcfs[]`, no `people[]` |
+| `both` | yes | single file: `cohort.bcf` (written from in-memory cohort) | `shape=both`, `samples[]`, `cohort_bcfs[]`, `people[]` |
 
 The top-level `samples[]` list always lands so a downstream tool
 wanting "every sample ID" reads one field regardless of `--mode`.
-`cohort_bcfs` is a list (singleton in 5a) so the consumer code path
-doesn't change when Phase 5b lands per-chromosome BCFs.
+`cohort_bcfs` is a list — singleton for `--mode both` (one combined
+file), one entry per chromosome for `--mode cohort` (streamed
+per-chrom layout). `--mode both` will switch to the per-chrom layout
+in Phase 5b2 once per-person derivation runs from the BCFs directly.
 
-To derive a per-person VCF from a cohort BCF later (e.g. when `--mode
+To derive a per-person VCF from cohort BCFs later (e.g. when `--mode
 cohort` was used to keep memory bounded on a 100k-person run):
 
 ```bash
+# Single chromosome
 bcftools view -s HG12345 -Oz \
-    out/cohort/cohort.bcf > out/person_HG12345.vcf.gz
+    out/cohort/cohort.chr22.bcf > out/person_HG12345.chr22.vcf.gz
+
+# All chromosomes — concatenate per-chrom slices
+bcftools concat -Oz -o out/person_HG12345.vcf.gz \
+    <(bcftools view -s HG12345 -Ou out/cohort/cohort.chr1.bcf) \
+    <(bcftools view -s HG12345 -Ou out/cohort/cohort.chr2.bcf) \
+    ...
 tabix -p vcf out/person_HG12345.vcf.gz
 ```
+
+Phase 5b2 will provide this derivation as a built-in CLI step.
 
 Per-person BED columns (admixture mode only):
 
