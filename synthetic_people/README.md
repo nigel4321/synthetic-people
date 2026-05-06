@@ -290,6 +290,20 @@ Legacy-only flags (`--background-glob`, `--n-background`, `--af-min`,
   *before* the coalescent simulation runs, so the loader work overlaps
   with msprime instead of running serially after it. No flag —
   prefetch is always on for the non-legacy path.
+- `--mode {per-person, cohort, both}` — output shape selector,
+  default `per-person` (today's behaviour, unchanged). `cohort` emits
+  a single multi-sample BCF (`out/cohort/cohort.bcf` + CSI) and skips
+  the per-person fan-out — derive per-person VCFs later via
+  `bcftools view -s SAMPLE_ID out/cohort/cohort.bcf`. `both` emits
+  both deliverables. The cohort BCF is the scaling-friendly format
+  for large `--n` because it avoids the per-person fork-pool memory
+  amplification; per-person stays the default so existing users see
+  no behaviour change unless they opt in.
+- Long-running runs print throttled progress lines (~20 s cadence)
+  during the cohort BCF write and the per-person fan-out — `cohort
+  BCF: 12,345/100,000 sites (4,500/s)` and `person VCFs: 1,234/100,000
+  written (5/s, elapsed 240s, eta 19000s)` — so a multi-hour 100k run
+  has visible heartbeat without flooding stderr.
 
 ---
 
@@ -327,11 +341,14 @@ offline.
 
 ```
 out/
-├── person_0001.vcf.gz
+├── person_0001.vcf.gz   # (--mode per-person | both)
 ├── person_0001.vcf.gz.tbi
 ├── person_0002.vcf.gz
 ├── ...
-├── manifest.json        # per-person VCF + truth + ancestry summary
+├── cohort/              # (--mode cohort | both): single multi-sample BCF
+│   ├── cohort.bcf       #   genotype matrix for the whole cohort
+│   └── cohort.bcf.csi   #   htslib-native index — `bcftools view -s …` ready
+├── manifest.json        # shape, samples[], per-person summary, cohort_bcfs path list
 ├── ancestry/            # admixture mode only: per-person local-ancestry BEDs
 │   ├── person_0001.bed
 │   └── ...
@@ -348,6 +365,28 @@ out/
     ├── af_histogram.png
     ├── indel_lengths.png
     └── pca.png
+```
+
+Which artefacts land depends on `--mode`:
+
+| `--mode` | per-person VCFs | `cohort/cohort.bcf` | manifest fields |
+|---|---|---|---|
+| `per-person` (default) | yes | — | `shape=per-person`, `samples[]`, `people[]` |
+| `cohort` | — | yes | `shape=cohort`, `samples[]`, `cohort_bcfs[]`, no `people[]` |
+| `both` | yes | yes | `shape=both`, `samples[]`, `cohort_bcfs[]`, `people[]` |
+
+The top-level `samples[]` list always lands so a downstream tool
+wanting "every sample ID" reads one field regardless of `--mode`.
+`cohort_bcfs` is a list (singleton in 5a) so the consumer code path
+doesn't change when Phase 5b lands per-chromosome BCFs.
+
+To derive a per-person VCF from a cohort BCF later (e.g. when `--mode
+cohort` was used to keep memory bounded on a 100k-person run):
+
+```bash
+bcftools view -s HG12345 -Oz \
+    out/cohort/cohort.bcf > out/person_HG12345.vcf.gz
+tabix -p vcf out/person_HG12345.vcf.gz
 ```
 
 Per-person BED columns (admixture mode only):
@@ -827,3 +866,4 @@ Tracked in `IMPLEMENTATION_PLAN.md`:
 | `--af-min` | [legacy] Minimum AF when loading the pool | `0.05` |
 | `--sfs-alpha` | [legacy] Power-law exponent for the SFS | `2.0` |
 | `--workers` | [perf] Worker processes for the per-chromosome pool and the per-person pool. `0` = auto (`os.cpu_count()`), `1` = serial. Linux only. | `0` |
+| `--mode` | [perf] Output shape: `per-person` (today's behaviour, unchanged), `cohort` (single multi-sample BCF, skip per-person fan-out), or `both`. Cohort mode is the scaling-friendly path for large `--n` — derive per-person VCFs later via `bcftools view -s`. | `per-person` |

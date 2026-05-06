@@ -8,6 +8,7 @@ import multiprocessing as mp
 import random
 import shutil
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
@@ -67,6 +68,7 @@ from .sv import (
     DEFAULT_SVS_PER_PERSON,
     generate_person_svs,
 )
+from .bcf_writer import CohortBcfWriter
 from .truth import TruthBedWriter
 from .writer import write_person_vcf
 
@@ -492,6 +494,17 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                         "regardless of --workers, but differs from a "
                         "pre-Phase-1 run at the same seed because the "
                         "rng consumption pattern changed.")
+    p.add_argument("--mode", choices=("per-person", "cohort", "both"),
+                   default="per-person",
+                   help="Output shape. per-person (default): emit one "
+                        "VCF per person, identical to today's behaviour. "
+                        "cohort: emit a single multi-sample cohort BCF "
+                        "and skip per-person fan-out — derive per-person "
+                        "later via `bcftools view -s SAMPLE`. both: emit "
+                        "both deliverables. The cohort BCF is the "
+                        "scaling-friendly format for large --n; "
+                        "per-person stays the default so existing users "
+                        "see no behaviour change unless they opt in.")
     p.add_argument("--check-deps", action="store_true",
                    help="Check htslib binaries and optional Python deps, "
                         "then exit")
@@ -755,6 +768,116 @@ def main(argv: list[str] | None = None) -> int:
     # master rng in a fixed order.
     person_seeds = [rng.randint(1, 2**31 - 1) for _ in range(args.n)]
 
+    # Phase 5a: write the cohort BCF when --mode is `cohort` or `both`.
+    # The BCF carries the truth-state cohort GTs (no per-call DP/GQ/AD
+    # noise — those are layered in at per-person derivation time, the
+    # same way today's writer.py does). At large --n this is the
+    # scaling-friendly deliverable; per-person VCFs can be derived from
+    # it later via `bcftools view -s SAMPLE`.
+    cohort_bcf_path: Path | None = None
+    if args.mode in ("cohort", "both"):
+        cohort_dir = args.output_dir / "cohort"
+        cohort_bcf_path = cohort_dir / "cohort.bcf"
+        contig_index = {c: i for i, c
+                        in enumerate(BUILDS[args.build]["contigs"])}
+        bcf_t0 = time.monotonic()
+        print(
+            f"Writing cohort BCF: {args.n} samples × "
+            f"{len(cohort_sites)} sites → {cohort_bcf_path}",
+            file=sys.stderr,
+        )
+        # Sort by (contig_order, pos) so the BCF is in genome order
+        # regardless of how chromosomes were emitted by the simulator.
+        cohort_sites_sorted = sorted(
+            cohort_sites,
+            key=lambda s: (contig_index.get(s["chrom"],
+                                            len(contig_index)), s["pos"]),
+        )
+        last_log = bcf_t0
+        per_chrom_count: dict = {}
+        with CohortBcfWriter(cohort_bcf_path, args.build,
+                             sample_ids) as bcfw:
+            for s in cohort_sites_sorted:
+                bcfw.write_site(s)
+                per_chrom_count[s["chrom"]] = \
+                    per_chrom_count.get(s["chrom"], 0) + 1
+                now = time.monotonic()
+                # Throttled progress: every ~20 s on long runs, plus a
+                # final summary at end. Tells the user "still alive,
+                # making progress" without spamming the log on small
+                # cohorts that finish in milliseconds.
+                if now - last_log > 20.0:
+                    written = sum(per_chrom_count.values())
+                    rate = written / (now - bcf_t0) if now > bcf_t0 else 0
+                    print(
+                        f"  cohort BCF: {written:,}/"
+                        f"{len(cohort_sites_sorted):,} sites "
+                        f"({rate:,.0f}/s)",
+                        file=sys.stderr,
+                    )
+                    last_log = now
+        bcf_secs = time.monotonic() - bcf_t0
+        for chrom in chromosomes:
+            n = per_chrom_count.get(chrom, 0)
+            if n:
+                print(f"  cohort BCF chrom {chrom}: {n} sites",
+                      file=sys.stderr)
+        print(f"  cohort BCF complete in {bcf_secs:.1f}s",
+              file=sys.stderr)
+
+    if args.mode == "cohort":
+        # No per-person fan-out — cohort BCF is the only deliverable.
+        # Drop the in-memory cohort_sites payload now and write a slim
+        # manifest pointing at the BCF.
+        del cohort_sites
+        manifest_mode = (
+            "legacy-background" if args.legacy_background
+            else "admixture-uk" if args.admixture
+            else "coalescent"
+        )
+        manifest = {
+            "build": args.build,
+            "n_people": args.n,
+            "mode": manifest_mode,
+            "shape": "cohort",
+            "chromosomes": chromosomes,
+            "seed": args.seed,
+            "samples": sample_ids,
+            "cohort_bcfs": [
+                str(cohort_bcf_path.relative_to(args.output_dir))
+            ],
+        }
+        if args.admixture:
+            manifest["ancestry_proportions"] = {
+                "EUR": args.eur_frac,
+                "SAS": args.sas_frac,
+                "AFR": args.afr_frac,
+            }
+        if not args.legacy_background:
+            manifest["overlays"] = {
+                "clinvar_inject_density": args.clinvar_inject_density,
+                "rsid_density": args.rsid_density,
+                "dbsnp_source": (
+                    str(args.dbsnp_vcf) if args.dbsnp_vcf
+                    else "clinvar:INFO/RS"),
+                "somatic": bool(args.somatic),
+                "cosmic_inject_density": (
+                    args.cosmic_inject_density if args.somatic else 0.0),
+                "stats": overlay_stats,
+            }
+        manifest_path = args.output_dir / "manifest.json"
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        print(
+            f"--mode cohort: skipped per-person VCF writes; cohort BCF "
+            f"is the deliverable. Derive per-person VCFs via "
+            f"`bcftools view -s SAMPLE_ID {cohort_bcf_path.name}`.",
+            file=sys.stderr,
+        )
+        print(f"Manifest written to {manifest_path}", file=sys.stderr)
+        print("Done.", file=sys.stderr)
+        return 0
+
     # SV bounds: each SV occupies [pos, pos + svlen]; we draw POS up to
     # `chrom_length_bp - sv_length_max` to keep the END inside the
     # simulated region. For the legacy path we just use the full
@@ -802,6 +925,30 @@ def main(argv: list[str] | None = None) -> int:
     })
 
     use_pool = workers > 1 and args.n > 1
+    fanout_t0 = time.monotonic()
+    last_progress_log = fanout_t0
+    progress_log_interval = 20.0   # seconds — same cadence as cohort BCF
+
+    def _maybe_log_progress(done: int) -> None:
+        nonlocal last_progress_log
+        now = time.monotonic()
+        # First / last person always log; intermediate progress is
+        # throttled so the output stays readable on small cohorts.
+        if (now - last_progress_log) < progress_log_interval \
+                and 0 < done < args.n:
+            return
+        elapsed = now - fanout_t0
+        rate = done / elapsed if elapsed > 0 else 0.0
+        remaining = args.n - done
+        eta = remaining / rate if rate > 0 else float("inf")
+        eta_str = f"{eta:.0f}s" if eta < float("inf") else "?"
+        print(
+            f"  person VCFs: {done:,}/{args.n:,} written "
+            f"({rate:.1f}/s, elapsed {elapsed:.0f}s, eta {eta_str})",
+            file=sys.stderr,
+        )
+        last_progress_log = now
+
     if use_pool:
         print(f"  fan-out: {workers} worker processes "
               f"(fork start method, --n={args.n})",
@@ -819,11 +966,12 @@ def main(argv: list[str] | None = None) -> int:
             # person order even if workers complete out of order.
             for i, fut in enumerate(futures):
                 results[i] = fut.result()
+                _maybe_log_progress(i + 1)
     else:
-        results = [
-            _person_worker(i, sample_ids[i], person_seeds[i])
-            for i in range(args.n)
-        ]
+        results = []
+        for i in range(args.n):
+            results.append(_person_worker(i, sample_ids[i], person_seeds[i]))
+            _maybe_log_progress(i + 1)
 
     # Drop the shared payload now that workers have finished, so the
     # cohort_sites reference can be GC'd before manifest writing.
@@ -843,10 +991,21 @@ def main(argv: list[str] | None = None) -> int:
         "build": args.build,
         "n_people": args.n,
         "mode": mode,
+        "shape": args.mode,
         "chromosomes": chromosomes,
         "seed": args.seed,
+        # Always emit the flat list of sample IDs at the top level so a
+        # downstream tool wanting "give me every sample" doesn't need a
+        # different code path per --mode value (cohort returns
+        # `samples`; per-person/both used to require iterating
+        # `people[*].sample_id`).
+        "samples": sample_ids,
         "people": manifest_people,
     }
+    if cohort_bcf_path is not None:
+        manifest["cohort_bcfs"] = [
+            str(cohort_bcf_path.relative_to(args.output_dir))
+        ]
     if args.admixture:
         manifest["ancestry_proportions"] = {
             "EUR": args.eur_frac,

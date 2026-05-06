@@ -762,6 +762,65 @@ inside the overlay block as each future is resolved. If a loader
 finished while the simulation was running, the `Awaiting` line returns
 immediately.
 
+### 9.3 Output shape — `--mode` (Phase 5a)
+
+`--mode` controls *what* the run writes to disk. Default is
+`per-person`, the layout every existing user is used to:
+
+```bash
+generate_people.py --n 100 --seed 42 --chromosomes 22 \
+    --chr-length-mb 5 --mode per-person   # default; flag optional
+```
+
+Three values:
+
+- `per-person` (default) — emit one bgzipped+tabixed VCF per person,
+  identical to today's behaviour. No cohort BCF is written.
+- `cohort` — emit a single multi-sample BCF
+  (`out/cohort/cohort.bcf` + CSI) and **skip the per-person fan-out
+  entirely**. The cohort BCF carries every site's genotype block for
+  the whole cohort. Per-person VCFs can be derived later via
+  `bcftools view -s SAMPLE_ID out/cohort/cohort.bcf`.
+- `both` — emit both deliverables in the same run.
+
+Cohort mode is the scaling-friendly format for large `--n`. The
+per-person fan-out forks N worker processes that each touch the
+in-memory cohort_sites payload, dirtying COW pages and inflating
+peak system RAM by ~`workers ×` the cohort footprint. Cohort mode
+skips the fan-out entirely, so the same host that OOM-kills today on
+`--n 30 --chromosomes 1-22 --chr-length-mb 70` finishes cleanly with
+`--mode cohort`.
+
+Example: derive a single sample's VCF from a cohort BCF after the
+fact:
+
+```bash
+bcftools view -s HG12345 -Oz \
+    out/cohort/cohort.bcf > out/person_HG12345.vcf.gz
+tabix -p vcf out/person_HG12345.vcf.gz
+```
+
+The manifest's `shape` field records which `--mode` produced the
+run. `samples[]` is always present at the top level (any mode) so
+listing the cohort doesn't need a per-mode code path; `people[]`
+appears in `per-person` and `both`; `cohort_bcfs[]` appears in
+`cohort` and `both` (a list — singleton in 5a, populated with
+per-chromosome paths once Phase 5b lands).
+
+### 9.4 Progress logging on long runs
+
+The cohort BCF write loop and the per-person fan-out both emit
+throttled (~20 s cadence) heartbeat lines so a multi-hour run has
+visible progress without flooding stderr. You'll see things like:
+
+```
+  cohort BCF: 1,234,567/2,285,875 sites (24,500/s)
+  person VCFs: 1,234/100,000 written (5/s, elapsed 240s, eta 19000s)
+```
+
+Small cohorts that finish in under twenty seconds skip the
+intermediate logs and just print the final summary.
+
 ---
 
 ## 10. Troubleshooting
