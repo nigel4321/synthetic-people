@@ -177,8 +177,8 @@ def load_or_create_meta(args, chromosomes: list, cohort_dir: Path,
         )
 
     # Fresh start: derive new state from the master rng.
-    from .background import random_sample_id   # local import; avoids cycle
-    samples = [random_sample_id(rng) for _ in range(args.n)]
+    from .background import draw_sample_ids   # local import; avoids cycle
+    samples = draw_sample_ids(args.n, rng)
     person_seeds = [rng.randint(1, 2**31 - 1) for _ in range(args.n)]
     overlay_seeds = {
         chrom: rng.randint(1, 2**31 - 1)

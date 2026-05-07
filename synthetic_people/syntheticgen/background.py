@@ -146,6 +146,76 @@ def alt_dosage(gt: str) -> int:
 
 
 def random_sample_id(rng: random.Random) -> str:
-    """HG/NA-prefixed 5-digit ID, mirroring 1000G naming conventions."""
+    """HG/NA-prefixed 5-digit ID, mirroring 1000G naming conventions.
+
+    .. warning::
+       This single-draw function is **only safe for very small
+       cohorts** (n ≲ 100) — the prefix × 5-digit number gives just
+       180 000 unique IDs, so by birthday-paradox math collisions
+       become routine past n ≈ 600. Cohort writers must use unique
+       sample names (bcftools rejects multi-sample BCFs with
+       duplicate columns), so anything constructing a list of N IDs
+       should call :func:`draw_sample_ids` instead.
+    """
     prefix = rng.choice(("HG", "NA"))
     return f"{prefix}{rng.randint(10000, 99999)}"
+
+
+# ID-pool dimensions for :func:`draw_sample_ids`. The number range
+# was widened from the legacy 5-digit ``random_sample_id`` to a
+# 6-digit + 7-digit superset so the cohort write succeeds at any
+# realistic cohort size:
+#
+#   pool size = 2 prefixes × (1e7 - 1e5) = 19.8M unique IDs
+#
+# Plenty for n ≤ 1M (the Phase 5 stretch target). Above that, the
+# function raises rather than silently risking a duplicate.
+_SAMPLE_ID_PREFIXES = ("HG", "NA")
+_SAMPLE_ID_NUMBER_LO = 100_000
+_SAMPLE_ID_NUMBER_HI = 10_000_000
+_SAMPLE_ID_POOL_SIZE = (
+    len(_SAMPLE_ID_PREFIXES)
+    * (_SAMPLE_ID_NUMBER_HI - _SAMPLE_ID_NUMBER_LO)
+)
+
+
+def draw_sample_ids(n_people: int, rng: random.Random) -> list:
+    """Draw ``n_people`` distinct ``HG``/``NA``-prefixed sample IDs.
+
+    Uniqueness is guaranteed by construction: a single
+    ``rng.sample(range(pool_size), n_people)`` shuffle picks integer
+    keys without replacement; each key decodes deterministically to a
+    ``(prefix, number)`` pair. So ``draw_sample_ids(3000, rng)`` cannot
+    produce a duplicate even after thousands of draws — the way the
+    old per-call ``random_sample_id`` could and did. bcftools rejects
+    multi-sample BCFs with duplicate sample columns
+    (``[E::bcf_hdr_add_sample_len] Duplicated sample name``), so the
+    cohort writer needs the uniqueness contract this function offers.
+
+    Determinism: the rng consumption is one ``rng.sample`` call, so a
+    re-run with the same ``--seed`` and the same ``n_people`` produces
+    the same list of IDs in the same order. Output at a given seed
+    differs from runs against the previous per-call
+    ``random_sample_id`` because the consumption pattern changed.
+
+    Raises ``ValueError`` if ``n_people`` exceeds the available pool
+    (1.98 × 10⁷). At that scale we'd need a wider pool or a different
+    naming convention — neither is needed today.
+    """
+    if n_people <= 0:
+        return []
+    if n_people > _SAMPLE_ID_POOL_SIZE:
+        raise ValueError(
+            f"n_people={n_people} exceeds the unique sample-ID pool "
+            f"({_SAMPLE_ID_POOL_SIZE}); widen the pool in "
+            f"background.py or switch to a longer naming convention"
+        )
+    span = _SAMPLE_ID_NUMBER_HI - _SAMPLE_ID_NUMBER_LO
+    keys = rng.sample(range(_SAMPLE_ID_POOL_SIZE), n_people)
+    out = []
+    for k in keys:
+        prefix_idx, num_in_prefix = divmod(k, span)
+        prefix = _SAMPLE_ID_PREFIXES[prefix_idx]
+        number = _SAMPLE_ID_NUMBER_LO + num_in_prefix
+        out.append(f"{prefix}{number}")
+    return out

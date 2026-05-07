@@ -20,7 +20,7 @@ from .admixture import (
     simulate_cohort as simulate_admixed_cohort,
     write_ancestry_bed,
 )
-from .background import load_background_pool, random_sample_id
+from .background import draw_sample_ids, load_background_pool
 from .builds import BUILDS
 from .clinvar import (
     DEFAULT_CLINVAR_INJECT_DENSITY,
@@ -1386,7 +1386,7 @@ def main(argv: list[str] | None = None) -> int:
     write_sfs_tsv(sfs_path, hist)
     print(f"  SFS histogram written to {sfs_path}", file=sys.stderr)
 
-    sample_ids = [random_sample_id(rng) for _ in range(args.n)]
+    sample_ids = draw_sample_ids(args.n, rng)
     # Pre-derive per-person seeds from the master rng before any
     # per-person work runs. This is what makes the output deterministic
     # for a given --seed regardless of --workers: the per-person rng
