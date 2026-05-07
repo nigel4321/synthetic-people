@@ -913,6 +913,54 @@ If your analysis depends on chr-scale LD, use
 host with enough RAM that auto-pick keeps the full chromosome
 in one chunk).
 
+### 9.6 Diagnosing memory pressure — `--profile-memory`
+
+When a run OOMs and the auto-picked chunk size still doesn't bring
+peak RAM under the host's limit, the next step is to look at the
+RSS curve over time and figure out which phase is the offender.
+Pass `--profile-memory PATH` to spawn a background thread that
+samples this process's RSS once per second to a TSV at `PATH`,
+plus drops labelled checkpoint rows at every key transition
+(ClinVar fetch, overlay loads, per-chromosome simulation, BCF
+write, per-person fan-out start/end). Every write is flushed +
+fsynced so an OOM kill preserves the trace up to the kernel reap.
+
+```bash
+generate_people.py --n 3000 --seed 45 --chromosomes 1-22 \
+    --chr-length-mb 70 --output-dir ~/out \
+    --profile-memory ~/out/memprof.tsv
+```
+
+The TSV has six columns:
+
+| Column | What it is |
+|---|---|
+| `elapsed_s` | seconds since profiler started |
+| `rss_mb` | parent process RSS in MB |
+| `vms_mb` | parent process VMS in MB |
+| `children_rss_mb` | sum of all live descendants' RSS (workers, bcftools subprocesses) |
+| `total_rss_mb` | parent + children — usually what you want for OOM diagnosis since the kernel budgets against the whole tree |
+| `label` | empty for periodic samples, caller-supplied string for checkpoint marks |
+
+A quick plot:
+
+```python
+import pandas as pd, matplotlib.pyplot as plt
+df = pd.read_csv("memprof.tsv", sep="\t")
+plt.plot(df.elapsed_s, df.total_rss_mb, label="total")
+plt.plot(df.elapsed_s, df.rss_mb, label="parent only")
+for _, row in df[df.label.notna() & (df.label != "")].iterrows():
+    plt.axvline(row.elapsed_s, color="red", alpha=0.3)
+    plt.text(row.elapsed_s, row.total_rss_mb, row.label, rotation=90)
+plt.legend(); plt.xlabel("seconds"); plt.ylabel("RSS (MB)")
+plt.show()
+```
+
+The flag is opt-in and zero-cost when not used. Needs
+`pip install psutil` (already in `requirements.txt` since Phase
+5f). Marks fired from forked workers are silently ignored — only
+the parent process writes to the TSV.
+
 ---
 
 ## 10. Troubleshooting

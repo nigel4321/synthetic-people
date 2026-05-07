@@ -72,6 +72,7 @@ from .sv import (
 )
 from .bcf_writer import CohortBcfWriter
 from .cohort_derivation import derive_person_records
+from .memprofile import mark as memprofile_mark
 from .resume import ResumeMismatch, load_or_create_meta
 from .truth import TruthBedWriter
 from .writer import write_person_vcf
@@ -519,6 +520,17 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                         "regardless of --workers, but differs from a "
                         "pre-Phase-1 run at the same seed because the "
                         "rng consumption pattern changed.")
+    p.add_argument("--profile-memory", type=Path, default=None,
+                   metavar="TSV_PATH",
+                   help="[diagnostic] Spawn a background thread that "
+                        "samples this process's RSS once per second to "
+                        "TSV_PATH (one row per sample, plus labelled "
+                        "checkpoint rows at key code transitions). "
+                        "Flushed + fsynced after every write so an OOM "
+                        "kill preserves data up to the kernel reap. "
+                        "Needs `pip install psutil`. Useful for "
+                        "diagnosing where peak RAM lands during a "
+                        "failing run.")
     p.add_argument("--no-resume", action="store_true",
                    help="On the streamed coalescent path: ignore any "
                         "existing out/cohort/cohort.meta.json + cohort "
@@ -584,17 +596,23 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
         print(f"Awaiting ClinVar overlay index for {chromosomes}...",
               file=sys.stderr)
         clinvar_index = overlay_futures["clinvar_index"].result()
+        memprofile_mark(
+            f"clinvar overlay index resolved ({len(clinvar_index)})")
         print(f"  {len(clinvar_index)} ClinVar pathogenic records "
               "available for overlay", file=sys.stderr)
     if overlay_futures.get("rsid_pool") is not None:
         print(f"Awaiting rsID pool...", file=sys.stderr)
         rsid_pool = overlay_futures["rsid_pool"].result()
+        memprofile_mark(
+            f"rsid pool resolved ({len(rsid_pool)})")
         print(f"  {len(rsid_pool)} rsID-bearing records available",
               file=sys.stderr)
     if overlay_futures.get("cosmic_pool") is not None:
         print(f"Awaiting COSMIC pool from {args.cosmic_vcf}...",
               file=sys.stderr)
         cosmic_pool = overlay_futures["cosmic_pool"].result()
+        memprofile_mark(
+            f"cosmic pool resolved ({len(cosmic_pool)})")
         print(f"  {len(cosmic_pool)} COSMIC records available",
               file=sys.stderr)
     if overlay_executor is not None:
@@ -707,6 +725,8 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
             cohort_bcf_paths.append(
                 cohort_dir / f"cohort.chr{chrom}.bcf")
 
+    memprofile_mark(
+        f"streaming sim start ({len(chromosomes_to_simulate)} chroms)")
     for chrom, sites in simulate_cohort_iter(
         chromosomes=chromosomes_to_simulate, build=args.build,
         n_people=args.n, length_mb=args.chr_length_mb,
@@ -715,6 +735,7 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
         rng=rng, verbose=True, workers=workers,
         chunk_size_mb=chunk_size_mb,
     ):
+        memprofile_mark(f"chrom {chrom} sites yielded ({len(sites)})")
         # Each chromosome's overlays use a per-chrom rng seeded from
         # the resume record so they're independent of streaming order
         # and reproducible across resumes.
@@ -766,6 +787,7 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
         if chrom_bcf not in cohort_bcf_paths:
             cohort_bcf_paths.append(chrom_bcf)
         resume.mark_chromosome_done(chrom)
+        memprofile_mark(f"chrom {chrom} BCF written")
 
         # Drop the chunk's reference so the next chromosome's
         # simulation has the previous chunk's RAM available.
@@ -932,6 +954,9 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
     fanout_t0 = time.monotonic()
     last_progress_log = fanout_t0
     progress_log_interval = 20.0
+    memprofile_mark(
+        f"per-person fanout start ({args.n} people, "
+        f"{fanout_workers} workers)")
 
     def _maybe_log_progress(done: int) -> None:
         nonlocal last_progress_log
@@ -975,6 +1000,7 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
             _maybe_log_progress(i + 1)
 
     _PERSON_WORKER_STATE.clear()
+    memprofile_mark("per-person fanout done")
 
     manifest_people: list = []
     for entry, person_stats, n_svs in results:
@@ -1078,9 +1104,33 @@ def main(argv: list[str] | None = None) -> int:
     rng = random.Random(args.seed)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Install the memory profiler before any heavy work so the TSV
+    # captures the full run. The flag is opt-in; when unset, all the
+    # `memprofile.mark(...)` calls scattered through this function
+    # are zero-cost no-ops.
+    profiler = None
+    if args.profile_memory is not None:
+        try:
+            from .memprofile import MemoryProfiler, install
+        except ImportError as exc:
+            sys.exit(
+                f"--profile-memory requires psutil but it failed to "
+                f"import: {exc}. Install with `pip install psutil` "
+                f"or drop the flag."
+            )
+        profiler = MemoryProfiler(args.profile_memory)
+        profiler.start()
+        install(profiler)
+        print(
+            f"  --profile-memory: sampling RSS to "
+            f"{args.profile_memory} (1 s cadence + labelled marks)",
+            file=sys.stderr,
+        )
+
     print(f"Reference build: {args.build}", file=sys.stderr)
     print("Fetching ClinVar (cached across runs)...", file=sys.stderr)
     clinvar_vcf = fetch_clinvar(args.cache_dir, args.build)
+    memprofile_mark("clinvar fetched")
 
     sig_filter = {s.strip() for s in args.clinvar_sig.split(",") if s.strip()}
     print(
@@ -1088,6 +1138,7 @@ def main(argv: list[str] | None = None) -> int:
         file=sys.stderr,
     )
     candidates = load_highlighted_candidates(clinvar_vcf, sig_filter)
+    memprofile_mark(f"candidates loaded ({len(candidates)} records)")
     print(f"  {len(candidates)} candidates matched", file=sys.stderr)
     if not candidates:
         sys.exit("no ClinVar variants matched the CLNSIG filter — widen "
@@ -1528,6 +1579,7 @@ def main(argv: list[str] | None = None) -> int:
     # Drop the shared payload now that workers have finished, so the
     # cohort_sites reference can be GC'd before manifest writing.
     _PERSON_WORKER_STATE.clear()
+    memprofile_mark("per-person fanout done")
 
     manifest_people: list = []
     for entry, person_stats, n_svs in results:
