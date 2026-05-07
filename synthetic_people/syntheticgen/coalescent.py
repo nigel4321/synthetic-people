@@ -533,6 +533,15 @@ def simulate_cohort_iter(chromosomes: list, build: str, n_people: int,
                 print(f"    {len(sites)} variable sites on chrom "
                       f"{chrom}", file=sys.stderr)
             yield chrom, sites
+            # Drop the generator-local binding so that, once the
+            # consumer's own ``del sites`` runs, the per-chrom site
+            # list (multi-GB at n≈3000 because the sparse-carriers
+            # representation has heavy Python tuple overhead) is
+            # actually collected before the next chromosome's
+            # simulation starts. Otherwise the generator frame keeps
+            # the previous chrom's list alive across the yield, and
+            # peak working set is two chromosomes wide.
+            sites = None
         return
 
     if verbose:
@@ -556,12 +565,20 @@ def simulate_cohort_iter(chromosomes: list, build: str, n_people: int,
             ))
             for chrom, seed in zip(chromosomes, seeds)
         ]
-        for chrom, fut in futures:
+        for i, (chrom, fut) in enumerate(futures):
             sites = fut.result()
             if verbose:
                 print(f"    {len(sites)} variable sites on chrom "
                       f"{chrom}", file=sys.stderr)
             yield chrom, sites
+            # Same generator-binding release as the no-pool branch.
+            # Also clear the slot in ``futures`` — each future's
+            # internal ``_result`` still references the same list,
+            # and the tuple in ``futures`` would otherwise pin it
+            # for the rest of the loop.
+            sites = None
+            fut = None
+            futures[i] = (chrom, None)
 
 
 def simulate_cohort(chromosomes: list, build: str, n_people: int,
