@@ -530,18 +530,26 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                         "regardless of --workers, but differs from a "
                         "pre-Phase-1 run at the same seed because the "
                         "rng consumption pattern changed.")
-    p.add_argument("--fanout-batch-size", type=int, default=50,
+    p.add_argument("--fanout-batch-size", type=int, default=4,
                    help="[perf] On the streamed coalescent path, group "
                         "this many sample IDs into one bcftools query "
                         "per cohort BCF during the per-person fan-out. "
                         "The legacy per-person path issued one bcftools "
                         "subprocess per (person, chrom) pair (~66k for "
                         "n=3000 × 22 chroms); batching cuts that by ~B× "
-                        "while bounding parent peak memory at "
-                        "B × per-person record list. Default 50 fits "
-                        "comfortably on 32 GB hosts at n=3000; raise it "
-                        "for hosts with more RAM, lower it if the "
-                        "fan-out OOMs.")
+                        "while bounding the parent process's batch RSS "
+                        "at B × per-person record list (empirically "
+                        "~280 MB/person at n=3000 × 22 chroms). The "
+                        "binding memory ceiling is "
+                        "(parent_baseline + B × per_person) × workers, "
+                        "because each fork-spawned worker's apparent "
+                        "RSS includes the parent's batch via COW and "
+                        "the kernel's OOM scoring is per-process. "
+                        "Default 4 keeps the worst case under ~14 GB "
+                        "with --workers 8 on a 32 GB host. Raise it "
+                        "for hosts with more RAM or for runs with "
+                        "fewer workers; lower it (or drop --workers) "
+                        "if the fan-out OOMs.")
     p.add_argument("--profile-memory", type=Path, default=None,
                    metavar="TSV_PATH",
                    help="[diagnostic] Spawn a background thread that "
@@ -1050,19 +1058,29 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
         batch_end = min(batch_start + batch_size, args.n)
         batch_indices = range(batch_start, batch_end)
         batch_sids = sample_ids[batch_start:batch_end]
+        batch_num = batch_start // batch_size + 1
         # Stage A: one bcftools subprocess per chrom decodes the
         # whole batch's columns at once. Records live on the parent
         # heap and are inherited via copy-on-write fork into each
         # worker that needs them.
+        memprofile_mark(
+            f"batch {batch_num} stage A start "
+            f"(B={len(batch_sids)})")
         batch_backgrounds = derive_persons_batch(
             cohort_bcf_paths, batch_sids)
         _PERSON_WORKER_STATE["batch_backgrounds"] = batch_backgrounds
+        memprofile_mark(
+            f"batch {batch_num} stage A extracted")
         # Stage B: workers consume per-person records and write per-
         # person VCFs. A fresh pool per batch is needed so each
         # batch's children fork-inherit the right
         # ``batch_backgrounds`` snapshot — fork is millisecond-cheap,
         # and the alternative (one long-lived pool + per-task pickle
         # of the records) would dominate runtime at these list sizes.
+        # The trace gets a checkpoint right after the pool spawns
+        # (where COW-inherited fork attribution shows up as
+        # children_rss_mb) so peak memory at the worker fork-out
+        # is the easiest spot to read off the next TSV.
         if use_pool:
             with ProcessPoolExecutor(max_workers=fanout_workers,
                                      mp_context=ctx) as ex:
@@ -1071,6 +1089,8 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
                                   person_seeds[i]))
                     for i in batch_indices
                 ]
+                memprofile_mark(
+                    f"batch {batch_num} stage B pool spawned")
                 for done_count, (i, fut) in enumerate(
                         futures, start=batch_start + 1):
                     results[i] = fut.result()
@@ -1080,6 +1100,7 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
                 results[i] = _person_worker(
                     i, sample_ids[i], person_seeds[i])
                 _maybe_log_progress(i + 1)
+        memprofile_mark(f"batch {batch_num} done")
         # Drop the parent's reference so the next batch's allocations
         # don't pile on top of the previous one.
         _PERSON_WORKER_STATE["batch_backgrounds"] = None
