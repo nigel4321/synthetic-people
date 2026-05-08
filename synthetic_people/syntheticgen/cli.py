@@ -196,6 +196,28 @@ def _person_worker(i: int, sid: str, seed: int) -> tuple:
     return person_entry, person_stats, len(person_svs)
 
 
+def _format_duration(seconds: float) -> str:
+    """Render a duration in ``Hh Mm Ss`` / ``Mm Ss`` / ``Ss`` form.
+
+    Used by progress logs so multi-hour ETAs read at a glance — a
+    raw ``eta 27970s`` is harder to skim than ``eta 7h 46m 10s``.
+    Returns ``"?"`` for ``inf`` (the rate-is-zero case) so callers
+    can drop their own infinity-guard branches.
+    """
+    if seconds == float("inf") or seconds != seconds:  # inf or NaN
+        return "?"
+    total = int(round(seconds))
+    if total < 0:
+        total = 0
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
 def _format_person_log(entry: dict, n_total: int) -> str:
     """Format the one-line progress log emitted per person."""
     hi = entry["highlighted"]
@@ -852,10 +874,10 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
             remaining = len(chromosomes) - done
             rate_chr = done / elapsed if elapsed > 0 else 0.0
             eta = (remaining / rate_chr) if rate_chr > 0 else float("inf")
-            eta_str = f"{eta:.0f}s" if eta < float("inf") else "?"
             print(
                 f"  cohort BCFs: {done}/{len(chromosomes)} chromosomes "
-                f"written (elapsed {elapsed:.0f}s, eta {eta_str})",
+                f"written (elapsed {_format_duration(elapsed)}, "
+                f"eta {_format_duration(eta)})",
                 file=sys.stderr,
             )
             last_progress_log = now
@@ -1020,10 +1042,10 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
         rate = done / elapsed if elapsed > 0 else 0.0
         remaining = args.n - done
         eta = remaining / rate if rate > 0 else float("inf")
-        eta_str = f"{eta:.0f}s" if eta < float("inf") else "?"
         print(
             f"  person VCFs: {done:,}/{args.n:,} written "
-            f"({rate:.1f}/s, elapsed {elapsed:.0f}s, eta {eta_str})",
+            f"({rate:.1f}/s, elapsed {_format_duration(elapsed)}, "
+            f"eta {_format_duration(eta)})",
             file=sys.stderr,
         )
         last_progress_log = now
@@ -1651,10 +1673,10 @@ def main(argv: list[str] | None = None) -> int:
         rate = done / elapsed if elapsed > 0 else 0.0
         remaining = args.n - done
         eta = remaining / rate if rate > 0 else float("inf")
-        eta_str = f"{eta:.0f}s" if eta < float("inf") else "?"
         print(
             f"  person VCFs: {done:,}/{args.n:,} written "
-            f"({rate:.1f}/s, elapsed {elapsed:.0f}s, eta {eta_str})",
+            f"({rate:.1f}/s, elapsed {_format_duration(elapsed)}, "
+            f"eta {_format_duration(eta)})",
             file=sys.stderr,
         )
         last_progress_log = now
