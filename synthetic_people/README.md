@@ -278,11 +278,16 @@ Legacy-only flags (`--background-glob`, `--n-background`, `--af-min`,
 
 ### Performance / parallelism
 
-- `--workers N` — fan out per-chromosome simulations and per-person
-  VCF writes across `N` worker processes. `0` (default) means auto
+- `--workers N` — parallelise the cohort BCF write (sample-slice
+  parallelism, post-Phase-5e) and the per-person VCF fan-out across
+  `N` worker processes. `0` (default) means auto
   (`os.cpu_count()`); `1` means serial. Linux only — non-Linux hosts
   silently fall back to serial because the parallel path uses
-  `fork`-based multiprocessing. See TUTORIAL.md §9.1 for details.
+  `fork`-based multiprocessing. **msprime simulation itself runs
+  serially across chromosomes** regardless of `--workers` — the
+  pre-Phase-5e parallel-chromosome path multiplied tree-sequence
+  RAM by the worker count and is no longer used. See TUTORIAL.md
+  §9.1 for details.
 - The writer streams records straight into `bgzip -c` (no plain `.vcf`
   intermediate), so per-person disk I/O is one pass instead of two.
 - The overlay loaders (ClinVar, dbSNP, COSMIC) are bcftools-driven and
@@ -904,7 +909,7 @@ Tracked in `IMPLEMENTATION_PLAN.md`:
 | `--n-background` | [legacy] Shared background site count | `500` |
 | `--af-min` | [legacy] Minimum AF when loading the pool | `0.05` |
 | `--sfs-alpha` | [legacy] Power-law exponent for the SFS | `2.0` |
-| `--workers` | [perf] Worker processes for the per-chromosome pool and the per-person pool. `0` = auto (`os.cpu_count()`, possibly auto-derated when chunk size would otherwise drop below ~2 Mb to fit), `1` = serial. Linux only. | `0` |
+| `--workers` | [perf] Worker processes for the parallel cohort BCF write (sample-slice, post-5e) and the per-person fan-out. `0` = auto (`os.cpu_count()`), `1` = serial. msprime simulation itself is single-threaded and runs serially across chromosomes regardless of `--workers`. Linux only. | `0` |
 | `--mode` | [perf] Output shape: `per-person` (default), `cohort` (skip per-person fan-out), or `both`. All three flow through the streamed cohort pipeline — derive per-person VCFs later via `bcftools view -s` against the per-chrom cohort BCFs. | `per-person` |
 | `--no-resume` | [perf] Ignore any existing `cohort.meta.json` + cohort BCFs and start a fresh simulation. Default behaviour resumes a prior run when its params match. | `False` |
 | `--chr-chunk-mb` | [perf] Split each chromosome's msprime simulation into independent sub-chunks of this size (Mb). `0` = auto-pick from `psutil.virtual_memory().available` and `--workers`. Cross-chunk LD is lost (chunks simulate independently); short-range LD within chunks is preserved. | `0` (auto) |

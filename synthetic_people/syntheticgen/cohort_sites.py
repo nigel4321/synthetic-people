@@ -96,6 +96,40 @@ def dense_gts_from_carriers(carriers, n_people: int) -> list:
     return [f"{p[0]}|{p[1]}" for p in pairs]
 
 
+def dense_gts_from_carriers_slice(carriers,
+                                  slice_lo: int,
+                                  slice_hi: int) -> list:
+    """Expand sparse carriers to dense GT strings for a sample slice
+    only — persons in ``[slice_lo, slice_hi)``.
+
+    Phase 5e Phase A: workers in the parallel cohort BCF write each
+    handle a contiguous sample slice. Per-site they need to format
+    only their slice's GT block, not the whole cohort. This is the
+    slice-aware sibling of :func:`dense_gts_from_carriers`.
+
+    Returns a list of length ``slice_hi - slice_lo``. Carriers with
+    haplotype indices outside the slice are skipped — single pass,
+    ``O(carriers + slice_size)``.
+
+    Slice bounds are bounded-half-open in *person* index space, not
+    haplotype index space (mirrors how ``sample_ids[lo:hi]`` slices
+    in the caller). The corresponding haplotype range is
+    ``[2 * slice_lo, 2 * slice_hi)``.
+    """
+    if slice_hi <= slice_lo:
+        return []
+    n = slice_hi - slice_lo
+    pairs = [[0, 0] for _ in range(n)]
+    hap_lo = 2 * slice_lo
+    hap_hi = 2 * slice_hi
+    for hap_idx, allele_idx in carriers:
+        if hap_lo <= hap_idx < hap_hi:
+            local = hap_idx - hap_lo
+            person_idx, pair_idx = divmod(local, 2)
+            pairs[person_idx][pair_idx] = allele_idx
+    return [f"{p[0]}|{p[1]}" for p in pairs]
+
+
 def gt_for_person(carriers, person_idx: int) -> str:
     """Return the GT string for one person without expanding the rest.
 

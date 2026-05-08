@@ -63,21 +63,49 @@ actual humans.
 
 ## Pipeline
 
+The pipeline runs in two phases connected by a disk-backed
+per-chromosome cohort BCF. The cohort phase simulates one
+chromosome at a time and writes its cohort BCF; the per-person
+fanout then derives individual VCFs by querying the cohort BCFs
+in sample-batches. `--workers` parallelises the cohort BCF *write*
+(sample-slice partials merged via `bcftools merge`) and the
+per-person fan-out, but not the msprime simulation itself —
+msprime is single-threaded internally and stays serial in the
+parent process.
+
 ```mermaid
-flowchart LR
-    A[stdpopsim + msprime<br/>demographic model] --> B[Cohort sites<br/>LD + SFS correct]
-    B --> C[ClinVar inject<br/>CLNSIG / CLNDN]
-    B --> D[dbSNP rsID inject]
-    B --> E[COSMIC overlay<br/>--somatic]
-    C --> F[Per-person SVs<br/>DEL / DUP / INV]
-    D --> F
-    E --> F
-    F --> G[Sequencing noise<br/>GT flips + dropouts]
-    G --> H[person_NNNN.vcf.gz<br/>+ .tbi]
-    G --> I[golden.bed + noise.bed<br/>truth tracks]
-    H --> J[validate_batch.py<br/>LD / AF / Ti/Tv / PCA]
-    I --> J
+flowchart TD
+    subgraph cohort_phase["Cohort phase — per chromosome, serial sim"]
+      A[stdpopsim + msprime<br/>demographic model] --> B[Tree sequence]
+      B --> C[Cohort sites<br/>sparse carriers · LD + SFS correct]
+      C --> D[Apply overlays<br/>ClinVar CLNSIG/CLNDN<br/>dbSNP rsIDs<br/>COSMIC --somatic]
+      D --> E[Sample-slice parallel write<br/>--workers W → bcftools merge]
+      E --> F[(cohort/cohort.chr&lt;N&gt;.bcf<br/>+ .csi index)]
+    end
+
+    subgraph fanout_phase["Per-person fanout — parallel batches"]
+      F --> G[Batched bcftools query<br/>--fanout-batch-size B]
+      G --> H[Per-person background records]
+      H --> I[+ highlighted ClinVar variant<br/>+ per-person SVs<br/>DEL / DUP / INV]
+      I --> J[Sequencing noise<br/>DP / AD / GQ draw<br/>+ GT flips + dropouts]
+      J --> K[person_NNNN.vcf.gz<br/>+ .tbi]
+      J --> L[golden.bed + noise.bed<br/>per-call truth tracks]
+    end
+
+    K --> M[validate_batch.py<br/>LD / AF / Ti/Tv / PCA]
+    L --> M
 ```
+
+Determinism survives the phase split: the master `--seed` produces
+byte-identical cohort BCFs and per-person VCFs at any `--workers`
+or `--fanout-batch-size` value. Resume is checkpointed at the
+chromosome boundary in `cohort/cohort.meta.json` — interrupted
+cohort runs skip already-completed chromosomes on restart.
+
+`--mode cohort` stops after writing the cohort BCFs (no fanout
+phase). `--mode per-person` (default) runs both phases.
+`--mode both` runs both and keeps the cohort BCFs as a deliverable
+alongside the per-person VCFs.
 
 Each stage is independently togglable via CLI flags — see the full
 flag table in [`synthetic_people/README.md`](synthetic_people/README.md#cli-reference).
