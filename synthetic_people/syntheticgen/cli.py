@@ -71,7 +71,7 @@ from .sv import (
     DEFAULT_SVS_PER_PERSON,
     generate_person_svs,
 )
-from .bcf_writer import CohortBcfWriter
+from .bcf_writer import CohortBcfWriter, write_cohort_bcf_parallel
 from .cohort_derivation import derive_person_records, derive_persons_batch
 from .memprofile import mark as memprofile_mark
 from .resume import ResumeMismatch, load_or_create_meta
@@ -544,14 +544,19 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                         "disk and the `art_illumina` binary on PATH; "
                         "wired in M11 alongside the GRCh38 reference.")
     p.add_argument("--workers", type=int, default=0,
-                   help="[perf] Worker processes for per-chromosome "
-                        "msprime simulations and per-person VCF writes. "
-                        "0 = auto (os.cpu_count()), 1 = serial. Linux "
-                        "only — non-Linux hosts fall back to serial. "
-                        "Output is deterministic for a given --seed "
-                        "regardless of --workers, but differs from a "
-                        "pre-Phase-1 run at the same seed because the "
-                        "rng consumption pattern changed.")
+                   help="[perf] Worker processes for parallel cohort "
+                        "BCF writes (sample-slice, post-Phase-5e) and "
+                        "per-person VCF writes. 0 = auto "
+                        "(os.cpu_count()), 1 = serial. Linux only — "
+                        "non-Linux hosts fall back to serial. "
+                        "Note: msprime simulation itself is single-"
+                        "threaded and runs serially across "
+                        "chromosomes regardless of --workers — "
+                        "increasing --workers parallelises only the "
+                        "cohort BCF write and the per-person fan-out, "
+                        "not the simulation. Output is deterministic "
+                        "for a given --seed across any --workers "
+                        "value.")
     p.add_argument("--fanout-batch-size", type=int, default=4,
                    help="[perf] On the streamed coalescent path, group "
                         "this many sample IDs into one bcftools query "
@@ -853,8 +858,17 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
         # may have re-sorted but injection helpers do that too — be
         # defensive).
         sites.sort(key=lambda s: s["pos"])
-        with CohortBcfWriter(chrom_bcf, args.build, sample_ids) as bw:
-            bw.write_sites(sites)
+        # Phase 5e Phase A: parallelise the cohort BCF write across
+        # ``workers`` sample-slice writers. At workers <= 1 this
+        # collapses to the original serial CohortBcfWriter path.
+        # Cohort simulation itself is now serial across chromosomes
+        # (the parallel-chromosome ProcessPoolExecutor path was
+        # removed in this phase), so ``workers`` here controls
+        # within-chromosome parallelism only.
+        write_cohort_bcf_parallel(
+            chrom_bcf, args.build, sample_ids, sites,
+            workers=workers,
+        )
         # Record the BCF in the path list and persist completion to
         # the resume record. From this point a re-run with the same
         # params will skip this chromosome.

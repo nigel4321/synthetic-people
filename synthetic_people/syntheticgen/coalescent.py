@@ -15,10 +15,8 @@ sampler returns (`chrom`, `pos`, `id`, `ref`, `alts`, `afs`, `acs`,
 
 from __future__ import annotations
 
-import multiprocessing as mp
 import random
 import sys
-from concurrent.futures import ProcessPoolExecutor
 
 from .builds import BUILDS
 from .titv import DEFAULT_TARGET_TITV, choose_alt
@@ -505,80 +503,48 @@ def simulate_cohort_iter(chromosomes: list, build: str, n_people: int,
     a thin wrapper for callers (admixture, tests) that need everything
     materialised.
 
-    Determinism: per-chromosome seeds are pre-derived from ``rng``
-    *before* spawning workers, identical to :func:`simulate_cohort`,
-    so the same ``--seed`` yields the same per-chrom site list whether
-    the caller iterates lazily or collects upfront.
+    Phase 5e Phase A: simulation is now serial across chromosomes,
+    regardless of ``workers``. The pre-5e parallel-chromosome path
+    multiplied msprime tree-sequence RAM by the worker count and
+    OOM-killed workstation-class hosts at ``n=3000+``; that's the
+    failure mode 5e was scoped to fix. The cohort BCF write is what
+    parallelises now (in the caller via
+    :func:`bcf_writer.write_cohort_bcf_parallel`), not the simulation.
+    The ``workers`` argument is kept on the signature for API
+    compatibility but is no longer consulted by this generator.
 
-    With ``workers > 1`` and more than one chromosome, msprime runs
-    each chromosome in its own fork-pool worker. Yields are emitted in
-    submission order (not completion order) so a downstream BCF writer
-    sees chromosomes in the requested order.
+    Determinism: per-chromosome seeds are still pre-derived from
+    ``rng`` upfront, identical to :func:`simulate_cohort`, so the
+    same ``--seed`` yields the same per-chrom site list across runs.
+    Output is byte-identical for any ``workers`` value because the
+    simulation path no longer branches on it.
     """
+    del workers  # signature kept for API stability — see docstring
     seeds = [rng.randint(1, 2**31 - 1) for _ in chromosomes]
 
-    use_pool = workers > 1 and len(chromosomes) > 1
-    if not use_pool:
-        for chrom, seed in zip(chromosomes, seeds):
-            if verbose:
-                print(f"  simulating chrom {chrom} (length {length_mb} "
-                      f"Mb, model={demo_model or 'uniform'})...",
-                      file=sys.stderr)
-            sites = _simulate_chromosome_from_seed(
-                chrom, build, n_people, length_mb, demo_model,
-                population, rec_rate, mu, seed, titv_target,
-                chunk_size_mb,
-            )
-            if verbose:
-                print(f"    {len(sites)} variable sites on chrom "
-                      f"{chrom}", file=sys.stderr)
-            yield chrom, sites
-            # Drop the generator-local binding so that, once the
-            # consumer's own ``del sites`` runs, the per-chrom site
-            # list (multi-GB at n≈3000 because the sparse-carriers
-            # representation has heavy Python tuple overhead) is
-            # actually collected before the next chromosome's
-            # simulation starts. Otherwise the generator frame keeps
-            # the previous chrom's list alive across the yield, and
-            # peak working set is two chromosomes wide.
-            sites = None
-        return
-
-    if verbose:
-        print(f"  simulating {len(chromosomes)} chromosomes "
-              f"(length {length_mb} Mb, "
-              f"model={demo_model or 'uniform'}) "
-              f"in parallel with {workers} workers...",
-              file=sys.stderr)
-
-    # fork shares the parent's already-loaded msprime/stdpopsim modules
-    # via copy-on-write — much faster startup than spawn, which would
-    # re-import them per worker.
-    ctx = mp.get_context("fork")
-    with ProcessPoolExecutor(max_workers=workers, mp_context=ctx) as ex:
-        futures = [
-            (chrom, ex.submit(
-                _simulate_chromosome_from_seed,
-                chrom, build, n_people, length_mb, demo_model,
-                population, rec_rate, mu, seed, titv_target,
-                chunk_size_mb,
-            ))
-            for chrom, seed in zip(chromosomes, seeds)
-        ]
-        for i, (chrom, fut) in enumerate(futures):
-            sites = fut.result()
-            if verbose:
-                print(f"    {len(sites)} variable sites on chrom "
-                      f"{chrom}", file=sys.stderr)
-            yield chrom, sites
-            # Same generator-binding release as the no-pool branch.
-            # Also clear the slot in ``futures`` — each future's
-            # internal ``_result`` still references the same list,
-            # and the tuple in ``futures`` would otherwise pin it
-            # for the rest of the loop.
-            sites = None
-            fut = None
-            futures[i] = (chrom, None)
+    for chrom, seed in zip(chromosomes, seeds):
+        if verbose:
+            print(f"  simulating chrom {chrom} (length {length_mb} "
+                  f"Mb, model={demo_model or 'uniform'})...",
+                  file=sys.stderr)
+        sites = _simulate_chromosome_from_seed(
+            chrom, build, n_people, length_mb, demo_model,
+            population, rec_rate, mu, seed, titv_target,
+            chunk_size_mb,
+        )
+        if verbose:
+            print(f"    {len(sites)} variable sites on chrom "
+                  f"{chrom}", file=sys.stderr)
+        yield chrom, sites
+        # Drop the generator-local binding so that, once the
+        # consumer's own ``del sites`` runs, the per-chrom site
+        # list (multi-GB at n≈3000 because the sparse-carriers
+        # representation has heavy Python tuple overhead) is
+        # actually collected before the next chromosome's
+        # simulation starts. Otherwise the generator frame keeps
+        # the previous chrom's list alive across the yield, and
+        # peak working set is two chromosomes wide.
+        sites = None
 
 
 def simulate_cohort(chromosomes: list, build: str, n_people: int,

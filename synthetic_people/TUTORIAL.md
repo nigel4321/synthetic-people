@@ -706,16 +706,28 @@ Scaling rules of thumb:
 - Validation (`validate_batch.py`) builds a full dosage matrix in RAM;
   drop `--ld-pairs-per-bin` to 1000 if you're tight.
 
-### 9.1 Worker processes (Phase 1)
+### 9.1 Worker processes (Phase 1, updated by Phase 5e)
 
-Multi-chromosome simulations and per-person VCF writes run in parallel
+The cohort BCF write and the per-person VCF fan-out run in parallel
 process pools on Linux. Control the fan-out with `--workers`:
 
 | `--workers` | Behaviour |
 |---|---|
 | `0` (default) | Auto = `os.cpu_count()`. |
 | `1` | Serial. Useful for profiling and for environments where parallelism is unwanted. |
-| `N > 1` | Up to `N` worker processes for the per-chromosome pool *and* the per-person pool. |
+| `N > 1` | Up to `N` worker processes parallelising (a) the per-chromosome cohort BCF write across sample slices and (b) the per-person VCF fan-out across persons. |
+
+> **Phase 5e change (2026-05):** `--workers` no longer parallelises
+> msprime simulation itself. The pre-5e behaviour ("one msprime
+> worker per chromosome") multiplied tree-sequence RAM by the worker
+> count and OOM-killed workstation-class hosts at `n=3000+`. After
+> 5e, simulation runs serially across chromosomes in the parent
+> process — only the cohort BCF write step (per chromosome,
+> sample-slice parallel) and the per-person fan-out are scaled by
+> `--workers`. The per-chrom cohort wall time goes from ~1270 s
+> (serial) to ~450 s with `--workers 8` on a 32 GB host at n=3000;
+> the simulation phase (~308 s/chrom) remains serial as the
+> wall-time floor.
 
 ```bash
 # Force serial for an apples-to-apples profiling baseline.
