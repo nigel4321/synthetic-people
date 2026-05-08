@@ -51,7 +51,14 @@ The phases compose, not compete:
 | 2 ✓ | Overlap I/O loaders with simulation | Faster, not larger | None |
 | 3 (partial) | Dense numpy genotype matrix | `n ≈ 5 000` | New in-RAM shape |
 | 4 | Hot-path cleanups | Faster | None |
-| **5** | **Disk-backed cohort BCF** | **`n = 100k+`** | **+disk I/O at phase boundaries** |
+| **5a/b/c ✓** | **Disk-backed cohort BCF + sparse carriers + streamed run** | **`n = 100k+`** | **+disk I/O at phase boundaries** |
+| **5f ✓** | **Chunked simulation within a chromosome** | Fits 16 GB hosts | Chunk-boundary LD |
+| **5e** Phase A | Sample-slice parallel BCF write | Cohort phase ~2.7× faster | Removes parallel-chromosome path |
+| **5e** Phase B | Workers walk tree directly (deferred) | Extraction parallelism | Larger refactor |
+| **5f'** | Constant-term chunk-RAM calibration (open) | Auto-derate sees per-worker constant cost | None — bug fix |
+| **5g.1/.2 ✓** | **Batched per-person fanout extraction** | Fanout ~10× fewer bcftools invocations | None — drop-in |
+| **5g.3** | Disk-spilled fanout batch handoff (planned) | Decouples B from W RAM ceiling | +staging disk |
+| **5d** | Direct binary BCF via pysam (deferred) | `n = 1M+` | New compiled dep |
 | **6** | **SQLite for side-state (truth / ancestry / manifest)** | Filesystem at 100k | +schema |
 
 Phase 3's `gts: list[str]` baseline measurement is recorded and still
@@ -871,16 +878,101 @@ changes: a heavier-than-OOA model would push the constant up;
 extreme-cohort runs (n>10k) might need their own coefficient if
 the lineage-tracking overhead scales super-linearly with n.
 
+### Phase 5f' — calibration update: add a constant term to the chunk RAM model
+
+**Status (2026-05-08):** open. Diagnosed empirically from a user
+``--workers 5`` run that OOM'd during the cohort phase on a 32 GB
+host (memprof24.tsv): per-worker peak ~5.6 GB even at the
+auto-picked ~1.7 Mb chunk size, indicating a per-worker
+*constant* cost (~3.6 GB at OOA n=3000) that doesn't shrink with
+chunk size. The current `estimate_chunk_ram_bytes` is purely
+linear (`rate × n × chunk_mb`), so `auto_pick_chunk_size_mb`
+underestimates total cost and `auto_derate_workers` doesn't see
+that 5 workers × 3.6 GB constant = 18 GB before any chunk-linear
+contribution. Result: 5 workers × ~5.6 GB ≈ 28 GB peak → OOM-kill
+within the first 150 s of cohort sim.
+
+The post-mortem above flagged exactly this risk
+("extreme-cohort runs might need their own coefficient if the
+lineage-tracking overhead scales super-linearly"); 5f' is the
+follow-up.
+
+**Workaround until 5f' lands:** the user's manual two-phase
+invocation works — `--workers 1` for the cohort phase, then
+resume + `--workers 8` for the fanout. 5f' just automates this.
+
+**Phase 5e Phase A makes 5f' largely moot for the cohort-write
+path** (because `--workers` no longer multiplies tree-sequence
+RAM there). 5f' still matters for the chunked-simulation path
+within a single chromosome at very high `n` or with heavier
+demographic models, where per-chunk peak can exceed budget even
+serially. So 5f' is lower priority now than it would have been
+pre-5e — but it's the correct fix for the model and worth
+shipping if/when an extreme-`n` user surfaces it again.
+
+**Branch (when implementation starts):**
+`perf/phase5f-prime-constant-term-calibration`
+
+#### Tasks
+
+- [ ] **Add constant-per-sample term to `estimate_chunk_ram_bytes`:**
+
+  ```python
+  CHUNK_RAM_BYTES_BASE_PER_SAMPLE_OOA = 1.2 * 1024 * 1024
+  CHUNK_RAM_BYTES_BASE_PER_SAMPLE_CONSTANT_NE = 200 * 1024
+
+  def estimate_chunk_ram_bytes(n, chunk_mb, demo):
+      if demo is None or str(demo).lower() == "none":
+          base, rate = (CHUNK_RAM_BYTES_BASE_PER_SAMPLE_CONSTANT_NE,
+                        CHUNK_RAM_BYTES_PER_SAMPLE_PER_MB_CONSTANT_NE)
+      else:
+          base, rate = (CHUNK_RAM_BYTES_BASE_PER_SAMPLE_OOA,
+                        CHUNK_RAM_BYTES_PER_SAMPLE_PER_MB_OOA)
+      return int(base * n + rate * n * chunk_mb)
+  ```
+
+  Per-sample constants come from the empirical 3.6 GB / 3000 ≈
+  1.2 MiB ratio at OOA scale; constant-Ne is the ~5× cheaper case
+  the existing rate ratio implies.
+- [ ] **Update `auto_pick_chunk_size_mb`:** the linear-only
+  `factor = per_worker_target / full_estimate` math no longer
+  works once the constant dominates. Solve for chunk_mb where
+  `base + linear × chunk_mb = budget`. If `budget < base`, the
+  return value should signal "this n + this many workers cannot
+  fit at any chunk size" — i.e. `auto_derate_workers` must reduce
+  W before the auto-pick can succeed.
+- [ ] **Update `auto_derate_workers`:** include the constant term
+  in the per-worker cost check. Walk down from requested workers
+  until `base × n + rate × n × floor_chunk_mb ≤ available × target / W`.
+- [ ] **Tests** in `tests/test_chunked_simulation.py`:
+  - At n=3000, OOA, 24 GB available: derate from W=8 → W=1 (or 2,
+    depending on rounding).
+  - At n=500, OOA, 24 GB available: no derate, pick large chunk.
+  - At n=100k, OOA: explicit budget-too-small error message,
+    pointing user at `--workers 1` or a larger host.
+- [ ] **Docs:** post-mortem subsection above gets a "resolved"
+  status update; `--workers` `--help` text mentions auto-derate
+  considers per-sample constant cost.
+
 ---
 
 ## Phase 5e — within-chromosome parallel extraction over a shared tree sequence
 
-**Status:** planned, **gated on Phase 5f landing first**. The user's
-n=3000 × full-chr1 OOM happens *during simulation* of a single
-chromosome — Phase 5e's parallel-extraction model only helps once
-one tree sequence fits in RAM. 5f (chunked simulation) gets each
-tree sequence to fit; 5e then parallelises extraction across that
-smaller tree sequence.
+**Status (2026-05-08):** Phase 5f has landed (PRs #19, #21, #23). 5e
+is unblocked. **Scope decided**: split into Phase A (sample-slice
+BCF write only — small structural change, captures most of the
+practical wall-time win) and Phase B (workers walk the tree
+sequence directly — bigger refactor, deferred). Phase A is the
+work to start with; Phase B is opportunistic follow-up if msprime
+sim parallelism turns out to be worth the complexity. **Branch in
+flight (Phase A):** TBD when implementation starts.
+
+The motivating bug — the user's n=3000 × full-chr1 OOM during
+simulation of a single chromosome — was already addressed by 5f
+(chunked simulation). 5e's parallel-extraction model is the next
+step: *now* one tree sequence fits in RAM, parallelising extraction
+across that smaller tree sequence is the structural fix that
+removes the `workers × tree_sequence_size` RAM ceiling.
 
 **Goal:** bound peak RAM at one msprime tree sequence per run
 regardless of `--workers`. After Phase 5c made cohort-sites RAM
@@ -966,62 +1058,188 @@ There's no good way to recover the parallel-chromosome speed
 without paying its RAM cost; that path stays available behind a
 flag if a user has the RAM and wants the wall-time win.
 
-### Tasks (when implementation starts)
+### Phase A — sample-slice BCF write (scoped, ready to ship)
 
-- [ ] **Refactor `coalescent.simulate_cohort_iter`** along the
-  structure above — simulate in parent, fork extractor pool, merge
-  per-worker outputs into the per-chrom BCF.
-- [ ] **`admixture.simulate_cohort` mirror.** The admixture path
-  uses `BinaryMutationModel` and emits per-person ancestry segments
-  alongside cohort sites; local-ancestry tracking interacts with
-  the tree sequence walk, so the refactor is more delicate but
-  follows the same principle.
-- [ ] **Tests.**
-  - Determinism: same seed → same per-chrom BCF byte-for-byte
-    regardless of `--workers`. Sample slices split deterministically;
-    merge order is fixed.
-  - Memory bound: regression test that runs at moderate n and
-    asserts peak RSS scales with one tree sequence (not workers ×
-    tree sequence).
-  - End-to-end: the user's failing command (`--n 3000 --chromosomes
-    1-22 --chr-length-mb 70`) completes on a 32 GB host.
-- [ ] **Re-measure** at the configurations 5c was measured against
-  (`n=500 / 3000 / 10 000`) so the comparison is direct.
-- [ ] **Docs** — README + TUTORIAL: clarify that `--workers` now
-  controls within-chromosome parallelism (sample-slice extraction),
-  not across-chromosome simulation; chromosomes simulate one at a
-  time. Note that hosts with enough RAM for parallel chromosome
-  simulation can opt into the old behaviour via a separate flag
-  if we keep it.
+**Goal:** parallelise the per-chromosome cohort BCF write across W
+workers, each writing a contiguous sample-slice partial BCF. Parent
+process keeps the existing serial flow up to the BCF write; only
+that final write step gets sample-sliced. Approximate diff size:
+300–400 LOC + tests.
+
+**Why this scope (vs. parallelising msprime sim too):** the BCF
+write is the dominant per-chrom cost in measured runs (~962 s /
+~75% of the per-chrom wall vs ~308 s simulation+extraction at
+n=3000 × 70 Mb on a 32 GB host). The write phase is dominated by
+Python text formatting + bgzip/bcftools encode — both parallelise
+cleanly across sample slices with simple fork-COW sharing of the
+parent's sites list. msprime's coalescent + mutation simulation is
+single-threaded internally and would need workers walking the tree
+sequence themselves to parallelise — that's the deeper refactor
+deferred to Phase B.
+
+**Architecture (per chromosome, all serial in parent):**
+
+1. Parent simulates tree sequence (existing 5f code, unchanged).
+2. Parent walks tree → sites list with sparse `carriers` (existing
+   `_tree_sequence_to_sites`, unchanged).
+3. Parent applies overlays + sorts (existing `cli.py` code).
+4. **NEW:** parent forks W workers via fork-COW. Each worker gets
+   a contiguous sample slice `[i × n/W, (i+1) × n/W)`. Sites list
+   is shared read-only via COW, no per-worker copy.
+5. **NEW:** each worker writes its slice's partial cohort BCF using
+   a sample-slice variant of `CohortBcfWriter` (formats only its
+   slice's columns of the per-site sample block).
+6. **NEW:** parent runs `bcftools merge -O b` to combine partials
+   into the final per-chrom cohort BCF, then `bcftools index`.
+7. Parent frees sites list. Loop to next chromosome.
+
+**Removed in this PR:** the `ProcessPoolExecutor` parallel-chromosome
+path in `simulate_cohort_iter` (the path that OOMs the user with
+`--workers 5`). Cohort simulation becomes serial across
+chromosomes; `--workers` controls within-chromosome BCF-write
+parallelism. Users who had enough RAM for parallel-chromosome sim
+get a follow-up `--parallel-chromosomes` opt-in flag (deferred —
+see Resolved decisions below).
+
+**RAM bound after Phase A:**
+
+```
+peak RAM ≈ 1 × tree_sequence_size + 1 × sites_list
+        + W × ~50 MB (per-worker bgzip + temp buffers)
+        + ~1-2 GB process overhead
+```
+
+At `n=3000 × 70 Mb`: ~17 GB tree + 1 GB sites + 0.4 GB workers ≈
+19 GB regardless of `--workers`. Fits 32 GB host comfortably; no
+auto-derate needed.
+
+**Wall-time estimate after Phase A** (n=3000, --workers 8):
+- msprime sim per chrom: ~200 s (serial, unchanged)
+- tree-walk to sites: ~100 s (serial, unchanged)
+- Parallel BCF write: ~960 s ÷ 8 + merge ~30 s ≈ 150 s
+- Per-chrom total: ~450 s vs ~1270 s pre-5e
+- 22 chroms: **~2.7 h vs ~7.4 h pre-5e — ~2.7× speedup**
+
+Not the ~3.5× speedup of 5e Full (which would also parallelise the
+~308 s extraction); Phase B captures that remainder.
+
+#### Phase A tasks
+
+- [ ] **Branch:** `perf/phase5e-sample-slice-bcf-write` off main.
+- [ ] **`bcf_writer.py`:** add a sample-slice mode to
+  `CohortBcfWriter` so a worker can format only its
+  `[lo, hi)` person range's GT block per site. Sparse-carrier
+  helpers in `cohort_sites.py` need a slice-aware sibling
+  (`dense_gts_from_carriers_slice(carriers, slice_lo, slice_hi)`).
+- [ ] **`cli.py`:** replace the existing per-chrom
+  `with CohortBcfWriter(chrom_bcf, ...) as bw: bw.write_sites(...)`
+  block with a new helper that:
+  - Forks W workers (fork mp_context); each gets `(slice_lo,
+    slice_hi)` and writes a partial BCF to `cohort/.partials/
+    cohort.chr<N>.slice<i>.bcf`.
+  - After all partials done, runs `bcftools merge -O b -o
+    cohort/cohort.chr<N>.bcf cohort/.partials/cohort.chr<N>.slice*.bcf`
+    and indexes.
+  - Cleans up the `.partials/` dir for that chrom.
+  - Resume: `cohort.meta.json`'s completed-chromosomes list still
+    drives the skip; partial BCFs only live mid-chromosome and are
+    cleaned on success.
+- [ ] **`coalescent.simulate_cohort_iter`:** drop the
+  `ProcessPoolExecutor` parallel-chromosome path. Keep only the
+  serial path (which already exists for `workers <= 1`). The
+  generator now always yields `(chrom, sites)` serially regardless
+  of `--workers`. Note the 5f auto-pick / auto-derate stays — chunk
+  size and chunked simulation still apply per chromosome.
+- [ ] **Tests** in `tests/test_cohort_parallel_write.py`:
+  - **Determinism:** same `--seed` produces byte-identical
+    `cohort.chr*.bcf` regardless of `--workers ∈ {1, 2, 4, 8}`.
+    Diff via `bcftools view -H` md5 across two runs.
+  - **End-to-end:** small cohort (n=20, chr22, 1 Mb,
+    `--demo-model none`) round-trips through the parallel-write
+    path; per-sample columns match a serial-write reference.
+  - **Memory bound:** regression test asserting peak RSS at
+    moderate `n` doesn't scale with `--workers` (within
+    constant-factor noise). Marked optional / `@unittest.skipIf` on
+    CI runners that don't expose `psutil`.
+  - **Sample-slice helpers:** `dense_gts_from_carriers_slice`
+    matches `dense_gts_from_carriers` on the relevant slice for a
+    range of `slice_lo`/`slice_hi`.
+- [ ] **Docs:** README + TUTORIAL — `--workers` now controls
+  within-chromosome BCF-write parallelism in the cohort phase,
+  not across-chromosome sim. Chromosomes simulate one at a time
+  in the parent process.
+
+#### Phase B — workers walk the tree sequence (deferred)
+
+Saves the parent's ~308 s/chrom serial extraction by having each
+worker iterate `ts.variants(samples=slice)` over the fork-shared
+tree sequence. Adds ~200 LOC + test coverage. Worth attacking only
+if Phase A measurements show extraction is a real bottleneck after
+the BCF write parallelises (currently extraction is ~25% of
+per-chrom cost, so Phase B is ~1.3× headroom — modest).
+
+Open question for Phase B: how does overlay application interact
+when workers walk the tree directly? Either parent walks once for
+the site coordinate metadata (then workers re-walk for GTs — wasted
+work), or workers each apply overlays deterministically with a
+shared seed (more code surface). Phase A sidesteps this entirely
+by keeping parent's sites-list-with-overlays as the source of truth.
+
+#### admixture mirror (separate follow-up)
+
+`admixture.simulate_cohort` uses `BinaryMutationModel` and emits
+per-person ancestry segments alongside cohort sites. Local-ancestry
+tracking interacts with the tree sequence walk in ways the
+non-admixture path doesn't, so the refactor is more delicate.
+Sample-slice writes work cleanly for the cohort BCF side; ancestry
+segments would either stay in the parent (parent emits them after
+the tree walk) or get split per-worker. Separate PR after Phase A
+lands.
 
 ### What this means for `--workers`
 
-After 5e, `--workers` semantics change from "parallel chromosomes"
-to "parallel sample-slice extractors within one chromosome at a
-time". For a fixed `--n`, doubling workers no longer doubles peak
-RAM — it just speeds up the (already-cheap) extraction phase. The
-auto-derate-workers idea that surfaced as a stopgap during the 5c
-discussion falls away because RAM stops scaling with `--workers`.
+After Phase A, `--workers` semantics in the cohort phase change
+from "parallel chromosomes" to "parallel sample-slice writers
+within one chromosome at a time". For a fixed `--n`, doubling
+workers no longer doubles peak RAM — it just speeds up the BCF
+write. The 5f auto-derate-workers heuristic remains useful only
+for pathological `--workers` choices in the chunked-simulation
+path (which still runs in parent); it's a no-op for the cohort
+write path because RAM doesn't scale with `--workers` there.
 
-### Open questions for review
+The fanout phase's `--workers` semantics are unchanged: still one
+worker per person VCF write, batched per `--fanout-batch-size`.
 
-- **Per-worker output format.** Per-worker text-VCF chunks merged
-  via `bcftools concat`, or per-worker pickle of records merged in
-  the parent? Concat is simpler and matches the existing BCF
-  writer; pickle keeps everything in Python and avoids the extra
-  disk write. Lean toward concat for parity with 5b's pipeline.
-- **Sample-slice vs position-slice.** Sample-slice gives equal
-  work per worker assuming roughly uniform allele frequencies;
-  position-slice gives genome-ordered output but unequal work.
-  Recommend sample-slice because msprime's variant iteration is
-  deterministic and equal slices fall out cleanly from the tree
-  sequence's sample list. Sample-slice also fits admixture's
-  per-person ancestry segments naturally (each worker emits its own
-  slice's ancestry).
-- **Keep parallel-chromosome path as opt-in?** Users with 64+ GB
-  hosts and large chromosome counts get the old wall-time win for
-  free today. Consider a `--parallel-chromosomes` flag that retains
-  the pre-5e behaviour for those users; default off.
+### Resolved decisions
+
+(Migrated from "Open questions for review" — answers locked in
+during the 2026-05-08 design review.)
+
+1. **Per-worker output format: per-slice partial BCF + `bcftools
+   merge`.** Each worker writes its slice through the existing
+   `CohortBcfWriter` (a thin sample-slice variant), so the
+   subprocess pipeline is parity-identical with the current writer.
+   Parent then runs `bcftools merge -O b` to join partials by
+   `(chrom, pos, ref, alt)` key — every partial has the same site
+   set in the same order, so merge collapses to a sample-column
+   join. Pickle-and-rejoin-in-Python was rejected because it
+   doesn't avoid disk I/O at this scale (the BCF still has to be
+   written) and forces a custom binary format.
+2. **Sample-slice (not position-slice).** Equal work per worker,
+   deterministic split, falls out cleanly from `sample_ids[lo:hi]`.
+   Position-slice would force per-worker variable workload (allele
+   frequency varies with chromosome region) and wouldn't help the
+   admixture follow-up.
+3. **Parallel-chromosome opt-in flag deferred.** A
+   `--parallel-chromosomes` flag (the pre-5e behaviour as a
+   user-opt-in for 64+ GB hosts) was discussed but ruled out for
+   Phase A. If a user explicitly asks for it later, add it as a
+   small follow-up; it's a feature, not a regression to fix.
+4. **`bcftools merge` (not `bcftools concat`).** The plan's earlier
+   text loosely said "`bcftools concat` or comparable join" —
+   that was wrong: concat is for region-disjoint VCFs (different
+   genomic ranges per file), merge is for sample-disjoint VCFs
+   (different sample columns per file). Sample-slice is the latter.
 
 ### Relationship to Phase 5d
 
@@ -1030,6 +1248,156 @@ the *writer* throughput at n=1M+. 5e addresses the *simulation*
 RAM at n=3000+. Both real follow-ups; 5e is more urgent because
 it unblocks workstation-class users *now*, whereas 5d only matters
 for cluster-class n.
+
+---
+
+## Phase 5g — batched per-person fanout
+
+**Status (2026-05-08):** Phase 5g.1 + 5g.2 shipped (PRs #24, #25);
+Phase 5g.3 (disk-spilled batch handoff) is the open follow-up.
+
+**The bottleneck this addresses:** after Phase 5b made the cohort
+BCF the canonical disk-backed handoff to per-person derivation,
+the per-person fan-out itself became the dominant phase at
+n=3000+. The original `derive_person_records` spawned
+`bcftools view -s SID | bcftools view -e 'GT="ref"'` *once per
+(person, chrom) pair* — at n=3000 × 22 chroms that was 66,000
+bcftools subprocesses, each scanning a few hundred MB of
+multi-sample BCF to keep one of 3,000 sample columns. Measured
+wall: ~45 s/person with `--workers 1`, projecting to ~38 hours
+fan-out for n=3000.
+
+The plan didn't anticipate this — Phase 5b modelled per-person
+derivation as a free disk read. The reality is that at high `n`
+the multi-sample-BCF decode is the dominant cost on the
+extraction side and the per-person VCF formatting is the
+dominant cost on the write side.
+
+### Phase 5g.1 — batched extraction (shipped, PR #24)
+
+`derive_persons_batch(cohort_bcf_paths, sample_ids)` runs **one**
+`bcftools query -s s1,...,sB -f '...[\t%GT]\n'` per chromosome
+that emits all batch members' GT columns in a single decode pass;
+the parser dispatches each row's GTs into per-person record lists
+in the parent. The `_run_cohort_streamed` fan-out groups sample
+IDs into batches and pipelines:
+
+1. Parent calls `derive_persons_batch` — one bcftools subprocess
+   per chrom for the batch's B sample IDs.
+2. Parent stages `{sid: records}` in `_PERSON_WORKER_STATE`.
+3. Parent forks a fresh `ProcessPoolExecutor`. Workers fork-inherit
+   the records via copy-on-write.
+4. Workers consume their `sid`'s records and write per-person
+   VCFs.
+5. Pool exits, parent drops the batch's references, next batch
+   starts.
+
+Bcftools subprocess count: 66,000 → `(n / B) × n_chroms` (66k →
+1,320 at B=50, 16,500 at B=4).
+
+### Phase 5g.2 — safer default + memprofile marks (shipped, PR #25)
+
+The PR-24 default of B=50 OOM'd a worker on a 32 GB host with
+`--workers 8`: parent extracts 14 GB of records (per-person ~280
+MB at n=3000), 8 workers fork from a 14-GB-RSS parent, kernel's
+per-process OOM scoring counts COW pages as resident in each
+worker, total apparent RSS hits 8 × 14 = 114 GB → reap.
+
+The binding ceiling is `(parent_baseline + B × per_person) ×
+workers`, not `B × per_person`. PR #25 dropped the default to
+B=4 and added per-batch memprofile marks
+(`batch N stage A start / extracted / pool spawned / done`) so
+the next trace pinpoints per-stage peak with no guesswork.
+
+### Phase 5g.3 — disk-spilled batch handoff (planned)
+
+**Goal:** decouple parent's RSS at fork time from the batch size.
+After 5g.3, B and W can both be large simultaneously without
+multiplying apparent RSS.
+
+**Branch (when implementation starts):**
+`perf/phase5g-disk-spill-fanout`
+
+**Architecture:**
+
+1. Stage A (parent): `derive_persons_batch_to_disk` writes per-
+   person records to per-person tempfiles in
+   `out/.fanout-staging/person_<i>.tsv` (one row per record,
+   tab-separated CHROM/POS/ID/REF/ALT/INFO/GT). Parent RSS stays
+   at baseline because records are streamed straight to disk, not
+   buffered in a Python dict.
+2. Stage B: parent forks workers from a thin parent (~600 MB
+   baseline). Each worker reads its assigned tempfile, parses
+   records into the dict shape `write_person_vcf` expects, runs
+   the existing per-person VCF write.
+3. Worker deletes its tempfile on success (truth-bed and per-
+   person VCF are the canonical outputs; staging is intermediate).
+
+**RAM bound after 5g.3:**
+
+```
+peak parent RSS ≈ ~600 MB (baseline only, no batch records held)
+peak per-worker RSS ≈ ~600 MB (parent shared) + ~280 MB private records
+peak system RSS  ≈ baseline + W × ~280 MB
+```
+
+For `n=3000` × `W=8`: ~2.8 GB instead of the current 14 GB at B=4.
+Headroom for `B=50+` × `W=8` simultaneously.
+
+**Disk cost:** ~280 MB × n_records-per-person × n_persons. At
+n=3000 that's ~840 MB total staging at any one time (one batch
+spilled at a time); at n=100k it's ~28 GB peak staging. Cleanup
+is per-person on success; staging dir gets `rm -rf`'d at the end
+of the fan-out. Acceptable on cloud instances; surface a clear
+disk-space requirement note in `--help`.
+
+**Wall-time impact:** the per-person VCF write itself (~70 s/
+person, dominated by `draw_site_quality` Python RNG calls) is
+unchanged. 5g.3 just removes the `B × W` ceiling so workers stay
+fully busy. With `B=50, W=8`: fanout for n=3000 should drop to
+~1 hour (vs ~8 h at B=7,W=8 currently, vs ~16 h at B=4,W=8).
+
+**Out of scope for 5g.3 — the deeper win waiting after this:**
+numpy-vectorise `draw_site_quality` (replace the per-record
+Knuth-poisson Python loop with `np.random.poisson(lam, n)` etc.).
+~5–7× speedup on the per-person VCF write; brings fanout from
+~1 h to ~10–15 minutes at n=3000 × W=8. **Trade-off: breaks bit-
+exact reproducibility** because numpy's RNG stream differs from
+Python's `random.Random`. Same statistical properties, different
+output bytes. Worth it for wall-clock-sensitive workflows; not if
+downstream tooling pins golden-hash equality. Tracked here as a
+candidate future PR rather than a confirmed task — needs a
+product call from the user first.
+
+#### Phase 5g.3 tasks
+
+- [ ] **`cohort_derivation.py`:** add
+  `derive_persons_batch_to_disk(cohort_bcf_paths, sample_ids,
+  staging_dir)` mirroring `derive_persons_batch` but writing each
+  parsed record line to `staging_dir/person_<sid>.tsv` instead of
+  appending to an in-memory list. Return the dict
+  `{sid: tsv_path}` for workers.
+- [ ] **`cli.py`:** swap the in-memory `batch_backgrounds` dict
+  for `batch_staging_paths`. Worker reads its tempfile + parses
+  records back to dicts. Tempfile gets deleted on worker success.
+  Staging-dir cleanup at fan-out end.
+- [ ] **`--fanout-batch-size` default revisit:** with the
+  parent-RSS ceiling gone, default can rise. 50 was the PR-24
+  pre-OOM target; pick a default that balances bcftools
+  invocation count (smaller batches = more) vs disk staging
+  footprint (smaller batches = less peak staging). Tentative
+  default: 50 once the disk-spill is in place.
+- [ ] **Tests** in `tests/test_cohort_derivation.py`:
+  - `derive_persons_batch_to_disk` parity with the in-memory
+    `derive_persons_batch` — same per-person records, just on
+    disk.
+  - Tempfile cleanup on worker success and on worker failure
+    (failure mode shouldn't leave stale staging).
+  - Disk-space check that the staging dir size scales as
+    `O(B × per_person)` not `O(n × per_person)`.
+- [ ] **Docs:** README + TUTORIAL notes on staging-dir disk
+  requirement; troubleshooting section for "fanout phase running
+  out of disk".
 
 ---
 
