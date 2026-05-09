@@ -1185,6 +1185,19 @@ work), or workers each apply overlays deterministically with a
 shared seed (more code surface). Phase A sidesteps this entirely
 by keeping parent's sites-list-with-overlays as the source of truth.
 
+**Additional motivation surfaced by memprof25 (2026-05-09):** at
+`n=3000 × 70 Mb`, parent's per-chrom plateau before fork is ~17 GB.
+Under Phase A's fork-COW design, eight workers each report ~17 GB
+*apparent* RSS — almost all of it shared, never written, so
+physical RSS stays ~17 GB. But the kernel's per-process OOM scoring
+counts COW pages as resident, and external monitoring / cgroup
+limits often do too. Phase B starts each worker with a small RSS
+(its slice's tree-walk state, not the parent's full sites list), so
+the apparent-RSS number tracks physical RSS. This becomes
+operationally important for users running on cgroup-bounded hosts
+or with OOM-scoring tooling that reads `/proc/<pid>/status` RSS
+fields directly.
+
 #### admixture mirror (separate follow-up)
 
 `admixture.simulate_cohort` uses `BinaryMutationModel` and emits
@@ -1309,6 +1322,48 @@ B=4 and added per-batch memprofile marks
 (`batch N stage A start / extracted / pool spawned / done`) so
 the next trace pinpoints per-stage peak with no guesswork.
 
+### Measured pre-#28 baseline (memprof25, 2026-05-09)
+
+User trace at `--n 3000 --chromosomes 1-22 --chr-length-mb 70
+--workers 1 --fanout-batch-size 7`, run on a 32 GB host, completed
+successfully. Captured before PR #28 (Phase 5e Phase A) merged, so
+cohort BCF write was still serial; serves as the canonical
+reference point for measuring future improvements.
+
+| Phase | Wall | RSS plateau |
+|---|---|---|
+| Setup (clinvar / candidates / rsid pool) | 0 → 16 s | 567 MB |
+| Cohort (sim + serial BCF write × 22 chroms) | 16 → 27,038 s ≈ **7.5 h** | ~17 GB per chrom |
+| Cohort → fanout boundary | (instant) | 17 GB → **11.9 GB** (~5 GB freed) |
+| Per-person fanout (W=1, B=7) | 27,041 → 92,665 s ≈ **18.2 h** | 11.89 GB rock-steady |
+| **Total** | **25.7 h** | — |
+
+Per-chrom split inside the cohort phase: msprime sim + tree-walk
+≈ 290 s, serial BCF write ≈ 940 s. The BCF write is **76 % of
+per-chrom wall** — exactly what Phase 5e Phase A (PR #28)
+parallelises. Per-batch fanout: ~150 s for B=7 = **~21 s/person**
+single-threaded (vs ~45 s/person pre-5g.1, confirming 5g.1+5g.2
+held).
+
+**Course-of-action implications captured at the time:**
+
+- **Fanout is now the dominant cost** — 18.2 h / 25.7 h ≈ 71 % of
+  total runtime. Validates 5g.3 as the next high-impact unit of
+  work after PR #28 lands. Linear extrapolation at W=8 (if RAM
+  permitted): 18.2 h → ~2.3 h; with B=50 W=8 after 5g.3 the
+  earlier ~1 h estimate looks consistent.
+- **Per-chrom cohort plateau at W=1 is ~17 GB** — matches the
+  Phase A RAM-bound estimate above (line ~1112). This exceeds the
+  5f' constant-term hypothesis (~3.6 GB OOA n=3000) because that
+  was framed around per-chunk constants, not full-chromosome
+  state. Worth flagging as additional motivation for Phase B (see
+  next subsection) since per-process OOM scoring on Linux counts
+  COW pages as resident.
+- **The cohort → fanout 5 GB drop** is sites-list /
+  tree-sequence / overlay state being released. A ~12 GB parent
+  baseline at fanout-fork time is what 5g.3 inherits — see the
+  5g.3 RAM-bound discussion below.
+
 ### Phase 5g.3 — disk-spilled batch handoff (planned)
 
 **Goal:** decouple parent's RSS at fork time from the batch size.
@@ -1343,6 +1398,22 @@ peak system RSS  ≈ baseline + W × ~280 MB
 
 For `n=3000` × `W=8`: ~2.8 GB instead of the current 14 GB at B=4.
 Headroom for `B=50+` × `W=8` simultaneously.
+
+**Pre-fanout state release is part of the 600 MB target.**
+memprof25 shows the parent's RSS at fanout-fork is ~12 GB
+(11.89 GB), only ~5 GB shed at the cohort → fanout boundary out
+of the ~17 GB cohort-phase peak. The remaining ~11 GB is a mix of
+sites-list references, ClinVar / rsID overlay tables, and Python
+allocator fragmentation that survives the post-cohort GC. To hit
+the 600 MB parent baseline assumed by the RAM bound above, 5g.3
+also needs to drop those references explicitly before
+`derive_persons_batch_to_disk` runs (`del sites; del overlays;
+gc.collect()` plus consider `malloc_trim` to release allocator
+arenas). If we don't shed those, parent baseline at fork is ~12 GB
+and the apparent-RSS-multiplier problem is unchanged from today —
+the disk-spill only helps with the *batch records* term, not the
+parent-baseline term. Treat the cohort-state-release path as a
+required sub-task of 5g.3, not an optimisation.
 
 **Disk cost:** ~280 MB × n_records-per-person × n_persons. At
 n=3000 that's ~840 MB total staging at any one time (one batch
