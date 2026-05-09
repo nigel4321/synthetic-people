@@ -40,6 +40,34 @@ land it, then move to the next phase. **Do not bundle phases.**
   better but still tops out around `n ≈ 5 000` (a `n_sites × 2*n`
   uint8 matrix at `n=100k` is ≈ 460 GB). Reaching 100k requires
   *disk-backed intermediates* — Phases 5 and 6 below.
+- **Strategic target: `n = 1 000 000`.** The realistic ceiling for
+  a single-machine pipeline given 2026-era cloud hosts (1–4 TB NVMe,
+  64–256 GB RAM). At this scale the in-RAM model breaks fundamentally,
+  not just quantitatively: even Phase 5e's "parent holds the sites
+  list, workers fork-share it" design fails because (a) the sites
+  list at n=1M would be hundreds of GB of Python objects, and
+  (b) CPython's reference-counting writes break fork-COW sharing
+  in workers (memprof26 demonstrated this at n=3000 already — see
+  Phase 5e Phase A post-mortem). The path to n=1M is therefore a
+  **streaming, mmap-backed intermediate**: parent never materialises
+  the cohort sites in Python at all; data flows
+  `msprime.TreeSequence → streaming variant iterator → mmap'd
+  Apache Arrow IPC file → workers (mmap-read their slice) → partial
+  BCFs → bcftools merge`. The parent's RAM stays at O(1) per variant
+  for the entire cohort phase. This is **Phase 5d** below — the
+  scope expanded substantially after memprof26 surfaced that the
+  n=1M ceiling is structural, not throughput-bound.
+- **Storage and I/O become first-class constraints at n=1M.** A raw
+  cohort BCF for `n=1M × 22 chroms × 70 Mb` is ~1.7 TB on disk
+  (compressed). The intermediate Arrow file roughly doubles peak
+  disk during a chromosome (drop-after-merge pattern). Total
+  scratch disk needed: 200-300 GB during a single chromosome's
+  processing, with ~80 GB final BCF per chromosome staying for
+  the duration of the run. **Disk space and I/O bandwidth become
+  the binding resources at this scale**, not RAM. NVMe at ~3 GB/s
+  is comfortable; spinning disks at ~150 MB/s are 20× slower and
+  dominate wall time. Cloud-instance disk choice matters more than
+  CPU at n=1M.
 
 ## Strategy summary
 
@@ -58,7 +86,8 @@ The phases compose, not compete:
 | **5f'** | Constant-term chunk-RAM calibration (open) | Auto-derate sees per-worker constant cost | None — bug fix |
 | **5g.1/.2 ✓** | **Batched per-person fanout extraction** | Fanout ~10× fewer bcftools invocations | None — drop-in |
 | **5g.3** | Disk-spilled fanout batch handoff (planned) | Decouples B from W RAM ceiling | +staging disk |
-| **5d** | Direct binary BCF via pysam (deferred) | `n = 1M+` | New compiled dep |
+| **5d.1** | Streaming-mmap cohort intermediate (Apache Arrow) | **`n = 1M`** — parent RAM becomes O(1) per variant | New dep (`pyarrow`) + ~200-300 GB scratch disk per chrom |
+| **5d.2** | Direct binary BCF via pysam (optional) | Writer throughput at `n = 1M+` | New compiled dep |
 | **6** | **SQLite for side-state (truth / ancestry / manifest)** | Filesystem at 100k | +schema |
 
 Phase 3's `gts: list[str]` baseline measurement is recorded and still
@@ -1169,34 +1198,113 @@ Not the ~3.5× speedup of 5e Full (which would also parallelise the
   not across-chromosome sim. Chromosomes simulate one at a time
   in the parent process.
 
-#### Phase B — workers walk the tree sequence (deferred)
+#### Phase B — workers walk the tree sequence (required to make Phase A work at n=3000+)
 
-Saves the parent's ~308 s/chrom serial extraction by having each
-worker iterate `ts.variants(samples=slice)` over the fork-shared
-tree sequence. Adds ~200 LOC + test coverage. Worth attacking only
-if Phase A measurements show extraction is a real bottleneck after
-the BCF write parallelises (currently extraction is ~25% of
-per-chrom cost, so Phase B is ~1.3× headroom — modest).
+**Status (2026-05-09):** promoted from "deferred / nice-to-have" to
+"required follow-up after PR #28" by the memprof26 trace. At
+`--n 3000 --workers 8`, Phase A OOM-kills on chrom 1: parent's
+~17 GB sites list is fork-shared to 8 workers, but CPython's
+reference-counting writes `ob_refcnt` on every PyObject access —
+*including read-only iteration*. Workers iterating the shared
+sites list trigger COW page faults across the whole structure.
+Physical RAM grows ~linearly with worker count and exhausts on a
+32 GB host within ~5 s of fork. Phase B sidesteps this entirely
+because workers don't share a giant Python object graph — each
+walks `ts.variants(samples=slice)` over the fork-shared tskit
+TreeSequence, whose data is held in numpy arrays that *are*
+fork-COW-safe (one Python wrapper, not one PyObject per element).
 
-Open question for Phase B: how does overlay application interact
-when workers walk the tree directly? Either parent walks once for
-the site coordinate metadata (then workers re-walk for GTs — wasted
-work), or workers each apply overlays deterministically with a
-shared seed (more code surface). Phase A sidesteps this entirely
-by keeping parent's sites-list-with-overlays as the source of truth.
+**Architecture:**
 
-**Additional motivation surfaced by memprof25 (2026-05-09):** at
-`n=3000 × 70 Mb`, parent's per-chrom plateau before fork is ~17 GB.
-Under Phase A's fork-COW design, eight workers each report ~17 GB
-*apparent* RSS — almost all of it shared, never written, so
-physical RSS stays ~17 GB. But the kernel's per-process OOM scoring
-counts COW pages as resident, and external monitoring / cgroup
-limits often do too. Phase B starts each worker with a small RSS
-(its slice's tree-walk state, not the parent's full sites list), so
-the apparent-RSS number tracks physical RSS. This becomes
-operationally important for users running on cgroup-bounded hosts
-or with OOM-scoring tooling that reads `/proc/<pid>/status` RSS
-fields directly.
+1. Parent simulates tree sequence (existing 5f code, unchanged).
+2. Parent does *not* materialise the sites list. Instead, it forks
+   W workers immediately after sim.
+3. Each worker iterates `ts.variants(samples=[slice_lo*2 ..
+   slice_hi*2])` for its sample slice, applies overlays per-site
+   (overlay tables are ~500 MB and fork-COW-share cleanly because
+   they're read-mostly Python dicts touched once per site, not per
+   element), and writes its slice's partial BCF.
+4. Parent runs `bcftools merge -O b` exactly as in Phase A.
+
+**Wall-time estimate:** at n=3000 × 70 Mb × W=8: ~150 s/chrom (each
+worker walks the tree once at ~100 s + writes its slice at ~50 s,
+all in parallel). Compare to Phase A's measured 940 s/chrom serial
+write or its theoretical ~150 s parallel write. Same wall time as
+Phase A *would* have delivered, except actually achievable.
+
+**What we lose vs Phase A's ideal (the tradeoffs):**
+
+1. **CPU duplication.** Each worker re-walks the tree to materialise
+   its slice's variants. At ~100 s tree-walk × W workers = 800
+   worker-seconds of duplicated CPU per chromosome. Wall-time it's
+   parallel-fast, but on metered cloud cycles you're paying ~3×
+   more CPU than Phase A's "parent walks once" design. Workstation
+   users feel this as fan noise, not budget.
+2. **Overlay application moves into workers.** Today (Phase A)
+   parent applies ClinVar (282k records) and rsID (440k records)
+   overlays once before fork; everyone reads the same overlaid
+   sites. In Phase B, each worker applies overlays per-site as it
+   walks. **Constraint:** every overlay function must be
+   deterministic and side-effect-free, so identical inputs yield
+   identical outputs in every worker. Today's overlay code already
+   is, but this becomes a hard contract for any future overlay
+   logic.
+3. **AC computation across slices.** Allele count (AC) for a site
+   is the sum of carriers across all slices. Today (Phase A) parent
+   computes AC from the full carriers list before workers see it.
+   In Phase B, each worker only sees its slice's contribution to
+   AC. Either: (a) workers each write their slice's partial AC and
+   `bcftools merge` re-derives the merged AC (works — already
+   tested in PR #28's parity tests), or (b) workers compute their
+   slice's AC and write it explicitly into the partial BCF for
+   later sum. (a) is what we already do; no change needed.
+4. **Sparse `carriers` list as a debugging artifact disappears.**
+   Today you can pickle the sites list and inspect carriers
+   post-hoc for diagnostics or downstream stats. After Phase B,
+   carriers exist only inside per-worker iteration scratch and are
+   gone after the BCF write. Inspection requires re-walking the
+   tree. Acceptable but worth noting.
+5. **Admixture path needs separate refactoring.**
+   `admixture.simulate_cohort` emits per-person ancestry segments
+   from the same tree walk. Under one parent-side walker those
+   segments come out alongside variants. Under W walkers, each
+   worker emits its slice's ancestry segments — needs an
+   ancestry-merge step (or each worker writes its own per-slice
+   ancestry file and parent concatenates). Treat as a separate
+   follow-up PR; landing Phase B for the non-admixture path first
+   is fine.
+6. **Site ordering source-of-truth moves.** Today parent sorts the
+   sites list once. In Phase B, each worker walks in tree-position
+   order; bcftools merge re-sorts on `(chrom, pos, ref, alt)`. This
+   is functionally equivalent but it's a behaviour change that
+   could surface ordering-sensitive bugs in overlay code or
+   downstream consumers. Add a regression test: full pipeline
+   produces byte-identical BCF (after `bcftools query` field
+   normalisation) under W ∈ {1, 2, 4, 8}.
+7. **Test refactoring surface.** Several tests build a sites list
+   manually and feed it to `CohortBcfWriter`. Phase B either keeps
+   that path supported (parent-side sites list as an *optional*
+   input for tests) or migrates the affected tests to TreeSequence
+   fixtures. ~150 LOC of test work.
+8. **Apparent-RSS still inflates in monitoring.** Phase B reduces
+   *physical* RSS to "1 × tree sequence + W × per-slice scratch",
+   but each worker still inherits the parent's address space at
+   fork. `/proc/<pid>/status` will still show each worker with the
+   parent's RSS. Linux kernel OOM-scoring also still treats COW
+   pages as resident in each child. Phase B fixes the *physical*
+   exhaustion (which is what kills the run) but not the apparent
+   inflation (which trips monitoring tools and cgroup limits).
+   Operators on cgroup-bounded hosts will still need to size memory
+   limits as `~W × tree_sequence_size` for the cgroup, even though
+   physical use is ~1 ×.
+
+**Bottom line.** Phase B is the right architecture for n=3000–30,000.
+Above ~30k, even the per-worker tskit walk starts allocating
+non-trivially (mutation count scales with n × sites), and the path
+to n=1M shifts to **Phase 5d** below — streaming the tree sequence
+to disk via Arrow IPC and never materialising the full per-slice
+variant set in any single process. Phase B is the bridge; 5d is the
+ceiling.
 
 #### admixture mirror (separate follow-up)
 
@@ -1472,31 +1580,255 @@ product call from the user first.
 
 ---
 
-## Phase 5d — direct binary BCF writes (path to n=1M+)
+## Phase 5d — streaming-mmap cohort intermediate (path to n=1M)
 
-**Goal:** get past the writer-side bottleneck that emerges once
-sparse storage takes RAM out of the picture. At `n=1M × ~500 k
-sites` per chromosome, the text-VCF representation we currently
-pipe through `bcftools view -O b` is roughly 2 TB per chromosome
-(GT block is `n × ~3 B` per record). Bgzip throughput caps the
-write at ~5 hours per chromosome, ~5 days total — slow even on
-a fat workstation.
+**Status (2026-05-09):** scope expanded substantially after
+memprof26 demonstrated that Phase 5e Phase A's "parent holds the
+sites list, workers fork-share it" design fails at n=3000 due to
+CPython refcount-COW divergence. Phase B (workers walk the tskit
+TreeSequence directly) bridges to ~n=30,000. Beyond that, even the
+per-worker tskit walk allocates non-trivially: mutation count grows
+with `n × sites`, and per-iteration scratch state per worker starts
+hitting many-GB territory at n=100k+. The design that actually
+scales to n=1M is **streaming the cohort representation to disk and
+mmap-ing it from workers** — parent never materialises a full
+in-memory site set, workers never copy more than their slice.
 
-**Status:** stub only. Keep on the plan so we can revisit when the
-1M scale becomes a real ask.
+**Goal:** make parent's RAM in the cohort phase O(1) per variant,
+independent of `n`. Workers consume their slice's columns via mmap
+without copying. Parent and worker memory both stay bounded as
+`n` grows; only disk and I/O scale.
 
-**Approach:** swap the `bcftools view -O b -` subprocess for a
-direct binary BCF writer. Two viable libraries:
+### Why Apache Arrow IPC
 
-- `pysam` — the obvious choice. Adds a ~30 MB compiled wheel to
-  the dep tree (its own htslib build with C extensions). Already
-  evaluated and rejected in 5a as a transitive dep cost; revisit
-  the cost/benefit at 1M scale.
-- A hand-rolled BCF encoder using `htslib` via `ctypes`. Lower
-  install cost, much higher implementation cost.
+Several mmap-able binary formats could work (custom struct format,
+HDF5, Parquet, Arrow). **Apache Arrow's IPC ("Feather v2") format
+is the right pick** for this problem:
 
-**Out of scope for the current PR.** Phase 5c gets to n=100k
-cleanly; n=1M waits for 5d when it's actually needed.
+1. **Columnar layout matches our access pattern.** Workers want to
+   read one slice (range of sample columns) per site. Arrow stores
+   each column contiguously, so a worker's read is a contiguous
+   mmap range — no scatter, no per-site decode. Row-oriented
+   formats (HDF5, custom struct) force every worker to scan every
+   site's full row to find its slice columns.
+2. **Zero-copy mmap is a first-class operation.**
+   `pyarrow.ipc.open_file(path).read_all()` returns a Table whose
+   columns are zero-copy views into the mmap'd buffer. Workers see
+   numpy arrays without ever materialising Python objects. No
+   refcount-COW issue (numpy arrays hold one PyObject wrapper for
+   the whole array, not one per element).
+3. **Variable-length carriers fit naturally.** Arrow's `ListArray`
+   handles per-site variable-length child arrays via offsets — the
+   exact shape our sparse `carriers` representation needs. No
+   manual offsets bookkeeping.
+4. **Streaming write API.** `pyarrow.ipc.new_file(...)` lets parent
+   write one record batch at a time as it iterates
+   `ts.variants()`. No requirement to hold the whole table in RAM
+   to write it. Parent's RAM stays at one record batch's worth
+   (~1k variants).
+5. **Parquet is overkill, HDF5 is non-columnar, custom format is
+   maintenance burden.** Arrow gives us the columnar mmap pattern
+   without inventing or maintaining a binary format.
+
+**New dependency: `pyarrow`.** Pulls in a ~70 MB wheel (Arrow C++
+core + Python bindings). Heavier than the existing pure-Python
+deps but lighter than pysam's compiled htslib build. Worth the
+weight at the n=1M ask; conditional-import-and-degrade-gracefully
+keeps it optional for n≤30k users who only need Phase B.
+
+### Architecture
+
+```
+Parent (per chromosome):
+  1. msprime.sim_ancestry(...) → TreeSequence ts
+  2. ts.dump("scratch/chrom_N.trees")        # disk-backed tskit
+     del ts                                   # free Python ref
+  3. ts = tskit.load("scratch/chrom_N.trees") # mmap-backed reload
+  4. with pyarrow.ipc.new_file(
+         "scratch/chrom_N.cohort.arrow",
+         schema=cohort_schema(n_samples)) as writer:
+         for batch in stream_variants_to_arrow_batches(
+                          ts, batch_size=1024):
+             writer.write_batch(batch)
+     # Parent RSS stays O(batch_size × n_samples × 1 byte) ≈ a few MB
+  5. Signal workers to start.
+
+Workers (each, in parallel):
+  1. table = pyarrow.ipc.open_file(
+                "scratch/chrom_N.cohort.arrow").read_all()
+     # Zero-copy mmap; table.columns are numpy views
+  2. Slice columns to assigned [sample_lo, sample_hi]:
+        slice_table = table.select(
+            ["pos", "ref", "alt", "info_ac", ...,
+             f"gt_{sample_lo}", ..., f"gt_{sample_hi-1}"])
+  3. Stream-write partial BCF using existing CohortBcfWriter
+     (or 5d.2's pysam direct writer if shipped) over the
+     numpy-array view.
+  4. Close mmap, exit.
+
+Parent: bcftools merge partials → cohort/cohort.chr_N.bcf
+        rm scratch/chrom_N.trees scratch/chrom_N.cohort.arrow
+```
+
+### RAM bound after 5d
+
+```
+peak parent RSS ≈ ~500 MB baseline + ~20 MB Arrow batch buffer
+peak per-worker RSS ≈ ~500 MB baseline + ~50 MB BCF write buffer
+peak system RSS  ≈ baseline + W × ~50 MB
+```
+
+**Independent of `n`.** At n=1M × W=8 the working set is ~5 GB
+total — fits comfortably on any modern host. The cost moves to
+disk.
+
+### Storage and I/O — first-class constraints at this scale
+
+**Per-chromosome scratch disk during processing:**
+- Tree sequence dump: ~10-50 GB at n=1M × 70 Mb (tskit's
+  table-store format; compresses well but still substantial).
+- Arrow IPC intermediate: ~80 GB at n=1M × 70 Mb (uncompressed
+  GT columns dominate; 1M samples × 500k sites × 1 byte = 500 GB
+  raw, halved by Arrow's RLE / dictionary encoding for typical
+  allele frequencies).
+- Partial BCFs (W workers): ~10 GB per slice × 8 slices = 80 GB.
+- Final merged BCF: ~80 GB.
+
+**Peak per-chromosome scratch: ~250 GB.** Drop-after-merge pattern
+keeps only one chromosome's intermediates in flight at a time; the
+final BCFs accumulate at ~80 GB × 22 = ~1.7 TB.
+
+**Total disk requirement at n=1M × 22 chroms:**
+- Final outputs (cohort BCFs + per-person VCFs): ~2 TB
+- Peak scratch (one chromosome in flight): ~250 GB
+- Headroom buffer: ~10%
+- **Recommended free disk: 2.5-3 TB**
+
+**I/O bandwidth dominates wall time at n=1M.** Per-chromosome data
+moves through disk twice (write Arrow, read mmap) plus tree
+sequence dump and partial BCF writes. Total per-chrom I/O:
+~400 GB. On NVMe (~3 GB/s) that's ~140 s — tolerable. On a
+spinning disk (~150 MB/s) it's ~45 minutes per chromosome,
+~16 hours just for I/O across 22 chromosomes. **Cloud-instance
+disk type matters more than CPU at n=1M.**
+
+**Surface this in `--help` and TUTORIAL:** users should know
+upfront that running n≥100k requires a fast SSD/NVMe and 2-3 TB
+free. Add a pre-flight check that warns if the output filesystem
+is rotational or has insufficient free space.
+
+### Phase 5d.1 vs 5d.2 split
+
+**5d.1 — streaming-mmap intermediate (the load-bearing change):**
+Replace parent's in-memory sites list with an Arrow IPC file.
+Workers consume via mmap. This is what unblocks n=1M. Most of the
+~600-800 LOC sits here:
+
+- New `cohort_arrow.py`: schema definition + `stream_variants_to_
+  arrow_batches(ts) -> Iterator[pyarrow.RecordBatch]` + reader
+  helpers.
+- `cli.py`: orchestration — dump tree, stream Arrow, fan out
+  workers, merge.
+- `bcf_writer.py`: a new mode that consumes Arrow column views
+  rather than a Python list-of-dicts.
+- Conditional `pyarrow` import; if missing, fall back to Phase B
+  with a clear "n=1M requires pyarrow; install with `pip install
+  pyarrow` or pass `--n ≤ 30000`" message.
+- Pre-flight disk-space check + clear error.
+- Tests: parity with Phase B output at small n; large-n smoke
+  test gated on `RUN_LARGE_N=1`.
+
+**5d.2 — direct binary BCF write via pysam (optional optimisation
+on top of 5d.1):**
+At n=1M the BCF write itself becomes a wall-time concern: piping
+through `bcftools view -O b -` from a Python `subprocess.PIPE`
+caps at ~50 MB/s (Python GIL + subprocess overhead). pysam's
+`VariantFile.write()` writes BCF binary directly through htslib at
+~500 MB/s, an order of magnitude faster.
+
+This is **independent of 5d.1** in design: 5d.1's worker can use
+either the existing subprocess pipeline or pysam. Ship 5d.1 first;
+add 5d.2 only if the BCF write phase is measured to bottleneck
+real n=1M runs (it might not — at NVMe disk speeds the partial
+BCF writes already saturate disk before they saturate bcftools).
+
+**Why pysam is cheaper to add now than at 5a evaluation time:**
+back when 5a evaluated pysam, the codebase had no compiled deps.
+5d.1 already ships pyarrow (a compiled wheel of similar size), so
+adding pysam shifts the dep model from "pure Python" to "two
+compiled wheels" — marginal cost. The 5a rejection no longer
+applies cleanly.
+
+### Out of scope for 5d entirely
+
+- **Per-person fanout at n=1M.** The fanout phase has its own
+  scaling story (5g.3 + the disk-spill design). At n=1M, fanout
+  produces 1M per-person VCFs at ~50 MB each = ~50 TB. That's
+  obviously a separate disk-space ceiling and a separate wall-time
+  problem. 5d covers the cohort phase up to and including the
+  cohort BCF; per-person derivation at n=1M needs its own design
+  pass — likely chunked persons, each chunk sharing the cohort
+  Arrow intermediate via mmap.
+- **Distributing across machines.** Out of scope per the
+  workload-assumptions section; if anyone needs to go beyond
+  single-machine, the disk-backed Arrow + BCF intermediates make
+  the data layer transferable, but the orchestration is a separate
+  product.
+
+### Phase 5d tasks
+
+- [ ] **Branch:** `perf/phase5d-streaming-mmap-arrow` off main.
+- [ ] **`cohort_arrow.py` (new):**
+  - `cohort_schema(n_samples) -> pyarrow.Schema`: pos/ref/alt/qual/
+    filter/info_ac/info_an/info_af + carriers as `ListArray<int32>`
+    or per-sample GT columns as `int8[n_samples]`. Decision point:
+    columns-per-sample is denser-on-disk but reads cleanly per
+    slice; carriers-as-list is sparser-on-disk but workers must
+    re-densify. **Tentative choice: per-sample int8 columns** —
+    matches Arrow's mmap-slice strength.
+  - `stream_variants_to_arrow_batches(ts, batch_size=1024) ->
+    Iterator[RecordBatch]`: walks `ts.variants()` once, emits
+    one batch every 1024 variants. Memory bound: O(batch_size ×
+    n_samples × 1 byte) per batch.
+  - `read_slice(arrow_path, sample_lo, sample_hi) -> Table`:
+    mmap-open + project columns. Workers' entry point.
+- [ ] **`cli.py`:** new orchestration path gated on `--cohort-mode
+  arrow` (or auto-pick for n≥100k):
+  - Dump tree to scratch.
+  - Stream Arrow IPC.
+  - Fork workers; each writes partial BCF from its Arrow slice.
+  - Merge + cleanup.
+  - Pre-flight disk-space check; clear error if insufficient.
+- [ ] **`bcf_writer.py`:** add `CohortBcfWriter.from_arrow_slice(
+  arrow_table, slice_lo, slice_hi)` constructor that reads
+  Arrow columns directly without a Python list-of-dicts
+  intermediate.
+- [ ] **Conditional pyarrow import:** if missing, raise
+  `ImportError` with install hint; degrade to Phase B for
+  n ≤ 30000.
+- [ ] **Tests:**
+  - Parity: output BCF byte-identical to Phase B's output at
+    n=100, n=500, n=2000 across W ∈ {1, 2, 4, 8}.
+  - Streaming bound: assert parent RSS during cohort phase stays
+    under 1 GB independent of n (smoke test at n=10k).
+  - Disk-space pre-flight: simulate insufficient space, assert
+    clear error before any work begins.
+  - Large-n smoke test gated on `RUN_LARGE_N=1` env: n=10k full
+    pipeline completes; record wall time + peak disk.
+- [ ] **Docs:** README + TUTORIAL — n=100k+ requires `pyarrow` +
+  fast disk + 2-3 TB free; cloud-instance disk-type guidance.
+  `--help` updates for `--cohort-mode` if surfaced.
+
+### Phase 5d.2 tasks (optional, after 5d.1 measurements)
+
+- [ ] **Branch:** `perf/phase5d2-pysam-bcf-write` off main (after
+  5d.1 lands).
+- [ ] **`bcf_writer.py`:** add a pysam-backed `write_site` path;
+  benchmark vs subprocess pipeline.
+- [ ] **Tests:** parity with the subprocess writer at modest n.
+- [ ] **Decision gate:** ship only if measured 5d.1 BCF write
+  phase is >25% of cohort wall at n=100k. Otherwise close as
+  "not worth the dep".
 
 ---
 
