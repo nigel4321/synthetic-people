@@ -41,7 +41,10 @@ file_size`. Green-lit Spike 2.
 
 ## Spike 1 — OS-level mmap+fork smoke test
 
-**File:** `spike1_mmap_fork_smoke.py`
+**File:** [`spike1_mmap_fork_smoke.py`](spike1_mmap_fork_smoke.py)
+
+**Result:** [`spike1_results_2026-05-09.txt`](spike1_results_2026-05-09.txt)
+— **PASS** on the user's 32 GB workstation (2026-05-09).
 
 **What it does:**
 
@@ -134,7 +137,11 @@ Spike 2; fail → halt 5d planning until we understand why.
 
 ## Spike 2 — Arrow IPC streaming write + zero-copy mmap
 
-**File:** `spike2_arrow_streaming.py`
+**File:** [`spike2_arrow_streaming.py`](spike2_arrow_streaming.py)
+
+**Result:** _not yet run_ — paste stdout into
+`spike2_results_<date>.txt` alongside this README and link it here
+once available.
 
 **What it does:**
 
