@@ -1,0 +1,75 @@
+Spike 2 result — 2026-05-09
+Verdict: PASS on all four checks (parent-RSS bound, mmap-share,
+write throughput, read throughput). Phase 5d's Arrow-IPC zero-copy
+mmap pattern is viable on this host; green-light Phase 5d.1
+implementation.
+
+Notable:
+  - System RAM delta during the 8-worker mmap-read phase was
+    +0.01 GB. Sum of per-worker reported RSS was 7.83 GB. The
+    apparent-to-physical ratio of ~700:1 confirms kernel page-cache
+    sharing works essentially perfectly for our access pattern.
+  - The per-site Python loop (`for i in range(my_slice.shape[0]):
+    alt_count = int((my_slice[i] > 0).sum())`) — the realistic
+    5d.1 worker pattern, identical in shape to what killed Phase
+    5e Phase A through refcount-COW divergence — ran cleanly on
+    all 8 workers in 0.69 s with zero physical RAM growth. Numpy
+    mmap views avoid the refcount-COW problem because numpy holds
+    one PyObject wrapper for the whole array, not one per element.
+  - Data-correctness sanity: each worker counted alt alleles in
+    1,250 samples × 100,000 sites at 5 % allele frequency →
+    expected ~6,250,000. All 8 landed in 6,246k–6,257k. Random
+    sampling distribution looks right.
+
+Stdout from spike2_arrow_streaming.py (defaults: 10k samples ×
+100k sites, 8 workers, ~1 GB Arrow file):
+
+
+=== Phase 1: Streaming write ===
+  schema: pos int64 | genotypes FixedSizeList(int8, 10000)
+  sites: 100,000  batch_size: 1024  n_batches: 98
+  expected raw GT bytes: 0.93 GB
+
+  wrote: 98 batches  file_size = 0.93 GB
+  elapsed: 3.89 s
+  write throughput (logical): 245 MB/s
+  parent baseline RSS: 65 MB
+  parent peak RSS during write: 184 MB
+  parent RSS growth during write: +119 MB
+
+=== Phase 2: Worker mmap-read ===
+  forking 8 workers; each reads sample slice of 1250 columns
+  worker iteration: per-site Python loop (realistic 5d.1 worker pattern)
+  baseline system RAM: used = 0.96 GB  available = 30.33 GB
+
+  all workers done in 0.70 s
+
+  per-worker:
+    worker 0: sites=100000  alt_total=6250492  bytes_read=119 MB  elapsed=0.69 s  thr=173 MB/s  RSS=0.98 GB
+    worker 1: sites=100000  alt_total=6251742  bytes_read=119 MB  elapsed=0.69 s  thr=173 MB/s  RSS=0.98 GB
+    worker 2: sites=100000  alt_total=6250366  bytes_read=119 MB  elapsed=0.69 s  thr=173 MB/s  RSS=0.98 GB
+    worker 3: sites=100000  alt_total=6246987  bytes_read=119 MB  elapsed=0.69 s  thr=173 MB/s  RSS=0.98 GB
+    worker 4: sites=100000  alt_total=6249925  bytes_read=119 MB  elapsed=0.69 s  thr=173 MB/s  RSS=0.98 GB
+    worker 5: sites=100000  alt_total=6253708  bytes_read=119 MB  elapsed=0.69 s  thr=173 MB/s  RSS=0.98 GB
+    worker 6: sites=100000  alt_total=6256667  bytes_read=119 MB  elapsed=0.69 s  thr=174 MB/s  RSS=0.98 GB
+    worker 7: sites=100000  alt_total=6246488  bytes_read=119 MB  elapsed=0.69 s  thr=174 MB/s  RSS=0.98 GB
+
+  aggregate read throughput: 1355 MB/s
+  sum of per-worker reported RSS (apparent): 7.83 GB
+
+  system RAM during worker phase:
+    baseline used:        0.96 GB
+    peak used:            0.97 GB
+    delta:                +0.01 GB
+    file size:            0.93 GB
+    n_workers × file:     7.46 GB (if no sharing)
+
+=== VERDICT ===
+  PASS: parent peak RSS = 184 MB < 500 MB threshold (streaming write is bounded).
+  PASS: system RAM delta = 0.01 GB < 1.40 GB threshold (mmap shares cleanly across workers).
+  PASS: write throughput = 245 MB/s >= 200 MB/s target.
+  PASS: aggregate read throughput = 1355 MB/s >= 500 MB/s target.
+
+  All checks PASSED.
+  Phase 5d's Arrow-IPC zero-copy mmap pattern is viable on this host.
+  Green-light Phase 5d.1 implementation.

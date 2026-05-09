@@ -27,17 +27,26 @@ learn early.
 | Spike | Status | What it tests | Cost |
 |---|---|---|---|
 | 1 | ✅ shipped, **PASS** (2026-05-09) | OS-level: `np.memmap` + `fork` + 8 workers shares physical RAM | ~120 LOC |
-| 2 | ✅ shipped | `pyarrow` IPC streaming write + zero-copy mmap read across workers | ~280 LOC |
+| 2 | ✅ shipped, **PASS** (2026-05-09) | `pyarrow` IPC streaming write + zero-copy mmap read across workers | ~280 LOC |
 
 Run Spike 1 first. If it fails (workers don't share physical RAM),
 Spike 2 is moot — 5d's foundation is wrong and we rethink. If
 Spike 1 passes, run Spike 2 to validate the Arrow-specific layer.
 
-Spike 1 result on the user's host (32 GB workstation) recorded in
-`spike1_results_2026-05-09.txt`: clean PASS — total system RAM
-delta during the 8-worker read phase was 0 GB, apparent per-worker
-RSS sum (4.21 GB) tracked file size rather than `n_workers ×
-file_size`. Green-lit Spike 2.
+**Both spikes have passed on the user's host (32 GB workstation,
+2026-05-09).** Phase 5d's foundation is validated; Phase 5d.1
+implementation is green-lit. Highlights:
+
+- Spike 1: total system RAM delta during the 8-worker read phase
+  was 0 GB; apparent per-worker RSS sum (4.21 GB) tracked file
+  size rather than `n_workers × file_size`.
+- Spike 2: system RAM delta during workers was +0.01 GB against a
+  7.83 GB apparent-RSS sum — an apparent-to-physical ratio of
+  ~700:1. The realistic per-site Python loop pattern (the same
+  shape that killed Phase 5e Phase A through refcount-COW
+  divergence) ran cleanly because numpy holds one PyObject wrapper
+  for the whole mmap'd array, not one per element. Write
+  throughput 245 MB/s, aggregate read throughput 1,355 MB/s.
 
 ## Spike 1 — OS-level mmap+fork smoke test
 
@@ -139,9 +148,10 @@ Spike 2; fail → halt 5d planning until we understand why.
 
 **File:** [`spike2_arrow_streaming.py`](spike2_arrow_streaming.py)
 
-**Result:** _not yet run_ — paste stdout into
-`spike2_results_<date>.txt` alongside this README and link it here
-once available.
+**Result:** [`spike2_results_2026-05-09.txt`](spike2_results_2026-05-09.txt)
+— **PASS** (all four checks: parent-RSS bound, mmap-share, write
+throughput, read throughput) on the user's 32 GB workstation
+(2026-05-09).
 
 **What it does:**
 
