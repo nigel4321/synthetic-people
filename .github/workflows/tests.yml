@@ -43,8 +43,7 @@ jobs:
           pip install pyarrow
 
       - name: Run unit tests
-        working-directory: synthetic_people
-        run: python -m unittest discover -s tests -v
+        run: python .github/scripts/run_tests.py synthetic_people
 
   nextflow-pipeline:
     name: nextflow_pipeline bin scripts
@@ -65,5 +64,4 @@ jobs:
       # bin/ scripts are stdlib-only; tests self-skip when optional tools
       # (e.g. nextflow for the e2e test) are missing.
       - name: Run unit tests
-        working-directory: nextflow_pipeline
-        run: python -m unittest discover -s tests -v
+        run: python .github/scripts/run_tests.py nextflow_pipeline
