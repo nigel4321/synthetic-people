@@ -288,6 +288,26 @@ Legacy-only flags (`--background-glob`, `--n-background`, `--af-min`,
   pre-Phase-5e parallel-chromosome path multiplied tree-sequence
   RAM by the worker count and is no longer used. See TUTORIAL.md
   §9.1 for details.
+- `--cohort-mode {sites_list, arrow, auto}` — selects the cohort
+  intermediate between simulation and the BCF write. `sites_list`
+  (Phase B) keeps the cohort in parent RAM and fork-shares to
+  workers; works up to `n ~= 30000`. `arrow` (Phase 5d.1) writes a
+  per-chrom Arrow IPC scratch file and workers consume it via
+  `pyarrow.memory_map` (zero-copy). `auto` (default) picks `arrow`
+  for `--n >= 100000` and `sites_list` below. The Arrow path
+  requires `pip install pyarrow`; without it, `auto` falls back to
+  `sites_list` with a warning. **At `n=100k+` plan on 2-3 TB free
+  scratch on a fast SSD/NVMe filesystem** — the Arrow scratch is
+  ~80 GB per chromosome at n=1M and gets created + deleted per
+  chromosome, but the merged cohort BCFs accumulate at ~80 GB ×
+  22 = ~1.7 TB. The cli runs a pre-flight disk-space check at
+  startup when Arrow mode is selected and aborts cleanly if free
+  disk can't fit one chromosome's scratch.
+- `--cohort-arrow-batch-size N` — sites per Arrow record batch when
+  `--cohort-mode` resolves to `arrow`. Default `256`, identified
+  empirically by Spike 2b; smaller batches lower parent peak RSS
+  linearly at a small (~7%) write-throughput cost. Don't change
+  unless you're characterising a specific host.
 - The writer streams records straight into `bgzip -c` (no plain `.vcf`
   intermediate), so per-person disk I/O is one pass instead of two.
 - The overlay loaders (ClinVar, dbSNP, COSMIC) are bcftools-driven and

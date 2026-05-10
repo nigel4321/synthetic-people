@@ -71,7 +71,11 @@ from .sv import (
     DEFAULT_SVS_PER_PERSON,
     generate_person_svs,
 )
-from .bcf_writer import CohortBcfWriter, write_cohort_bcf_parallel
+from .bcf_writer import (
+    CohortBcfWriter,
+    write_cohort_bcf_parallel,
+    write_cohort_bcf_parallel_from_arrow,
+)
 from .cohort_derivation import derive_person_records, derive_persons_batch
 from .memprofile import mark as memprofile_mark
 from .resume import ResumeMismatch, load_or_create_meta
@@ -293,6 +297,142 @@ def resolve_workers(requested: int) -> int:
     if requested == 0:
         return max(1, _os.cpu_count() or 1)
     return requested
+
+
+# ---------------------------------------------------------------------------
+# Phase 5d.1 — cohort-mode resolution + pre-flight disk check
+# ---------------------------------------------------------------------------
+
+# n threshold above which `--cohort-mode auto` picks the Arrow path. The
+# Phase B sites-list path was measured-stable up to ~30k and was the
+# ceiling at which CPython refcount-COW divergence started to bite; we
+# pick the auto-flip well below the failure boundary.
+_ARROW_AUTO_THRESHOLD = 100_000
+
+# Rough variants-per-Mb yield for the coalescent default (mu, rec_rate,
+# population). Used only for the pre-flight disk-space estimate, so a
+# 2x error here just produces a slightly noisy warning, not a wrong
+# decision.
+_VARIANTS_PER_MB = 5_000
+
+
+def _resolve_cohort_mode(cli_mode: str, n: int) -> str:
+    """Map ``--cohort-mode {sites_list,arrow,auto}`` + ``--n`` to the
+    concrete mode used by the cohort-write loop.
+
+    Returns ``"sites_list"`` or ``"arrow"`` (never ``"auto"``).
+    """
+    if cli_mode == "sites_list":
+        return "sites_list"
+    if cli_mode == "arrow":
+        return "arrow"
+    # auto
+    return "arrow" if n >= _ARROW_AUTO_THRESHOLD else "sites_list"
+
+
+def _estimate_arrow_chrom_scratch_bytes(
+    n_samples: int, chr_length_mb: float
+) -> int:
+    """Estimate per-chromosome scratch disk for the Arrow intermediate.
+
+    Used only by :func:`_preflight_arrow_disk_check`. Approximation:
+    ``n_haplotypes × variants_per_chrom × 1 byte`` for the genotype
+    matrix dominates; INFO + offsets add ~5 %. Rough accuracy is OK —
+    the check produces a warning when free disk is tight, not a hard
+    refusal.
+    """
+    variants = max(1, int(chr_length_mb * _VARIANTS_PER_MB))
+    raw = 2 * n_samples * variants
+    return int(raw * 1.05)
+
+
+def _preflight_arrow_disk_check(
+    cohort_dir: Path, n_samples: int, chr_length_mb: float
+) -> None:
+    """Warn (or fail) if the cohort directory's filesystem doesn't have
+    enough free space to hold one chromosome's Arrow scratch + the
+    final BCF concurrently.
+
+    The Arrow file is created and deleted per chromosome so the steady-
+    state requirement is one Arrow file plus the BCF being written. We
+    require ``2x`` the per-chrom estimate free; below ``1x`` we fail
+    with a clear message because the Arrow write itself wouldn't
+    complete.
+    """
+    cohort_dir = Path(cohort_dir)
+    cohort_dir.mkdir(parents=True, exist_ok=True)
+    per_chrom = _estimate_arrow_chrom_scratch_bytes(n_samples, chr_length_mb)
+    try:
+        free = shutil.disk_usage(cohort_dir).free
+    except OSError:
+        # Best-effort — if disk_usage fails we don't block the run.
+        return
+
+    if free < per_chrom:
+        raise SystemExit(
+            f"--cohort-mode arrow needs ~{per_chrom / 1e9:.1f} GB scratch "
+            f"per chromosome (n={n_samples}, length={chr_length_mb} Mb); "
+            f"only {free / 1e9:.1f} GB free under {cohort_dir}. "
+            f"Free up disk or pass --cohort-mode sites_list (supported "
+            f"up to n~30000)."
+        )
+    if free < 2 * per_chrom:
+        print(
+            f"  WARNING: --cohort-mode arrow estimates "
+            f"~{per_chrom / 1e9:.1f} GB scratch per chromosome and only "
+            f"{free / 1e9:.1f} GB is free under {cohort_dir}. The first "
+            f"chromosome will fit, but the final BCF + Arrow file may "
+            f"not coexist. Free up disk or set "
+            f"`--cohort-mode sites_list` to be safe.",
+            file=sys.stderr,
+        )
+
+
+def _write_cohort_chrom_bcf(
+    mode: str,
+    chrom: str,
+    chrom_bcf: Path,
+    sites: list,
+    sample_ids: list,
+    build: str,
+    workers: int,
+    cohort_dir: Path,
+    arrow_batch_size: int,
+) -> None:
+    """Dispatch one chromosome's cohort BCF write between the
+    sites-list (Phase B) and Arrow (Phase 5d.1) paths.
+
+    Arrow path: writes ``cohort_dir / .arrow / cohort.chr<N>.arrow``,
+    runs the parallel BCF writers against it, deletes the Arrow file
+    on success. On failure the Arrow file is left in place for
+    postmortem (matches the ``.partials/`` cleanup behaviour).
+    """
+    if mode == "arrow":
+        arrow_dir = cohort_dir / ".arrow"
+        arrow_dir.mkdir(parents=True, exist_ok=True)
+        arrow_path = arrow_dir / f"cohort.chr{chrom}.arrow"
+        from .cohort_arrow import write_arrow_file
+        write_arrow_file(
+            arrow_path, chrom, len(sample_ids), iter(sites),
+            batch_size=arrow_batch_size,
+        )
+        # Clean up the Arrow file only on success — on failure leave it
+        # in place so a postmortem can mmap it and inspect what the
+        # writer was about to consume.
+        write_cohort_bcf_parallel_from_arrow(
+            arrow_path, chrom_bcf, build, sample_ids, workers,
+        )
+        if arrow_path.exists():
+            arrow_path.unlink()
+        try:
+            arrow_dir.rmdir()
+        except OSError:
+            pass
+        return
+
+    write_cohort_bcf_parallel(
+        chrom_bcf, build, sample_ids, sites, workers=workers,
+    )
 
 
 def parse_chromosomes(spec: str, build: str) -> list[str]:
@@ -557,6 +697,30 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                         "not the simulation. Output is deterministic "
                         "for a given --seed across any --workers "
                         "value.")
+    p.add_argument("--cohort-mode",
+                   choices=("sites_list", "arrow", "auto"),
+                   default="auto",
+                   help="[perf, Phase 5d.1] Cohort intermediate "
+                        "between simulation and the BCF write. "
+                        "`sites_list` (Phase B) keeps the cohort in "
+                        "RAM and fork-shares to workers; works up to "
+                        "n~30k. `arrow` writes a streaming-mmap Arrow "
+                        "IPC scratch file per chromosome and workers "
+                        "consume it via memory_map (zero-copy); "
+                        "required for n=100k+, optional below. `auto` "
+                        "picks `arrow` for --n>=100000 and `sites_list` "
+                        "below. The Arrow path needs `pip install "
+                        "pyarrow`; without it, `auto` falls back to "
+                        "`sites_list` with a warning.")
+    p.add_argument("--cohort-arrow-batch-size", type=int, default=256,
+                   help="[perf, Phase 5d.1] Sites-per-batch when "
+                        "streaming the cohort Arrow IPC file. The "
+                        "default of 256 was identified by Spike 2b "
+                        "as the knee of the parent-RSS / write-"
+                        "throughput trade-off (predicted parent peak "
+                        "~5 GB at n=1M; +7%% throughput cost vs the "
+                        "fastest cell). Only consulted in "
+                        "`--cohort-mode arrow`.")
     p.add_argument("--fanout-batch-size", type=int, default=4,
                    help="[perf] On the streamed coalescent path, group "
                         "this many sample IDs into one bcftools query "
@@ -678,6 +842,41 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
     workers = resolve_workers(args.workers)
 
     cohort_dir = args.output_dir / "cohort"
+
+    # Phase 5d.1 — resolve the cohort intermediate mode for this run
+    # and (if it ends up Arrow) pre-flight the disk before any
+    # simulation work. Doing this before resume / sample draw means
+    # an insufficient-disk run aborts cheaply.
+    cohort_mode = _resolve_cohort_mode(args.cohort_mode, args.n)
+    if cohort_mode == "arrow":
+        try:
+            from . import cohort_arrow  # noqa: F401
+        except ImportError as exc:
+            if args.cohort_mode == "auto":
+                print(
+                    f"  WARNING: --cohort-mode auto chose `arrow` for "
+                    f"--n={args.n}, but pyarrow is not installed; "
+                    f"falling back to `sites_list`. Install with "
+                    f"`pip install pyarrow` to use the Arrow path. "
+                    f"({exc})",
+                    file=sys.stderr,
+                )
+                cohort_mode = "sites_list"
+            else:
+                sys.exit(
+                    f"--cohort-mode arrow requires pyarrow; install "
+                    f"with `pip install pyarrow` or pass --cohort-mode "
+                    f"sites_list (supported up to n~30000)."
+                )
+    if cohort_mode == "arrow":
+        _preflight_arrow_disk_check(
+            cohort_dir, args.n, args.chr_length_mb,
+        )
+    print(
+        f"  cohort intermediate mode: {cohort_mode} "
+        f"(--cohort-mode={args.cohort_mode}, --n={args.n})",
+        file=sys.stderr,
+    )
 
     # Resume contract (Phase 5b2): load or freshly derive the cohort-
     # identity state (sample_ids, person_seeds, per-chrom overlay
@@ -865,9 +1064,20 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
         # (the parallel-chromosome ProcessPoolExecutor path was
         # removed in this phase), so ``workers`` here controls
         # within-chromosome parallelism only.
-        write_cohort_bcf_parallel(
-            chrom_bcf, args.build, sample_ids, sites,
+        # Phase 5d.1: when --cohort-mode resolves to ``arrow``, the
+        # parent's sites list is streamed to a per-chrom Arrow IPC
+        # scratch file before fanout; workers consume it via mmap.
+        # See ``_write_cohort_chrom_bcf`` for the dispatch.
+        _write_cohort_chrom_bcf(
+            mode=cohort_mode,
+            chrom=chrom,
+            chrom_bcf=chrom_bcf,
+            sites=sites,
+            sample_ids=sample_ids,
+            build=args.build,
             workers=workers,
+            cohort_dir=cohort_dir,
+            arrow_batch_size=args.cohort_arrow_batch_size,
         )
         # Record the BCF in the path list and persist completion to
         # the resume record. From this point a re-run with the same

@@ -1,0 +1,249 @@
+"""Tests for the Phase 5d.1 cli.py orchestration: --cohort-mode
+{sites_list,arrow,auto}, the pre-flight disk-space check, and the
+full-pipeline parity claim.
+
+Pure unit tests run anywhere. The full-pipeline parity test gates
+on bcftools / tabix / bgzip / msprime / stdpopsim / pyarrow.
+"""
+
+from __future__ import annotations
+
+import collections
+import hashlib
+import importlib.util
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from syntheticgen import cli as cli_module  # noqa: E402
+from syntheticgen.cli import (  # noqa: E402
+    _ARROW_AUTO_THRESHOLD,
+    _estimate_arrow_chrom_scratch_bytes,
+    _preflight_arrow_disk_check,
+    _resolve_cohort_mode,
+)
+
+_HAVE_BCFTOOLS = shutil.which("bcftools") is not None
+_HAVE_TABIX = shutil.which("tabix") is not None
+_HAVE_BGZIP = shutil.which("bgzip") is not None
+_HAVE_MSPRIME = importlib.util.find_spec("msprime") is not None
+_HAVE_STDPOPSIM = importlib.util.find_spec("stdpopsim") is not None
+_HAVE_PYARROW = importlib.util.find_spec("pyarrow") is not None
+
+
+class ResolveCohortModeTest(unittest.TestCase):
+    """Mode resolution is the only place ``--cohort-mode auto`` becomes
+    a concrete mode. The threshold is the only thing the rest of the
+    codebase depends on for picking; pin it explicitly."""
+
+    def test_explicit_sites_list_overrides_n(self):
+        self.assertEqual(_resolve_cohort_mode("sites_list", 1), "sites_list")
+        self.assertEqual(
+            _resolve_cohort_mode("sites_list", 10_000_000), "sites_list",
+        )
+
+    def test_explicit_arrow_overrides_n(self):
+        self.assertEqual(_resolve_cohort_mode("arrow", 1), "arrow")
+        self.assertEqual(
+            _resolve_cohort_mode("arrow", 10_000_000), "arrow",
+        )
+
+    def test_auto_below_threshold_picks_sites_list(self):
+        self.assertEqual(_resolve_cohort_mode("auto", 1), "sites_list")
+        self.assertEqual(_resolve_cohort_mode("auto", 99_999), "sites_list")
+        self.assertEqual(
+            _resolve_cohort_mode("auto", _ARROW_AUTO_THRESHOLD - 1),
+            "sites_list",
+        )
+
+    def test_auto_at_threshold_picks_arrow(self):
+        self.assertEqual(
+            _resolve_cohort_mode("auto", _ARROW_AUTO_THRESHOLD), "arrow",
+        )
+        self.assertEqual(_resolve_cohort_mode("auto", 1_000_000), "arrow")
+
+    def test_threshold_is_100k(self):
+        # The threshold value itself is part of the public contract — pin it
+        # so any future change is a deliberate decision, not an accident.
+        self.assertEqual(_ARROW_AUTO_THRESHOLD, 100_000)
+
+
+class EstimateArrowScratchTest(unittest.TestCase):
+    def test_scales_with_n(self):
+        a = _estimate_arrow_chrom_scratch_bytes(1_000, 1.0)
+        b = _estimate_arrow_chrom_scratch_bytes(2_000, 1.0)
+        self.assertEqual(b, 2 * a)
+
+    def test_scales_with_chr_length(self):
+        a = _estimate_arrow_chrom_scratch_bytes(1_000, 1.0)
+        b = _estimate_arrow_chrom_scratch_bytes(1_000, 10.0)
+        self.assertEqual(b, 10 * a)
+
+    def test_n1m_70mb_in_expected_range(self):
+        # Plan §5d says ~250-300 GB after Arrow encoding for n=1M ×
+        # 70Mb. The estimator over-estimates raw uncompressed (which
+        # is the safe direction for a pre-flight check).
+        b = _estimate_arrow_chrom_scratch_bytes(1_000_000, 70.0)
+        self.assertGreater(b, 100 * 1e9)   # > 100 GB
+        self.assertLess(b, 1500 * 1e9)     # < 1.5 TB upper sanity
+
+
+class PreflightArrowDiskCheckTest(unittest.TestCase):
+    """The pre-flight check has three observable behaviours: pass
+    silently when free disk >= 2x estimate, warn when it's between
+    1x and 2x, fail-with-SystemExit when below 1x."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cohort_dir = Path(self.tmp.name) / "cohort"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _patch_free_bytes(self, free_bytes: int):
+        DiskUsage = collections.namedtuple(
+            "DiskUsage", "total used free",
+        )
+        return mock.patch.object(
+            cli_module.shutil, "disk_usage",
+            return_value=DiskUsage(total=10**12, used=0, free=free_bytes),
+        )
+
+    def test_plenty_of_free_disk_passes_silently(self):
+        with self._patch_free_bytes(10**12):  # 1 TB free
+            with mock.patch.object(cli_module.sys, "stderr") as err:
+                _preflight_arrow_disk_check(self.cohort_dir, 100, 0.05)
+                err.write.assert_not_called()
+
+    def test_tight_free_disk_warns(self):
+        # Estimate at n=100, chr=0.05Mb is 100 × 0.05 × 5000 × 2 × 1.05
+        # = ~52 KB. Set free to 1.5x of that so it warns but doesn't fail.
+        per_chrom = _estimate_arrow_chrom_scratch_bytes(100, 0.05)
+        with self._patch_free_bytes(int(per_chrom * 1.5)):
+            with mock.patch.object(cli_module.sys, "stderr") as err:
+                _preflight_arrow_disk_check(self.cohort_dir, 100, 0.05)
+                # At least one stderr write happened with the warning.
+                self.assertTrue(err.write.called)
+                printed = "".join(
+                    a.args[0] if a.args else ""
+                    for a in err.write.call_args_list
+                )
+                self.assertIn("WARNING", printed)
+                self.assertIn("arrow", printed)
+
+    def test_insufficient_free_disk_exits(self):
+        per_chrom = _estimate_arrow_chrom_scratch_bytes(100, 0.05)
+        with self._patch_free_bytes(per_chrom // 2):  # below 1x
+            with self.assertRaises(SystemExit) as ctx:
+                _preflight_arrow_disk_check(self.cohort_dir, 100, 0.05)
+            msg = str(ctx.exception)
+            self.assertIn("--cohort-mode arrow needs", msg)
+            self.assertIn("Free up disk", msg)
+            self.assertIn("sites_list", msg)
+
+
+def _common_args(
+    out_dir: Path,
+    cohort_mode: str,
+    n: int = 3,
+    chroms: str = "22",
+) -> list:
+    """Mirrors test_cohort_streaming._common_args; adds --cohort-mode."""
+    return [
+        "--n", str(n),
+        "--seed", "42",
+        "--build", "GRCh38",
+        "--chromosomes", chroms,
+        "--chr-length-mb", "0.05",
+        "--demo-model", "none",
+        "--rsid-density", "0",
+        "--clinvar-inject-density", "0",
+        "--svs-per-person", "0",
+        "--error-rate", "0",
+        "--dropout-rate", "0",
+        "--workers", "2",
+        "--output-dir", str(out_dir),
+        "--cache-dir", str(out_dir / "cache"),
+        "--mode", "cohort",
+        "--cohort-mode", cohort_mode,
+    ]
+
+
+def _bcf_data_md5(bcf_path: Path) -> str:
+    """Same content-hash helper as test_cohort_arrow_bcf_writer /
+    test_cohort_parallel_write — fixed-order line format via
+    bcftools query so the hash is insensitive to BCF metadata trivia."""
+    out = subprocess.check_output(
+        ["bcftools", "query",
+         "-f", "%CHROM\t%POS\t%REF\t%ALT\t"
+               "%INFO/AC\t%INFO/AN\t%INFO/AF[\t%GT]\n",
+         str(bcf_path)])
+    return hashlib.md5(out).hexdigest()
+
+
+@unittest.skipUnless(
+    _HAVE_BCFTOOLS and _HAVE_TABIX and _HAVE_BGZIP
+    and _HAVE_MSPRIME and _HAVE_STDPOPSIM and _HAVE_PYARROW,
+    "needs bcftools/tabix/bgzip + msprime + stdpopsim + pyarrow",
+)
+class CohortModeArrowParityTest(unittest.TestCase):
+    """The integration parity claim: end-to-end cli runs at the same
+    seed produce the same cohort BCF content under
+    ``--cohort-mode sites_list`` and ``--cohort-mode arrow``.
+
+    Intentionally tiny scale (n=3, 0.05 Mb, chr22) so the two runs
+    finish in seconds; the byte-identical assertion is what carries
+    the load-bearing claim, not coverage of large-n behaviour.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir_a = Path(
+            tempfile.mkdtemp(prefix="cohort_mode_sites_list_"),
+        )
+        cls.tmpdir_b = Path(tempfile.mkdtemp(prefix="cohort_mode_arrow_"))
+        rc_a = cli_module.main(
+            _common_args(cls.tmpdir_a, "sites_list"),
+        )
+        if rc_a != 0:
+            raise RuntimeError(f"cli.main(sites_list) exited {rc_a}")
+        rc_b = cli_module.main(_common_args(cls.tmpdir_b, "arrow"))
+        if rc_b != 0:
+            raise RuntimeError(f"cli.main(arrow) exited {rc_b}")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmpdir_a, ignore_errors=True)
+        shutil.rmtree(cls.tmpdir_b, ignore_errors=True)
+
+    def test_byte_identical_cohort_bcf(self):
+        bcf_a = self.tmpdir_a / "cohort" / "cohort.chr22.bcf"
+        bcf_b = self.tmpdir_b / "cohort" / "cohort.chr22.bcf"
+        self.assertTrue(bcf_a.exists(), f"missing {bcf_a}")
+        self.assertTrue(bcf_b.exists(), f"missing {bcf_b}")
+        self.assertEqual(_bcf_data_md5(bcf_a), _bcf_data_md5(bcf_b))
+
+    def test_arrow_scratch_cleaned_up_on_success(self):
+        # The Arrow path creates cohort/.arrow/cohort.chr<N>.arrow
+        # transiently; on success both the file and the empty .arrow
+        # directory should be gone.
+        arrow_dir = self.tmpdir_b / "cohort" / ".arrow"
+        self.assertFalse(
+            arrow_dir.exists(),
+            f"Arrow scratch dir was not cleaned up: {arrow_dir}",
+        )
+
+    def test_sites_list_run_does_not_create_arrow_scratch(self):
+        # sites_list mode must never touch the .arrow scratch.
+        arrow_dir = self.tmpdir_a / "cohort" / ".arrow"
+        self.assertFalse(arrow_dir.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

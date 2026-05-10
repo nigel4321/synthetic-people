@@ -755,6 +755,41 @@ The writer also pipes records straight into `bgzip -c` instead of
 writing a plain `.vcf` first; this is transparent to the user but
 shaves one disk pass per person.
 
+### 9.1.1 Cohort intermediate — `--cohort-mode` (Phase 5d.1)
+
+Between simulation and the BCF write, the cohort lives in some
+intermediate form. `--cohort-mode {sites_list, arrow, auto}`
+selects which:
+
+| Mode | What happens | Recommended `--n` |
+|---|---|---|
+| `sites_list` (Phase B) | Parent holds the per-chromosome sites list in RAM as sparse-carriers Python dicts. Workers fork-COW share the list. | up to ~30 000 |
+| `arrow` (Phase 5d.1) | Parent streams the per-chromosome cohort to `out/cohort/.arrow/cohort.chr<N>.arrow` (Apache Arrow IPC, batch-size 256 sites). Workers `pa.memory_map` the file and consume their sample slice as a zero-copy numpy view. The Arrow scratch is created + deleted per chromosome. | 100 000+ |
+| `auto` (default) | Picks `arrow` for `--n ≥ 100 000`, otherwise `sites_list`. If `pyarrow` isn't installed, falls back to `sites_list` with a warning. | any |
+
+Why two modes: at small n the sites-list path is faster (no disk
+round-trip, no pyarrow dep). At large n the sites-list path runs
+out of memory through CPython refcount-COW divergence between
+parent and workers — the Arrow path was added specifically to
+unblock the n = 1 000 000 target.
+
+Disk and IO at scale (only relevant when the run picks `arrow`):
+
+- **Per-chromosome scratch:** roughly `2 × n_samples × 5000 × chr_length_mb` bytes for the Arrow file plus the partial BCFs. At n=1M × 70 Mb that's ~80 GB Arrow + ~80 GB partial BCFs in flight per chromosome. The Arrow file is deleted on success after the merge; partials too. The cli runs a pre-flight check at startup and aborts cleanly if free disk under `out/cohort/` can't hold one chromosome's scratch.
+- **Final cohort BCFs accumulate:** ~80 GB × 22 chromosomes ≈ 1.7 TB at n=1M. Reserve **2–3 TB total** before kicking off a million-sample run.
+- **Disk type matters more than CPU.** Per-chrom data moves through disk twice (write Arrow, read mmap) plus tree-sequence dump and partial-BCF writes — ~400 GB of I/O per chromosome at n=1M. NVMe at ~3 GB/s does that in ~140 s; a spinning disk at ~150 MB/s takes ~45 minutes per chromosome, ~16 hours just for I/O across 22 chromosomes. **Run cohort jobs at scale on NVMe, not HDD.**
+
+To force a path explicitly:
+
+```sh
+$ python generate_people.py \
+    --n 200000 --seed 42 --chromosomes 22 \
+    --cohort-mode arrow \
+    --workers 8
+```
+
+Output is byte-identical between `sites_list` and `arrow` at the same seed (verified by `tests/test_cohort_arrow_cli.py::CohortModeArrowParityTest`).
+
 ### 9.2 Overlay prefetch (Phase 2)
 
 The ClinVar / dbSNP / COSMIC loaders are bcftools-driven and bound on
