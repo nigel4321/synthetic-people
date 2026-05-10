@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fixtures import (
     PIPELINE_DIR,
+    bcftools_stats_padding_variants,
     default_cohort,
     in_range_variants,
     require_tools,
@@ -34,17 +35,32 @@ class PipelineE2ETest(unittest.TestCase):
         cls.input_dir = os.path.join(cls.tmpdir, "vcfs")
         os.makedirs(cls.input_dir)
 
-        # chr15: target variant in range.
+        # Pad each chromosome with realistic background variants so
+        # bcftools stats produces non-trivial per-sample Ts/Tv counts
+        # and MultiQC's bcftools-stats module has plottable data. See
+        # the docstring on bcftools_stats_padding_variants — the
+        # padding doesn't influence any pipeline-test assertion, which
+        # only checks named test variants (rs12913832) and chromosome
+        # metadata. Positions chosen to be disjoint from the named
+        # test variants on each chrom.
+        # chr15: target variant in range + 60 padding variants from 30 Mb.
         write_vcf(
             standard_filename(cls.input_dir, "15"),
-            "15", in_range_variants(), default_cohort(),
+            "15",
+            in_range_variants() + bcftools_stats_padding_variants(
+                "15", n=60, start=30_000_000,
+            ),
+            default_cohort(),
         )
         # chr22: does not contain chr15 → should classify as not_applicable.
         write_vcf(
             standard_filename(cls.input_dir, "22"),
             "22",
             [Variant(pos=16050075, ref="A", alt="G",
-                     af_by_pop={"ALL": 0.05})],
+                     af_by_pop={"ALL": 0.05})]
+            + bcftools_stats_padding_variants(
+                "22", n=60, start=20_000_000,
+            ),
             default_cohort(),
         )
 

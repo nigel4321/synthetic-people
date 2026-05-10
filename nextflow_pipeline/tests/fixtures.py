@@ -65,6 +65,60 @@ def default_cohort() -> SyntheticCohort:
     return SyntheticCohort()
 
 
+def bcftools_stats_padding_variants(
+    chrom: str,
+    n: int = 60,
+    start: int = 30_000_000,
+    step: int = 5_000,
+    seed: int = 0,
+) -> list[Variant]:
+    """Synthesise ``n`` background variants with a realistic
+    transition/transversion mix (~2:1) and varying allele frequencies.
+
+    bcftools stats computes its per-sample Ts/Tv ratio from the PSC
+    section; if the test cohort only has a handful of variants the
+    per-sample counts collapse to all-zeros, which makes MultiQC's
+    bcftools module raise ``ValueError: No datasets to plot`` on
+    its Ts/Tv bargraph (multiqc 1.34 doesn't guard against the
+    all-zero edge case before calling ``bargraph.plot``). Padding
+    the input VCFs with this realistic background gives bcftools
+    stats enough non-trivial PSC data for the plot to render.
+
+    None of the pipeline-test assertions depend on these padding
+    variants — they only assert on the named test variants
+    (rs12913832 etc.) and chromosome-level metadata. Padding is
+    purely there to exercise the production MULTIQC stage end-to-
+    end with realistic data shape, rather than masking edge cases
+    behind ``errorStrategy 'ignore'``.
+
+    Deterministic in ``(chrom, n, start, step, seed)``.
+    """
+    import random
+    rng = random.Random(f"bcftools-padding|{chrom}|{seed}")
+    transitions = [("A", "G"), ("G", "A"), ("C", "T"), ("T", "C")]
+    transversions = [
+        ("A", "C"), ("C", "A"), ("A", "T"), ("T", "A"),
+        ("G", "C"), ("C", "G"), ("G", "T"), ("T", "G"),
+    ]
+    out: list[Variant] = []
+    for i in range(n):
+        # ~2:1 Ti/Tv to match the human germline empirical ratio.
+        if rng.random() < 2 / 3:
+            ref, alt = rng.choice(transitions)
+        else:
+            ref, alt = rng.choice(transversions)
+        # Spread AFs across the full common-variant range so different
+        # samples carry different sites — needed for non-trivial PSC.
+        af = rng.uniform(0.05, 0.50)
+        out.append(Variant(
+            pos=start + i * step,
+            ref=ref, alt=alt,
+            variant_id=".",
+            af_by_pop={"ALL": af},
+        ))
+    return out
+
+
 def in_range_variants() -> list[Variant]:
     """chr15 with rs12913832 present at a cohort-level AF around 0.25."""
     return [
