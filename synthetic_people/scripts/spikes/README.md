@@ -28,6 +28,7 @@ learn early.
 |---|---|---|---|
 | 1 | ✅ shipped, **PASS** (2026-05-09) | OS-level: `np.memmap` + `fork` + 8 workers shares physical RAM | ~120 LOC |
 | 2 | ✅ shipped, **PASS** (2026-05-09) | `pyarrow` IPC streaming write + zero-copy mmap read across workers | ~280 LOC |
+| 2b | shipped, _not yet run_ | follow-up matrix: parent peak RSS as a function of `batch_size` × memory pool × `release_unused`-between-writes; pick a known-good default for 5d.1 | ~330 LOC |
 
 Run Spike 1 first. If it fails (workers don't share physical RAM),
 Spike 2 is moot — 5d's foundation is wrong and we rethink. If
@@ -274,6 +275,103 @@ python synthetic_people/scripts/spikes/spike2_arrow_streaming.py \
 
 The test file is overwritten each run (Arrow's IPC writer creates
 fresh files, unlike Spike 1 which reuses).
+
+## Spike 2b — pool × batch_size matrix (parent-RSS characterisation)
+
+**File:** [`spike2b_pool_batch_matrix.py`](spike2b_pool_batch_matrix.py)
+
+**Result:** _not yet run_ — paste stdout into
+`spike2b_results_<date>.txt` alongside this README and link it here
+once available.
+
+**Why this exists.** Spike 2's stress run (100k × 500k, ~46.57 GB
+Arrow file) showed parent peak RSS at 1051 MB during the streaming
+write. The growth was *sublinear* with file size (5.7× peak growth
+for a 46.5× file growth — far from "buffering the whole file"), but
+not flat. The residual is allocator high-water mark: PyArrow's
+default memory pool (jemalloc on most builds) keeps freed buffers
+in a free-list rather than returning them to the OS, plus Python's
+`pymalloc` retains arena memory at peak after large numpy
+allocations.
+
+For 5d.1 production code, we want to ship a known-good default that
+flattens this curve as much as possible without sacrificing too much
+write throughput. Spike 2b sweeps a 12-cell matrix and picks the
+best configuration empirically.
+
+**What it does:**
+
+1. **Matrix shape.** 2 pools × 3 batch sizes × 2 release_unused
+   states = 12 cells:
+   - `ARROW_DEFAULT_MEMORY_POOL` ∈ {jemalloc, system}
+   - `--batch-size` ∈ {256, 1024, 4096}
+   - `pa.default_memory_pool().release_unused()` after each
+     `write_batch()`: {off, on}
+2. **Per-cell isolation.** Each cell runs in a fresh subprocess so
+   pool state starts clean — pyarrow's pool is a process-global
+   singleton and would otherwise carry high-water mark across cells.
+3. **Per-cell payload.** Default scale: 50k samples × 200k sites
+   = ~10 GB Arrow file. Big enough to amortise allocator effects
+   above noise; small enough that the full 12-cell matrix finishes
+   in roughly 15 minutes on a workstation. Schema matches Spike 2:
+   `pos int64 | genotypes FixedSizeList(int8, n_samples)`.
+4. **Per-cell measurement.** Background thread samples parent RSS
+   every 200 ms during the streaming write. Reports baseline / peak
+   / growth / write throughput.
+5. **Cleanup.** Arrow file deleted after each cell (12 × 10 GB =
+   120 GB if kept). Path can be relocated via `--path-dir`.
+
+**What we want to learn:**
+
+- Which pool keeps parent RSS lowest? (Hypothesis: `system`, at the
+  cost of throughput.)
+- Does smaller `batch_size` flatten peak RSS, and at what throughput
+  cost? (Hypothesis: smaller batch → lower peak, modest throughput
+  hit.)
+- Does `release_unused()` between writes meaningfully reduce peak
+  RSS on the jemalloc default? (Hypothesis: yes; on the system
+  pool it's a no-op.)
+- Is there a "free lunch" cell (low peak + good throughput)? If yes,
+  ship it as the 5d.1 default.
+
+**Output:** a summary table + automatic "lowest peak growth" and
+"fastest write" picks.
+
+### How to run
+
+```bash
+# defaults: 50k × 200k = ~10 GB per cell, 12 cells, ~15 min total
+python synthetic_people/scripts/spikes/spike2b_pool_batch_matrix.py
+
+# faster smoke (smaller scale; useful to confirm the script runs end-
+# to-end on this host before committing to the full matrix)
+python synthetic_people/scripts/spikes/spike2b_pool_batch_matrix.py \
+    --samples 20000 --sites 50000
+
+# stress-scale matrix (matches the Spike 2 stress run; ~3-4 hours)
+python synthetic_people/scripts/spikes/spike2b_pool_batch_matrix.py \
+    --samples 100000 --sites 500000
+
+# alternate path (fast NVMe etc.)
+python synthetic_people/scripts/spikes/spike2b_pool_batch_matrix.py \
+    --path-dir /mnt/nvme
+
+# narrower matrix (omit release_unused axis → 6 cells)
+python synthetic_people/scripts/spikes/spike2b_pool_batch_matrix.py \
+    --no-release-unused-axis
+```
+
+Requires `pyarrow` to be installed in the active env. Exits 3 with a
+clear message if it isn't.
+
+### Decision tree after Spike 2b
+
+| Result | Action |
+|---|---|
+| One cell wins on both peak RSS and throughput | Lock that as the 5d.1 default. Document in plan. |
+| Tradeoff frontier (low-peak vs high-throughput) | Pick based on n=1M extrapolation: at n=1M, predicted peak in the worst cell is what matters; pick the lowest-peak cell that still meets the throughput target. |
+| All cells indistinguishable | Allocator effects are not the dominant cost; the residual must be Python pymalloc or per-batch numpy allocations. Investigate batch construction in 5d.1 (e.g., reuse pre-allocated numpy buffers across batches). |
+| One pool fails entirely (not compiled in) | Driver records the failure cell-by-cell; matrix continues with the remaining pool. |
 
 ## Recording results
 
