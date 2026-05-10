@@ -1,0 +1,135 @@
+Spike 2 stress result — 2026-05-10  (--samples 100000 --sites 500000)
+
+Script auto-verdict: PASS on mmap-share, WARN on write throughput,
+WARN on read throughput, FAIL on parent peak RSS.
+
+Architectural verdict (human reviewer): the load-bearing assumption
+holds at 50× scale. The script's FAIL is a too-strict absolute
+threshold; the real number — parent RSS growth as a function of
+file size — is sublinear and consistent with streaming. Throughput
+WARNs reflect host disk type, not Arrow. 5d.1 green light unchanged;
+two follow-up actions identified.
+
+Headline numbers vs the 2026-05-09 small run (10k × 100k, ~1 GB):
+
+  Arrow file size:           46.57 GB    (vs 1 GB; 46.5× larger)
+  Parent peak RSS during
+    streaming write:         1051 MB     (vs 184 MB; 5.7× larger)
+  System RAM delta during
+    8-worker mmap-read:      +0.39 GB    (vs +0.01 GB)
+  Apparent per-worker RSS
+    sum:                     203.97 GB   (vs 7.83 GB)
+  Apparent-to-physical ratio: ~520:1     (vs ~700:1)
+  Write throughput:          157 MB/s    (vs 245 MB/s)
+  Aggregate read throughput: 465 MB/s    (vs 1,355 MB/s)
+  Per-worker iter time:      102.20 s    (vs 0.69 s; 50× sites)
+
+Reading each warning/fail in turn:
+
+1. Parent peak RSS 1051 MB vs 500 MB threshold — FAIL by script.
+   Parent RSS grew 5.7× while file size grew 46.5×. Sublinear, not
+   file-size-proportional. If pyarrow.ipc.new_file were buffering
+   the file before flushing, parent RSS would be ≈ 46 GB. It is
+   ~2% of that. The 500 MB absolute threshold was written with the
+   1 GB file in mind; the right test at 46 GB is "does parent RSS
+   scale with file size?" — answer: yes, but at ~2% the rate.
+   Streaming holds in the load-bearing sense.
+
+   Likely cause: PyArrow memory-pool retention (jemalloc free-list
+   keeps freed buffers rather than returning to OS) plus Python
+   allocator high-water mark from per-batch numpy creation. Bounded
+   growth, not buffering. Configurable via
+   `pa.default_memory_pool().release_unused()` after each
+   `write_batch`, or `PYARROW_DEFAULT_MEMORY_POOL=system`.
+
+   Implication for n=1M: ~3000 batches per chromosome at 1024 sites;
+   linear extrapolation suggests parent peak ≈ 6 GB. Tolerable on a
+   32 GB host but worth flattening before 5d.1 lands.
+
+   Action: small follow-up sub-spike before 5d.1 build — vary
+   batch_size {256, 1024, 4096} × pool {jemalloc, system} on a
+   moderate-scale run, identify the knob that flattens parent RSS.
+
+2. Write throughput 157 MB/s vs 200 MB/s target — WARN by script.
+   /tmp on this host is /dev/root (OS boot disk), not NVMe. At
+   n=1M per-chrom Arrow file is ~80 GB; at 157 MB/s that's ~9 min
+   per chromosome write. Across 22 chromosomes: ~3.3 hours of pure
+   write I/O. Tolerable on a workstation; production runs at n=1M
+   need NVMe (the plan already calls this out — this run is the
+   empirical confirmation).
+
+3. Aggregate read throughput 465 MB/s vs 500 MB/s target — WARN by
+   script. 8 workers × 58 MB/s. Disk-bound: 46 GB file > 32 GB host
+   RAM, so the page cache cannot hold the whole file and workers
+   incur cold reads for the bulk of it. The small run's 1,355 MB/s
+   came from 1 GB fitting fully in page cache. Same disk-type
+   caveat as #2, not a 5d issue.
+
+4. mmap-share PASS — the load-bearing test. System RAM delta
+   +0.39 GB during the 8-worker phase, against a 372.56 GB
+   worst-case if no sharing. Workers each report ~25 GB RSS while
+   physical use is essentially zero — apparent-to-physical ratio
+   ~520:1. The refcount-COW divergence that killed Phase 5e Phase A
+   does not appear, even with 500k sites of realistic per-site
+   Python iteration. This is the architectural bet for 5d and it
+   survives the 50× scale-up cleanly.
+
+Bottom line: 5d.1 green light unchanged. Two follow-ups identified:
+
+  (a) Sub-spike to characterise parent-RSS vs (batch_size, pool)
+      before 5d.1 build, so 5d.1 ships with a known-good default.
+  (b) Tighten spike2's FAIL/WARN logic — the 500 MB absolute
+      threshold should become a "growth rate vs file size" test so
+      future big runs don't false-fail on monotone allocator
+      high-water mark.
+
+--- Raw stdout from the run ---
+
+=== Phase 1: Streaming write ===
+  schema: pos int64 | genotypes FixedSizeList(int8, 100000)
+  sites: 500,000  batch_size: 1024  n_batches: 489
+  expected raw GT bytes: 46.57 GB
+
+  wrote: 489 batches  file_size = 46.57 GB
+  elapsed: 303.86 s
+  write throughput (logical): 157 MB/s
+  parent baseline RSS: 65 MB
+  parent peak RSS during write: 1051 MB
+  parent RSS growth during write: +986 MB
+
+=== Phase 2: Worker mmap-read ===
+  forking 8 workers; each reads sample slice of 12500 columns
+  worker iteration: per-site Python loop (realistic 5d.1 worker pattern)
+  baseline system RAM: used = 0.96 GB  available = 30.34 GB
+
+  all workers done in 102.54 s
+
+  per-worker:
+    worker 0: sites=500000  alt_total=312506601  bytes_read=5960 MB  elapsed=102.20 s  thr=58 MB/s  RSS=25.30 GB
+    worker 1: sites=500000  alt_total=312508134  bytes_read=5960 MB  elapsed=102.20 s  thr=58 MB/s  RSS=25.35 GB
+    worker 2: sites=500000  alt_total=312497374  bytes_read=5960 MB  elapsed=102.20 s  thr=58 MB/s  RSS=25.41 GB
+    worker 3: sites=500000  alt_total=312519749  bytes_read=5960 MB  elapsed=102.20 s  thr=58 MB/s  RSS=25.73 GB
+    worker 4: sites=500000  alt_total=312511252  bytes_read=5960 MB  elapsed=102.20 s  thr=58 MB/s  RSS=25.91 GB
+    worker 5: sites=500000  alt_total=312494076  bytes_read=5960 MB  elapsed=102.20 s  thr=58 MB/s  RSS=25.55 GB
+    worker 6: sites=500000  alt_total=312482293  bytes_read=5960 MB  elapsed=102.20 s  thr=58 MB/s  RSS=25.41 GB
+    worker 7: sites=500000  alt_total=312500182  bytes_read=5960 MB  elapsed=102.19 s  thr=58 MB/s  RSS=25.32 GB
+
+  aggregate read throughput: 465 MB/s
+  sum of per-worker reported RSS (apparent): 203.97 GB
+
+  system RAM during worker phase:
+    baseline used:        0.96 GB
+    peak used:            1.35 GB
+    delta:                +0.39 GB
+    file size:            46.57 GB
+    n_workers × file:     372.56 GB (if no sharing)
+
+=== VERDICT ===
+  PASS: system RAM delta = 0.39 GB < 69.85 GB threshold (mmap shares cleanly across workers).
+
+  WARN: write throughput 157 MB/s below 200 MB/s NVMe target. At n=1M this becomes the bottleneck.
+  WARN: aggregate read throughput 465 MB/s below 500 MB/s target. At n=1M workers may not finish in reasonable time.
+  FAIL: parent peak RSS during streaming write was 1051 MB, exceeds 500 MB threshold. pyarrow.ipc.new_file may be buffering instead of streaming.
+
+  Phase 5d Arrow assumptions DO NOT FULLY HOLD on this host.
+  See README.md for fail-mode-specific guidance.
