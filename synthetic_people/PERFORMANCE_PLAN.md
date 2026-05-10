@@ -1630,6 +1630,17 @@ this host class" rather than "every implementation detail is
 solved." Implementation-time discoveries are still possible; budget
 for them.
 
+A follow-up sub-spike ([`spike2b_pool_batch_matrix.py`](scripts/spikes/spike2b_pool_batch_matrix.py)
+/ [results](scripts/spikes/spike2b_results_2026-05-10.txt))
+characterised parent peak RSS during the streaming write as a
+function of `batch_size`, memory pool, and `release_unused()`-
+between-writes. Findings: `batch_size` is the only knob that
+materially affects parent peak; pool choice (jemalloc vs system) and
+`release_unused()` calls are noise. **Decision for 5d.1:**
+`batch_size = 256`, default memory pool, no `release_unused()`
+calls. The 5d task list and architecture pseudocode below reflect
+this default.
+
 ### Why Apache Arrow IPC
 
 Several mmap-able binary formats could work (custom struct format,
@@ -1679,9 +1690,11 @@ Parent (per chromosome):
          "scratch/chrom_N.cohort.arrow",
          schema=cohort_schema(n_samples)) as writer:
          for batch in stream_variants_to_arrow_batches(
-                          ts, batch_size=1024):
+                          ts, batch_size=256):
              writer.write_batch(batch)
-     # Parent RSS stays O(batch_size × n_samples × 1 byte) ≈ a few MB
+     # Parent peak RSS during write ≈ ~9.5 bytes/element × batch_size
+     # × n_samples (Spike 2b empirical fit). At batch_size=256:
+     # n=10k → ~25 MB,  n=100k → ~250 MB,  n=1M → ~2.5 GB.
   5. Signal workers to start.
 
 Workers (each, in parallel):
@@ -1817,10 +1830,15 @@ applies cleanly.
     slice; carriers-as-list is sparser-on-disk but workers must
     re-densify. **Tentative choice: per-sample int8 columns** —
     matches Arrow's mmap-slice strength.
-  - `stream_variants_to_arrow_batches(ts, batch_size=1024) ->
+  - `stream_variants_to_arrow_batches(ts, batch_size=256) ->
     Iterator[RecordBatch]`: walks `ts.variants()` once, emits
-    one batch every 1024 variants. Memory bound: O(batch_size ×
-    n_samples × 1 byte) per batch.
+    one batch every 256 variants. Default chosen empirically from
+    Spike 2b ([results](scripts/spikes/spike2b_results_2026-05-10.txt)):
+    `batch_size` is the only knob that materially affects parent
+    peak RSS, and 256 keeps the predicted peak at n=1M to ~2.5 GB
+    vs ~9.4 GB at 1024 / ~37 GB at 4096, for a ~7% throughput cost.
+    Memory bound (empirical fit): ~9.5 bytes/element × batch_size
+    × n_samples per batch.
   - `read_slice(arrow_path, sample_lo, sample_hi) -> Table`:
     mmap-open + project columns. Workers' entry point.
 - [ ] **`cli.py`:** new orchestration path gated on `--cohort-mode
