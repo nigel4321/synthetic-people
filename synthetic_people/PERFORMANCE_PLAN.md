@@ -1850,6 +1850,66 @@ applies cleanly.
   fast disk + 2-3 TB free; cloud-instance disk-type guidance.
   `--help` updates for `--cohort-mode` if surfaced.
 
+### Phase 5d persistent regressions (track and verify post-merge)
+
+5d eliminates most of the Phase B regressions for free — parent walks
+the tree exactly once during the Arrow stream-write, so workers
+never re-walk. That removes Phase B trade-offs **#1 (CPU
+duplication)**, **#2 (overlay-in-workers determinism contract)**,
+**#3 (AC-across-slices reconstruction)**, and **#8 (apparent-RSS
+inflation per worker)**. The list below is what *does* persist into
+5d and needs deliberate handling — captured here so we don't lose
+them when 5d.1 implementation begins.
+
+1. **Site-ordering source-of-truth moves.** Phase A: parent sorts
+   the in-memory sites list once. 5d.1: parent writes Arrow in
+   tree-position order; `bcftools merge` re-sorts on
+   `(chrom, pos, ref, alt)`. Functionally equivalent, but a
+   behaviour change vs Phase A that could surface ordering-sensitive
+   bugs in overlay code or downstream consumers.
+   - **Action:** add a regression test asserting full pipeline
+     produces byte-identical BCF (after `bcftools query` field
+     normalisation) under W ∈ {1, 2, 4, 8} on a small fixture.
+2. **Sparse `carriers` list as a pickle-able debugging artifact
+   disappears.** Phase A keeps a Python-pickleable in-memory
+   carriers list that downstream diagnostics can introspect. 5d.1
+   never materialises it — the on-disk Arrow file is the
+   source-of-truth instead. Strictly *better* observability than
+   Phase B (full GTs are recoverable per-site by re-mmap-ing the
+   Arrow file), but anything that called `pickle.dump(sites_list)`
+   for diagnostics needs to migrate to the Arrow file.
+   - **Action:** audit any debugging / diagnostic code paths that
+     consume the in-memory sites list. Provide a small
+     `read_arrow_carriers(arrow_path, pos)` helper if the audit
+     finds real consumers.
+3. **Test refactoring surface (larger than Phase B's).** Several
+   tests build a sites list manually and feed it to
+   `CohortBcfWriter`. Phase B was estimated at ~150 LOC of test
+   work; 5d.1 is bigger because we're introducing
+   `CohortBcfWriter.from_arrow_slice(...)` as a new constructor.
+   Either keep the manual-list path supported as an *optional* test
+   input or migrate the affected tests to write a small Arrow
+   fixture.
+   - **Action:** during 5d.1 implementation, decide between
+     dual-path support and full migration; document the call in the
+     PR.
+4. **Admixture path needs separate refactoring.**
+   `admixture.simulate_cohort` emits per-person ancestry segments
+   alongside cohort sites. Under the 5d.1 single-walker streaming
+   design, ancestry segments come out alongside the variant stream
+   in the parent — but the schema and downstream merge for ancestry
+   is not yet designed. Land 5d.1 for the non-admixture path first,
+   then mirror.
+   - **Action:** track as a separate follow-up PR after 5d.1 lands.
+     Same disposition as Phase B's admixture follow-up.
+
+**Out-of-scope reminder (not a 5d regression — separate):** the
+optional 5g.3 follow-up that numpy-vectorises `draw_site_quality`
+*does* break bit-exact reproducibility (numpy RNG ≠ Python
+`random.Random`). That regression is independent of which cohort-
+phase architecture ships and lives or dies on its own product call.
+Tracked in §5g.3.
+
 ### Phase 5d.2 tasks (optional, after 5d.1 measurements)
 
 - [ ] **Branch:** `perf/phase5d2-pysam-bcf-write` off main (after
