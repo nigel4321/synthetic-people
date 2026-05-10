@@ -12,6 +12,14 @@ multiqc>=1.18
 numpy>=1.24
 scikit-learn>=1.3
 matplotlib>=3.7
+# rich 15.0 dropped the implicit ``rich.panel`` submodule re-export from
+# ``rich/__init__.py``. multiqc 1.34 (current latest) still accesses
+# ``rich.panel.Panel(...)`` directly inside its exception-rendering path,
+# so a primary MultiQC error (e.g. "No datasets to plot" on tiny test
+# fixtures) cascades into ``AttributeError: module 'rich' has no
+# attribute 'panel'`` and obscures the diagnosis. Pin to <15 until
+# multiqc upgrades its rich usage.
+rich<15
 
 # System binaries required on PATH (invoked via subprocess, not installable
 # via pip):
