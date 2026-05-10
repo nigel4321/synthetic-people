@@ -705,6 +705,14 @@ Scaling rules of thumb:
   (extra demography + per-haplotype tree walks).
 - Validation (`validate_batch.py`) builds a full dosage matrix in RAM;
   drop `--ld-pairs-per-bin` to 1000 if you're tight.
+- **Beyond `--n 30 000` the in-RAM sites-list path stops working**
+  (CPython refcount-COW divergence across forked workers; see
+  `PERFORMANCE_PLAN.md` §5d for the diagnosis). The `--cohort-mode
+  arrow` path detailed in §9.1.1 below replaces the in-RAM hand-off
+  with a memory-mapped Arrow IPC scratch file per chromosome, makes
+  peak parent RSS bounded as `n` grows, and is what unblocks the
+  100 000+ scale target. `--cohort-mode auto` (the default) picks it
+  for `--n >= 100 000` automatically; `pip install pyarrow` first.
 
 ### 9.1 Worker processes (Phase 1, updated by Phase 5e)
 
@@ -756,6 +764,12 @@ writing a plain `.vcf` first; this is transparent to the user but
 shaves one disk pass per person.
 
 ### 9.1.1 Cohort intermediate — `--cohort-mode` (Phase 5d.1)
+
+> **Install first:** the Arrow path needs `pyarrow`, which isn't in
+> `requirements.txt`. Run `.venv/bin/pip install pyarrow` once if
+> you'll be running with `--n >= 100 000` or passing
+> `--cohort-mode arrow` explicitly. Without it, `--cohort-mode auto`
+> falls back to `sites_list` and prints a one-line warning.
 
 Between simulation and the BCF write, the cohort lives in some
 intermediate form. `--cohort-mode {sites_list, arrow, auto}`

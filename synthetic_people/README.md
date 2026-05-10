@@ -69,6 +69,19 @@ python3 -m venv .venv
 | `matplotlib>=3.7`, `scikit-allel>=1.3` | M10 | LD decay r² + cohort PCA + plot artefacts |
 | `scikit-learn>=1.3` (transitive) | M10 | PCA decomposition for the cohort matrix |
 
+**Optional dep — `pyarrow` (cohort scale ≥ n=100 000):**
+
+```bash
+.venv/bin/pip install pyarrow
+```
+
+Required only when `--cohort-mode` resolves to `arrow` (the auto-pick
+above `--n 100000`, or any explicit `--cohort-mode arrow`). The default
+`--cohort-mode auto` falls back to the in-RAM `sites_list` path with
+a one-line warning when pyarrow is missing, so runs at smaller `n`
+keep working without it. See TUTORIAL.md §9.1.1 for the mode picker
+details and at-scale disk requirements.
+
 Probe the environment:
 
 ```bash
@@ -930,6 +943,10 @@ Tracked in `IMPLEMENTATION_PLAN.md`:
 | `--af-min` | [legacy] Minimum AF when loading the pool | `0.05` |
 | `--sfs-alpha` | [legacy] Power-law exponent for the SFS | `2.0` |
 | `--workers` | [perf] Worker processes for the parallel cohort BCF write (sample-slice, post-5e) and the per-person fan-out. `0` = auto (`os.cpu_count()`), `1` = serial. msprime simulation itself is single-threaded and runs serially across chromosomes regardless of `--workers`. Linux only. | `0` |
+| `--cohort-mode` | [perf, Phase 5d.1] Cohort intermediate between simulation and BCF write: `sites_list` (in-RAM, n ≤ 30 000), `arrow` (mmap'd Arrow IPC scratch file, required for n ≥ 100 000, needs `pip install pyarrow`), or `auto`. See TUTORIAL.md §9.1.1. | `auto` |
+| `--cohort-arrow-batch-size` | [perf, Phase 5d.1] Sites per Arrow record batch when `--cohort-mode` resolves to `arrow`. Default identified empirically (parent peak RSS ≈ 9.5 bytes × batch_size × n_haplotypes per batch). Don't change unless characterising a specific host. | `256` |
+| `--fanout-batch-size` | [perf] Persons grouped into one `bcftools query` invocation during the per-person VCF fan-out. Larger batches reduce subprocess overhead; smaller batches reduce the parent's batch RSS. Binding RAM ceiling is `(parent_baseline + B × per_person) × workers`. | `4` |
 | `--mode` | [perf] Output shape: `per-person` (default), `cohort` (skip per-person fan-out), or `both`. All three flow through the streamed cohort pipeline — derive per-person VCFs later via `bcftools view -s` against the per-chrom cohort BCFs. | `per-person` |
 | `--no-resume` | [perf] Ignore any existing `cohort.meta.json` + cohort BCFs and start a fresh simulation. Default behaviour resumes a prior run when its params match. | `False` |
 | `--chr-chunk-mb` | [perf] Split each chromosome's msprime simulation into independent sub-chunks of this size (Mb). `0` = auto-pick from `psutil.virtual_memory().available` and `--workers`. Cross-chunk LD is lost (chunks simulate independently); short-range LD within chunks is preserved. | `0` (auto) |
+| `--profile-memory` | [perf, diagnostic] Sample RSS to a TSV at this path, ~1 s cadence plus labelled marks at phase boundaries (sim start, chrom yielded, BCF written, etc.). Useful for OOM postmortems and peak-RSS plots. | `None` (off) |
