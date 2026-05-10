@@ -493,3 +493,172 @@ def write_cohort_bcf_parallel(out_path: Path, build: str,
             partials_dir.parent.rmdir()
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Phase 5d.1 — parallel cohort BCF write from Arrow IPC source
+# ---------------------------------------------------------------------------
+#
+# Sibling of ``write_cohort_bcf_parallel`` that doesn't take the
+# sites list in RAM. Each worker memory-maps its sample slice from
+# the Arrow IPC intermediate produced by ``cohort_arrow.write_
+# arrow_file`` instead of fork-inheriting the parent's sites list.
+# That removes the CPython refcount-COW divergence that killed
+# Phase 5e Phase A at n=3000+ (see PERFORMANCE_PLAN.md §5e), and
+# unblocks the path to n=1M.
+#
+# At small n the Phase B sites-list path is still preferred —
+# avoids the disk write+read round-trip and the pyarrow dep — so
+# this function is the *capability*; the cli.py layer (PR 3) picks
+# between the two based on cohort size or an explicit user flag.
+
+_COHORT_ARROW_STATE: dict = {}
+
+
+def _arrow_partial_writer_target(slice_idx: int) -> None:
+    """Worker entry point — writes one sample-slice partial BCF
+    sourced from the parent's Arrow IPC intermediate.
+
+    Mirrors :func:`_partial_writer_target` for the Arrow source
+    case. The shared inputs (``arrow_path`` / ``sample_ids`` /
+    ``build`` / per-slice paths) are inherited via fork through
+    ``_COHORT_ARROW_STATE``; only the slice index crosses the task
+    boundary.
+
+    The site stream comes from :func:`cohort_arrow.read_arrow_slice`,
+    which mmap's the file and yields site dicts with ``gts``
+    pre-sliced to ``[sample_lo, sample_hi)``. Those plug straight
+    into :class:`CohortBcfWriter`'s legacy ``gts`` path —
+    no writer changes are needed for this consumer.
+    """
+    state = _COHORT_ARROW_STATE
+    out_path = state["partial_paths"][slice_idx]
+    slice_lo, slice_hi = state["slices"][slice_idx]
+    full_sample_ids = state["sample_ids"]
+    arrow_path = state["arrow_path"]
+    slice_sample_ids = full_sample_ids[slice_lo:slice_hi]
+
+    from .cohort_arrow import read_arrow_slice
+
+    with CohortBcfWriter(
+        out_path, state["build"], slice_sample_ids,
+        sample_slice=(slice_lo, slice_hi),
+        cohort_size=len(full_sample_ids),
+    ) as w:
+        w.write_sites(read_arrow_slice(arrow_path, slice_lo, slice_hi))
+
+
+def write_cohort_bcf_parallel_from_arrow(
+    arrow_path: Path,
+    out_path: Path,
+    build: str,
+    sample_ids: list[str],
+    workers: int,
+) -> None:
+    """Phase 5d.1: write a cohort BCF from an Arrow IPC source using
+    ``workers`` parallel sample-slice writers + a final
+    ``bcftools merge``.
+
+    The non-Arrow sibling :func:`write_cohort_bcf_parallel` requires
+    the parent to hold the cohort's sites list in RAM. That works up
+    to n ~30k and then breaks (refcount-COW divergence). This
+    function takes the same orchestration shape but sources sites
+    from a memory-mapped Arrow IPC file:
+
+      * Parent must already have written the file via
+        :func:`syntheticgen.cohort_arrow.write_arrow_file`.
+      * Workers ``pa.memory_map`` the file and iterate their slice's
+        columns as zero-copy numpy views — no per-worker copy of
+        the variant set.
+      * Output equivalence with the sites-list path: the merged BCF
+        contains the same sites in the same order with the same
+        per-sample columns. ``bcftools merge`` is deterministic
+        given identical partial inputs.
+
+    Falls back to a single in-process write when ``workers <= 1`` or
+    ``len(sample_ids) <= 1`` — at that scale the parallel
+    orchestration costs more than it saves.
+
+    Side effects mirror :func:`write_cohort_bcf_parallel`:
+    ``.partials/<bcf-stem>/`` is created during the write and
+    cleaned up on success; on failure the partials are left in
+    place for postmortem.
+
+    The caller is responsible for the Arrow file's lifecycle
+    (creation before, deletion after if desired). This function
+    does not touch the Arrow file beyond reading it.
+    """
+    n_samples = len(sample_ids)
+    arrow_path = Path(arrow_path)
+
+    if workers <= 1 or n_samples <= 1:
+        from .cohort_arrow import read_arrow_slice
+        with CohortBcfWriter(out_path, build, sample_ids) as w:
+            w.write_sites(read_arrow_slice(arrow_path, 0, n_samples))
+        return
+
+    slices = _split_into_slices(n_samples, workers)
+    if len(slices) <= 1:
+        # workers > n_samples — only one non-empty slice would
+        # exist; serial write is simpler.
+        from .cohort_arrow import read_arrow_slice
+        with CohortBcfWriter(out_path, build, sample_ids) as w:
+            w.write_sites(read_arrow_slice(arrow_path, 0, n_samples))
+        return
+
+    out_path = Path(out_path)
+    partials_dir = out_path.parent / ".partials" / out_path.stem
+    partials_dir.mkdir(parents=True, exist_ok=True)
+    partial_paths = [
+        partials_dir / f"slice_{i:03d}.bcf"
+        for i in range(len(slices))
+    ]
+
+    _COHORT_ARROW_STATE.update({
+        "partial_paths": partial_paths,
+        "slices": slices,
+        "sample_ids": sample_ids,
+        "arrow_path": arrow_path,
+        "build": build,
+    })
+    try:
+        ctx = mp.get_context("fork")
+        with ProcessPoolExecutor(max_workers=len(slices),
+                                 mp_context=ctx) as ex:
+            futures = [
+                ex.submit(_arrow_partial_writer_target, i)
+                for i in range(len(slices))
+            ]
+            for fut in futures:
+                fut.result()
+    finally:
+        _COHORT_ARROW_STATE.clear()
+
+    merge_cmd = [
+        "bcftools", "merge", "-O", "b",
+        "-o", str(out_path),
+        *[str(p) for p in partial_paths],
+    ]
+    merge_proc = subprocess.run(merge_cmd, capture_output=True)
+    if merge_proc.returncode != 0:
+        stderr = merge_proc.stderr.decode("utf-8",
+                                          errors="replace").strip()
+        raise RuntimeError(
+            f"bcftools merge exited {merge_proc.returncode} writing "
+            f"{out_path}: {stderr[-500:] or '(no stderr)'}"
+        )
+    subprocess.run(
+        ["bcftools", "index", "-f", str(out_path)],
+        check=True, capture_output=True,
+    )
+
+    for p in partial_paths:
+        for path in (p, Path(str(p) + ".csi")):
+            if path.exists():
+                path.unlink()
+    try:
+        partials_dir.rmdir()
+        if not any(partials_dir.parent.iterdir()):
+            partials_dir.parent.rmdir()
+    except OSError:
+        pass
