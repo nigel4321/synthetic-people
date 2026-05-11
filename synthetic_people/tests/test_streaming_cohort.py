@@ -74,8 +74,12 @@ def _materialised_path(ts, chrom: str, n_people: int, *,
     sites = _tree_sequence_to_sites(
         ts, chrom, n_people, rng, DEFAULT_TARGET_TITV,
     )
+    # Match the streamer's contract: overlay_rng defaults to the main
+    # rng when no overlay seed is provided. Without this default, the
+    # injectors below would receive ``None`` and raise on
+    # ``None.shuffle``/``sample`` if any injection density were > 0.
     overlay_rng = (random.Random(overlay_rng_seed)
-                   if overlay_rng_seed is not None else None)
+                   if overlay_rng_seed is not None else rng)
     if clinvar_records:
         annotate_clinvar(sites, clinvar_records)
         if clinvar_inject_density > 0:
@@ -112,8 +116,12 @@ def _streamed_path(ts, chrom: str, n_people: int, *,
     from syntheticgen.titv import DEFAULT_TARGET_TITV
 
     rng = random.Random(rng_seed)
+    # Mirror the materialised helper above: default overlay_rng to the
+    # main rng when no overlay seed is provided. ``stream_cohort_sites``
+    # already does this internally; passing ``None`` here is harmless
+    # but explicit is clearer.
     overlay_rng = (random.Random(overlay_rng_seed)
-                   if overlay_rng_seed is not None else None)
+                   if overlay_rng_seed is not None else rng)
     return list(stream_cohort_sites(
         ts, chrom, n_people, rng,
         DEFAULT_TARGET_TITV,
@@ -420,6 +428,134 @@ class StreamPosMonotoneTest(unittest.TestCase):
         self.assertEqual(positions, sorted(positions),
                          "streaming path must emit sites in pos-sorted "
                          "order even under heavy overlay injection")
+
+
+@unittest.skipUnless(_HAVE_MSPRIME, "msprime not installed")
+class StreamPosSortWithOutOfOrderOverlaysRegressionTest(unittest.TestCase):
+    """Regression test for the PR #51 Copilot review finding: the
+    safe-yield bound in ``_stream_cohort_pass2`` looked up
+    ``overlay_positions_sorted[overlay_next_idx]`` where the array was
+    sorted by *position* but the index counted overlays in tree-walk
+    order. The look-up could report a future-min larger than the
+    actual smallest un-encountered overlay pos, letting tree sites
+    yield ahead of overlay sites and breaking pos-sortedness.
+
+    The fix uses a suffix-min over overlays sorted by *accepted_idx*.
+    This test constructs an inject_map that explicitly trips the
+    pre-fix algorithm (high-pos overlay at early idx, low-pos overlay
+    at later idx) and asserts the output is still pos-sorted."""
+
+    def test_pos_sorted_when_first_overlay_high_later_overlay_low(self):
+        from syntheticgen.coalescent import (
+            _tree_sequence_to_sites_meta,
+            _stream_cohort_pass2,
+        )
+        from syntheticgen.titv import DEFAULT_TARGET_TITV
+
+        # Seed 4 with this fixture shape was the concrete repro
+        # produced during the PR #51 review investigation.
+        ts = _build_tree_sequence(
+            n_people=4, length_bp=300_000, seed=4,
+        )
+        rng = random.Random(4)
+        meta = _tree_sequence_to_sites_meta(
+            ts, "22", 4, rng, DEFAULT_TARGET_TITV,
+        )
+        self.assertGreaterEqual(len(meta), 4,
+            "fixture must produce at least 4 sites to exercise the "
+            "high-then-low overlay-pos pattern")
+
+        # Synthetic inject_map: idx 1 -> very high pos, idx 3 -> low pos.
+        # The pre-fix algorithm would yield the tree site at meta[2]'s
+        # pos before seeing the idx-3 overlay at a smaller pos.
+        tree_positions = [m[1] for m in meta]
+        high_pos = tree_positions[3] + 1000
+        low_pos = max(1, tree_positions[1] - 5)
+        inject_map = {
+            1: {"pos": high_pos, "ref": "A", "alts": ["G"], "id": "."},
+            3: {"pos": low_pos, "ref": "A", "alts": ["G"], "id": "."},
+        }
+
+        rng2 = random.Random(4)
+        sites = list(_stream_cohort_pass2(
+            ts, "22", 4, rng2, DEFAULT_TARGET_TITV,
+            meta, inject_map, {},
+        ))
+        positions = [s["pos"] for s in sites]
+        self.assertEqual(
+            positions, sorted(positions),
+            f"streaming output must remain pos-sorted under out-of-"
+            f"order overlay positions; got {positions}",
+        )
+
+
+@unittest.skipUnless(_HAVE_MSPRIME, "msprime not installed")
+class StreamCohortChainedOverlayParityAtScaleTest(unittest.TestCase):
+    """Regression test for the PR #51 Copilot review finding on
+    chained overlays.
+
+    The materialised path sorts the sites list inside ``inject_*``
+    after each mutation, so the next planner's ``used_keys`` and
+    ``reserve_indices`` come from the post-sort view. PR #51's first
+    draft of the streaming pipeline ran all planners against the
+    original tree-walk-order ``sites_meta``, which diverged on
+    chained overlays at large enough scale.
+
+    The previous small-fixture parity tests (n=6, 200 kb, density
+    0.04) failed to expose this — they typically produced only ~2
+    injections per overlay, too few to trigger a chained divergence.
+    These tests run at n=20, 1 Mb, density 0.10 across multiple seeds
+    so the bug, if reintroduced, fails loudly."""
+
+    def setUp(self):
+        self.ts = _build_tree_sequence(
+            n_people=20, length_bp=1_000_000, seed=42,
+        )
+        self.chrom = "22"
+        self.n_people = 20
+        self.clinvar = _clinvar_recs_on_chrom(
+            self.chrom, range(50_000, 1_000_000, 7_500),
+        )
+        self.rsids = _rsid_recs_on_chrom(
+            self.chrom, range(75_000, 1_000_000, 6_500),
+        )
+        self.cosmic = _cosmic_recs_on_chrom(
+            self.chrom, range(100_000, 1_000_000, 8_000),
+        )
+
+    def _assert_byte_identical(self, materialised, streamed):
+        self.assertEqual(
+            len(materialised), len(streamed),
+            f"length differs: m={len(materialised)} s={len(streamed)}",
+        )
+        for i, (m, s) in enumerate(zip(materialised, streamed)):
+            self.assertEqual(
+                m, s,
+                f"site {i} diverges:\n  materialised={m}\n  streamed={s}",
+            )
+
+    def test_chained_overlays_at_density_10pct(self):
+        for seed in range(5):
+            with self.subTest(seed=seed):
+                m = _materialised_path(
+                    self.ts, self.chrom, self.n_people,
+                    rng_seed=seed, overlay_rng_seed=seed + 1000,
+                    clinvar_records=self.clinvar,
+                    clinvar_inject_density=0.10,
+                    rsid_pool=self.rsids, rsid_density=0.10,
+                    cosmic_records=self.cosmic,
+                    cosmic_inject_density=0.10,
+                )
+                s = _streamed_path(
+                    self.ts, self.chrom, self.n_people,
+                    rng_seed=seed, overlay_rng_seed=seed + 1000,
+                    clinvar_records=self.clinvar,
+                    clinvar_inject_density=0.10,
+                    rsid_pool=self.rsids, rsid_density=0.10,
+                    cosmic_records=self.cosmic,
+                    cosmic_inject_density=0.10,
+                )
+                self._assert_byte_identical(m, s)
 
 
 if __name__ == "__main__":
