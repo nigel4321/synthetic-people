@@ -563,6 +563,111 @@ def format_effective_values(
 # ---------------------------------------------------------------------------
 
 
+def render_default_config_yaml() -> str:
+    """Render a starter ``generate_people_config.yaml`` with every
+    field set to its built-in default and a leading ``# description``
+    comment for each key.
+
+    The output is a fully valid config — saving it as
+    ``generate_people_config.yaml`` and running with no flags
+    behaves identically to running with no config at all. Intended
+    use is ``generate_people --print-config > generate_people_config.yaml``
+    as a starting point a new user can then edit down.
+
+    Determinism: field iteration order is fixed by the pydantic
+    model definitions, and ``yaml.safe_dump`` is used per-leaf so
+    booleans, ``None`` (rendered ``null``), and strings escape the
+    way the loader expects. Re-emission is byte-identical for a
+    given build of the models.
+    """
+    _require_deps()
+    Config = _models()
+
+    lines: list[str] = [
+        "# generate_people_config.yaml",
+        "#",
+        "# Starter config emitted by `generate_people --print-config`.",
+        "# Every field is set to its built-in default — running with",
+        "# this file and no CLI flags behaves identically to running",
+        "# with no config at all. Edit the values you want to change;",
+        "# CLI flags still override config values, config values",
+        "# still override built-in defaults.",
+        "#",
+        "# Schema reference (for IDE auto-complete / validation):",
+        "# https://github.com/nigel4321/synthetic-people/blob/main/"
+        "synthetic_people/generate_people_config.schema.json",
+        "# Full documentation: TUTORIAL.md §10.",
+        "",
+        "# yaml-language-server: $schema=./"
+        f"{SCHEMA_FILENAME}",
+        "",
+        "# Schema version. Required. The loader rejects unknown",
+        "# schema versions with a clear message so an incompatible",
+        f"# field rename can never silently mis-interpret an old config.",
+        f"schema_version: {CURRENT_SCHEMA_VERSION}",
+        "",
+    ]
+    _render_model_fields(
+        Config, lines, indent=0, skip=("schema_version",),
+    )
+    # Strip any trailing blank lines, then ensure exactly one
+    # terminal newline.
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines) + "\n"
+
+
+def _render_model_fields(
+    model_class,
+    lines: list,
+    indent: int,
+    skip: tuple = (),
+) -> None:
+    """Walk a pydantic model's fields and append YAML lines.
+
+    Sub-models (nested ``BaseModel`` subclasses) become indented
+    sections. Leaf fields become ``key: value`` lines preceded by
+    a ``# description`` comment line drawn from the field's
+    pydantic ``description=``.
+    """
+    import yaml
+    from pydantic import BaseModel
+
+    pad = "  " * indent
+    fields = list(model_class.model_fields.items())
+    for idx, (name, field) in enumerate(fields):
+        if name in skip:
+            continue
+        annotation = field.annotation
+        description = field.description or ""
+
+        if isinstance(annotation, type) and issubclass(
+            annotation, BaseModel
+        ):
+            # Nested section: descend with one extra indent level.
+            # A blank line between top-level sections makes the
+            # output readable when redirected to a file.
+            if indent == 0 and idx > 0:
+                lines.append("")
+            if description:
+                lines.append(f"{pad}# {description}")
+            lines.append(f"{pad}{name}:")
+            _render_model_fields(annotation, lines, indent + 1)
+            continue
+
+        if description:
+            lines.append(f"{pad}# {description}")
+        default_value = field.default
+        # safe_dump produces compact one-line values (``42``,
+        # ``true``, ``null``, ``'1-22'``) but appends a ``...`` YAML
+        # end-of-document marker on scalar values. Take just the
+        # first line so the marker is dropped.
+        rendered = yaml.safe_dump(
+            default_value, default_flow_style=True,
+        ).split("\n", 1)[0]
+        lines.append(f"{pad}{name}: {rendered}")
+
+
 def generate_json_schema() -> dict:
     """Return the JSON Schema for the config file, suitable for
     publishing as ``generate_people_config.schema.json``."""

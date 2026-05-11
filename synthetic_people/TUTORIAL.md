@@ -1043,9 +1043,61 @@ directory you run from. CLI flags still win over config values, so
 you can keep a stable baseline file and override one or two settings
 on the command line for a single experiment.
 
-### Quick start
+### Bootstrap a starter config with `--print-config`
 
-Create `generate_people_config.yaml` next to where you run from:
+The fastest way to create your first config file is to ask the
+tool to print one. `--print-config` emits a fully-valid YAML
+config with every field set to its built-in default, each preceded
+by a `# description` comment drawn from the schema:
+
+```bash
+.venv/bin/python generate_people.py --print-config > generate_people_config.yaml
+```
+
+The emitted file is a **no-op as-is** — running the tool with no
+other flags after that command behaves identically to running with
+no config at all. From there, edit only the values you want to
+change; the comments tell you what each field controls and the
+`# yaml-language-server: $schema=...` line wires up IDE
+auto-complete (see [Editor integration](#editor-integration-vs-code-intellij-helix-) below).
+
+A snippet of what gets emitted:
+
+```yaml
+# generate_people_config.yaml
+#
+# Starter config emitted by `generate_people --print-config`.
+# Every field is set to its built-in default …
+
+# yaml-language-server: $schema=./generate_people_config.schema.json
+
+schema_version: 1
+
+cohort:
+  # Cohort size (number of person VCFs).
+  n: 10
+  # Reference build assembly.
+  build: GRCh38
+  # Master RNG seed; omit for fresh randomness each run.
+  seed: null
+  # Chromosomes spec: list / range / mix (e.g. '22', '19-22,X').
+  chromosomes: '22'
+  # Simulated prefix per chromosome in Mb; 0 = full length.
+  chr_length_mb: 5.0
+
+# … one section per area: simulation, overlays, structural_variants,
+# sequencing_errors, performance, output, admixture, legacy_background
+```
+
+`--print-config` writes only to stdout and exits 0 without touching
+any other state, so it composes cleanly with shell redirection,
+diffing against an existing config (`diff <(generate_people --print-config) generate_people_config.yaml`),
+or piping into another tool.
+
+### Quick start (hand-written)
+
+If you'd rather hand-write a minimal config, create
+`generate_people_config.yaml` next to where you run from:
 
 ```yaml
 # yaml-language-server: $schema=./generate_people_config.schema.json

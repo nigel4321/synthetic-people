@@ -414,5 +414,192 @@ class SchemaSyncTest(unittest.TestCase):
             )
 
 
+@unittest.skipUnless(HAS_DEPS, "pydantic + PyYAML not installed")
+class RenderDefaultConfigYamlTest(unittest.TestCase):
+    """The starter YAML emitted by ``--print-config`` must:
+
+    - Be valid YAML the loader accepts.
+    - Load as a no-op (every field equal to its built-in default,
+      so a fresh user can edit incrementally).
+    - Carry every top-level section the models define, so future
+      additions don't silently fail to appear in the starter.
+    - Carry a leading ``# description`` comment per field so the
+      file documents itself.
+    - Be deterministic so the output can be diffed across builds.
+    """
+
+    def setUp(self):
+        from syntheticgen.config import render_default_config_yaml
+        self.rendered = render_default_config_yaml()
+
+    def test_round_trips_through_loader(self):
+        # Write to a temp file and feed through the real loader the
+        # cli would use. Round-trips imply every value rendered is
+        # acceptable to the pydantic validators (including bounded
+        # ranges, enum values, and cross-field rules).
+        from syntheticgen.config import load_and_validate_config
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False,
+        ) as fh:
+            fh.write(self.rendered)
+            path = Path(fh.name)
+        try:
+            cfg = load_and_validate_config(path)
+        finally:
+            path.unlink(missing_ok=True)
+        self.assertEqual(cfg.schema_version, 1)
+
+    def test_loaded_config_equals_minimal_config(self):
+        # The starter is a no-op: every key matches the value the
+        # loader would assign from defaults given ``schema_version:
+        # 1`` alone. So both objects' dict-dumps must match.
+        from syntheticgen.config import _models, load_and_validate_config
+        Config = _models()
+        minimal = Config(schema_version=1)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False,
+        ) as fh:
+            fh.write(self.rendered)
+            path = Path(fh.name)
+        try:
+            from_yaml = load_and_validate_config(path)
+        finally:
+            path.unlink(missing_ok=True)
+        self.assertEqual(
+            minimal.model_dump(), from_yaml.model_dump(),
+            "Rendered starter must produce a no-op config",
+        )
+
+    def test_every_top_level_section_present(self):
+        # Sentinel against silent omissions: every nested section
+        # in the model must appear at the start of a line in the
+        # rendered output.
+        for section in (
+            "cohort:", "simulation:", "overlays:",
+            "structural_variants:", "sequencing_errors:",
+            "performance:", "output:", "admixture:",
+            "legacy_background:",
+        ):
+            self.assertIn(
+                f"\n{section}\n", self.rendered,
+                f"missing top-level section: {section}",
+            )
+
+    def test_overlays_subsections_present(self):
+        # The nested overlays.{clinvar,rsid,cosmic} sections render
+        # under ``overlays:`` with two-space indent.
+        for sub in ("  clinvar:", "  rsid:", "  cosmic:"):
+            self.assertIn(
+                f"\n{sub}\n", self.rendered,
+                f"missing overlays subsection: {sub}",
+            )
+
+    def test_carries_schema_version_line(self):
+        self.assertIn("schema_version: 1\n", self.rendered)
+
+    def test_carries_yaml_language_server_pragma(self):
+        # The IDE-integration comment must be near the top so VS
+        # Code / IntelliJ pick up the schema for autocomplete.
+        self.assertIn(
+            "# yaml-language-server: $schema=", self.rendered,
+        )
+
+    def test_every_leaf_field_has_a_description_comment(self):
+        # For every ``key: value`` line that isn't a section header
+        # (``key:`` alone) and isn't ``schema_version`` (which has
+        # its own multi-line preamble), the *immediately preceding*
+        # non-blank line must be a ``# ...`` comment. This is the
+        # property that makes the file self-documenting and is
+        # easy to regress when new fields are added.
+        import re
+        lines = self.rendered.split("\n")
+        leaf_pat = re.compile(r"^(\s*)([A-Za-z_]\w*):\s+\S")
+        for idx, line in enumerate(lines):
+            m = leaf_pat.match(line)
+            if not m:
+                continue
+            key = m.group(2)
+            if key == "schema_version":
+                continue
+            # Walk backwards over blank lines to the previous line.
+            j = idx - 1
+            while j >= 0 and lines[j].strip() == "":
+                j -= 1
+            self.assertTrue(
+                j >= 0 and lines[j].lstrip().startswith("#"),
+                f"leaf field {key!r} on line {idx + 1} has no "
+                f"preceding # description comment "
+                f"(previous non-blank line: {lines[j]!r})",
+            )
+
+    def test_deterministic_across_calls(self):
+        # Two consecutive renderings must be byte-identical so the
+        # output is diff-stable for users who commit it.
+        from syntheticgen.config import render_default_config_yaml
+        self.assertEqual(self.rendered, render_default_config_yaml())
+
+    def test_includes_carrier_field_descriptions(self):
+        # Spot-check a handful of fields by their description text
+        # so we catch the case where the renderer accidentally
+        # stops emitting the ``description=`` from pydantic.
+        for snippet in (
+            "Cohort size (number of person VCFs).",
+            "Reference build assembly.",
+            "Cohort intermediate between simulation and BCF write.",
+            "Output directory for per-person VCFs and cohort BCFs.",
+            "Run M6 EUR + SAS + AFR -> UK admixture and emit ancestry BEDs.",
+        ):
+            self.assertIn(snippet, self.rendered)
+
+
+@unittest.skipUnless(HAS_DEPS, "pydantic + PyYAML not installed")
+class PrintConfigCliTest(unittest.TestCase):
+    """The ``--print-config`` flag short-circuits cli.main and writes
+    the starter YAML to stdout. This test invokes the real main
+    function with stdout captured so the integration is exercised
+    end-to-end."""
+
+    def test_print_config_writes_to_stdout_and_exits_zero(self):
+        from syntheticgen.cli import main
+        from syntheticgen.config import render_default_config_yaml
+        buf = io.StringIO()
+        real_stdout = sys.stdout
+        sys.stdout = buf
+        try:
+            rc = main(["--print-config"])
+        finally:
+            sys.stdout = real_stdout
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue(), render_default_config_yaml())
+
+    def test_print_config_output_is_valid_loader_input(self):
+        # End-to-end: capture the cli's stdout, feed it back into
+        # the loader, expect a no-op config (every field == default).
+        from syntheticgen.cli import main
+        from syntheticgen.config import (
+            _models, load_and_validate_config,
+        )
+        buf = io.StringIO()
+        real_stdout = sys.stdout
+        sys.stdout = buf
+        try:
+            main(["--print-config"])
+        finally:
+            sys.stdout = real_stdout
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".yaml", delete=False,
+        ) as fh:
+            fh.write(buf.getvalue())
+            path = Path(fh.name)
+        try:
+            cfg = load_and_validate_config(path)
+        finally:
+            path.unlink(missing_ok=True)
+        Config = _models()
+        self.assertEqual(
+            cfg.model_dump(), Config(schema_version=1).model_dump(),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

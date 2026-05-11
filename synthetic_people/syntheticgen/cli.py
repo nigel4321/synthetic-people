@@ -913,6 +913,17 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                    help="Skip the auto-discovery of "
                         "`generate_people_config.yaml` in the current "
                         "directory. Has no effect when --config is set.")
+    p.add_argument("--print-config", action="store_true",
+                   help="Print a starter `generate_people_config.yaml` "
+                        "to stdout (every field at its built-in "
+                        "default, with a leading comment per field) "
+                        "and exit. Redirect to a file to bootstrap "
+                        "the YAML config: "
+                        "`generate_people --print-config > "
+                        "generate_people_config.yaml`. The emitted "
+                        "config is a valid no-op as-is — running with "
+                        "it changes nothing — so edit just the values "
+                        "you want to change. See TUTORIAL.md §10.")
     p.add_argument("--n", type=int, default=10,
                    help="Cohort size: number of person VCFs to generate")
     p.add_argument("--output-dir", type=Path,
@@ -1824,6 +1835,14 @@ def main(argv: list[str] | None = None) -> int:
     script_dir = Path(__file__).resolve().parent.parent
     parser = _parser(script_dir)
     args = parser.parse_args(argv)
+
+    # ``--print-config`` short-circuits before any config discovery
+    # or simulation work: emit the starter YAML to stdout and exit
+    # so the user can redirect it to a file as a starting point.
+    if getattr(args, "print_config", False):
+        from .config import render_default_config_yaml
+        sys.stdout.write(render_default_config_yaml())
+        return 0
 
     # ------------------------------------------------------------
     # Optional YAML config layer (Phase config-file). CLI flags
