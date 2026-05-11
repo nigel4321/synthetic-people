@@ -776,17 +776,26 @@ Between simulation and the BCF write, the cohort lives in some
 intermediate form. `--cohort-mode {sites_list, arrow, auto}`
 selects which:
 
-| Mode | What happens | Recommended `--n` |
+| Mode | What happens | When to use |
 |---|---|---|
-| `sites_list` (Phase B) | Parent holds the per-chromosome sites list in RAM as sparse-carriers Python dicts. Workers fork-COW share the list. | up to ~30 000 |
-| `arrow` (Phase 5d.1) | Parent streams the per-chromosome cohort to `out/cohort/.arrow/cohort.chr<N>.arrow` (Apache Arrow IPC, batch-size 256 sites). Workers `pa.memory_map` the file and consume their sample slice as a zero-copy numpy view. The Arrow scratch is created + deleted per chromosome. | 100 000+ |
-| `auto` (default) | Picks `arrow` for `--n ≥ 100 000`, otherwise `sites_list`. If `pyarrow` isn't installed, falls back to `sites_list` with a warning. | any |
+| `sites_list` (Phase B) | Parent holds the per-chromosome sites list in RAM as sparse-carriers Python dicts. Workers fork-COW share the list. | small `--n` (≤ ~30 000) — fastest path, no pyarrow dep |
+| `arrow` (Phase 5d.1) | Parent materialises the per-chromosome sites list and streams it into `out/cohort/.arrow/cohort.chr<N>.arrow` (Apache Arrow IPC, batch-size 256 sites). Workers `pa.memory_map` and consume their sample slice as a zero-copy numpy view. The Arrow scratch is created + deleted per chromosome. | medium `--n` (≥ 100 000) where workers benefit from mmap, but parent's sites list still fits in RAM |
+| `arrow-streaming` (Phase 5d.1 PR 3 — option 3) | Parent **streams directly from the msprime tree sequence into the Arrow file**, never materialising the full sites list. Overlay injection (ClinVar / rsID / COSMIC) and `annotate_clinvar` are applied inline. Parent peak drops from ~17 GB to a few hundred MB at WGS scale. | large workloads where the materialised parent peak overflows host RAM (e.g. WGS at `--n 3000+` on a 32 GB host) |
+| `auto` (default) | First checks whether predicted materialised parent peak exceeds 50 % of host RAM (via psutil); if yes picks `arrow-streaming`. Otherwise picks `arrow` for `--n ≥ 100 000` else `sites_list`. If pyarrow is missing, falls back to `sites_list` with a one-line warning. | nearly always |
 
-Why two modes: at small n the sites-list path is faster (no disk
-round-trip, no pyarrow dep). At large n the sites-list path runs
-out of memory through CPython refcount-COW divergence between
-parent and workers — the Arrow path was added specifically to
-unblock the n = 1 000 000 target.
+Why three paths: at small n the sites-list path is fastest. At
+medium n the mmap-share win matters for workers but parent fits in
+RAM, so the materialised+arrow path is fine. At very large `n` or
+`chr_length_mb`, the materialised parent itself overflows host RAM
+(memprof28 measured 17 GB at n=3000 × 70 Mb; WGS chr1 at n=3000
+extrapolates to ~60 GB). The `arrow-streaming` path was added so
+parent never holds the full sites list — required for WGS-scale
+runs on commodity hosts, and the foundation for the n=1M target.
+
+**Output is byte-identical across all three modes at a fixed
+`--seed`.** The choice is purely about resource use; downstream
+BCF + per-person VCF outputs are independent of which path
+generated them.
 
 Disk and IO at scale (only relevant when the run picks `arrow`):
 

@@ -316,17 +316,78 @@ _ARROW_AUTO_THRESHOLD = 100_000
 _VARIANTS_PER_MB = 5_000
 
 
-def _resolve_cohort_mode(cli_mode: str, n: int) -> str:
-    """Map ``--cohort-mode {sites_list,arrow,auto}`` + ``--n`` to the
-    concrete mode used by the cohort-write loop.
+def _estimate_materialised_parent_peak_bytes(
+    n_samples: int, chr_length_mb: float
+) -> int:
+    """Estimate the parent-process peak RSS during the cohort-write
+    phase of the *materialised* sites-list path (``sites_list`` or
+    ``arrow`` mode). Used by ``--cohort-mode auto`` to decide when to
+    fall through to the streaming path.
 
-    Returns ``"sites_list"`` or ``"arrow"`` (never ``"auto"``).
+    Calibration anchor: memprof28 measured ~17 GB at n=3000 ×
+    chr_length=70 Mb. That's ~17000 MB / (3000 × 70) ≈ 0.081 MB per
+    (sample × Mb), i.e. ~80 KB per (sample × Mb). The dominant
+    contribution is the per-site dict + sparse carriers list. Pad the
+    coefficient slightly upward to be conservative — better to
+    auto-pick streaming a bit early than OOM.
+    """
+    bytes_per_sample_per_mb = 90_000  # ~90 KB
+    return int(n_samples * chr_length_mb * bytes_per_sample_per_mb)
+
+
+def _resolve_cohort_mode(cli_mode: str, n: int,
+                         chr_length_mb: float = 0.0,
+                         host_ram_bytes: int | None = None) -> str:
+    """Map ``--cohort-mode {sites_list,arrow,arrow-streaming,auto}``
+    + ``--n`` + chromosome size to the concrete mode used by the
+    cohort-write loop.
+
+    Returns one of ``"sites_list"``, ``"arrow"``, or
+    ``"arrow-streaming"`` (never ``"auto"``).
+
+    ``auto`` resolution:
+
+    - First, check whether the predicted materialised parent peak
+      exceeds ~50% of host RAM. If so, pick ``arrow-streaming`` so
+      the parent never holds the full sites list — required for
+      WGS-scale runs (predicted ~60 GB parent at n=3000 × chr1 full
+      length).
+    - Otherwise, pick ``arrow`` for ``n >= 100000`` (the existing
+      threshold — keeps the materialised+arrow path for medium-n
+      runs where the per-site Python overhead isn't yet the binding
+      cost).
+    - Otherwise, pick ``sites_list`` (Phase B; bounded at n~30k by
+      the refcount-COW divergence).
+
+    ``host_ram_bytes`` defaults to ``psutil.virtual_memory().total``
+    when ``psutil`` is available; otherwise a conservative fallback
+    of 32 GB (the smallest workstation class we target). The
+    ``chr_length_mb`` argument is used only for the predicted-peak
+    auto-pick; pass ``0`` when the caller doesn't care about
+    streaming-mode escalation.
     """
     if cli_mode == "sites_list":
         return "sites_list"
     if cli_mode == "arrow":
         return "arrow"
+    if cli_mode == "arrow-streaming":
+        return "arrow-streaming"
     # auto
+    if host_ram_bytes is None:
+        try:
+            import psutil
+            host_ram_bytes = psutil.virtual_memory().total
+        except ImportError:
+            host_ram_bytes = 32 * 1024**3  # 32 GB conservative fallback
+    if chr_length_mb > 0:
+        # Predicted peak is per-chromosome (we process one at a time
+        # so this is the binding constraint, not the cohort-wide
+        # cumulative).
+        predicted = _estimate_materialised_parent_peak_bytes(
+            n, chr_length_mb,
+        )
+        if predicted > 0.5 * host_ram_bytes:
+            return "arrow-streaming"
     return "arrow" if n >= _ARROW_AUTO_THRESHOLD else "sites_list"
 
 
@@ -407,11 +468,14 @@ def _write_cohort_chrom_bcf(
     on success. On failure the Arrow file is left in place for
     postmortem (matches the ``.partials/`` cleanup behaviour).
     """
-    if mode == "arrow":
+    if mode in ("arrow", "arrow-streaming"):
         arrow_dir = cohort_dir / ".arrow"
         arrow_dir.mkdir(parents=True, exist_ok=True)
         arrow_path = arrow_dir / f"cohort.chr{chrom}.arrow"
         from .cohort_arrow import write_arrow_file
+        # ``sites`` here is either a materialised list (mode=="arrow")
+        # or a streaming generator (mode=="arrow-streaming"). Both
+        # iterate identically; ``iter()`` is a no-op on generators.
         write_arrow_file(
             arrow_path, chrom, len(sample_ids), iter(sites),
             batch_size=arrow_batch_size,
@@ -433,6 +497,184 @@ def _write_cohort_chrom_bcf(
     write_cohort_bcf_parallel(
         chrom_bcf, build, sample_ids, sites, workers=workers,
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-chromosome iterators (Phase 5d.1 streaming refactor — PR 3)
+# ---------------------------------------------------------------------------
+#
+# Two iterators with the same ``(chrom, sites)`` contract so the cli's
+# main cohort-phase loop can stay simple. ``sites`` is either a fully-
+# materialised list (legacy path) or a streaming generator that the
+# Arrow writer drains directly (PR 3 path). Both versions handle:
+#
+#   - msprime simulation (per chrom)
+#   - the four overlays (annotate_clinvar, inject_clinvar, inject_rsids,
+#     inject_cosmic) with per-chrom rng derived from the resume record
+#   - SFS histogram accumulation
+#
+# What differs:
+#
+#   - Materialised: builds the full sites list, applies overlays in
+#     place, runs sfs_histogram on the list, sorts by pos.
+#   - Streaming: builds only the metadata + overlay plans, returns a
+#     generator that pulls full sites from the tree on demand. SFS
+#     accumulation runs inline (per yielded site).
+
+
+def _iter_chrom_sites_materialised(
+    *, chromosomes_to_simulate, args, demo_model, rng, workers,
+    resume, clinvar_index, rsid_pool, cosmic_pool,
+    overlay_stats, sfs_total, chunk_size_mb,
+):
+    """Legacy materialised per-chromosome iterator. Yields
+    ``(chrom, sites_list)`` after applying overlays + sorting in place.
+    """
+    from .coalescent import simulate_cohort_iter
+    for chrom, sites in simulate_cohort_iter(
+        chromosomes=chromosomes_to_simulate, build=args.build,
+        n_people=args.n, length_mb=args.chr_length_mb,
+        demo_model=demo_model, population=args.population,
+        rec_rate=args.rec_rate, mu=args.mu,
+        rng=rng, verbose=True, workers=workers,
+        chunk_size_mb=chunk_size_mb,
+    ):
+        memprofile_mark(f"chrom {chrom} sites yielded ({len(sites)})")
+        chrom_overlay_rng = random.Random(resume.overlay_seeds[chrom])
+        if clinvar_index:
+            overlay_stats["clinvar_annotated"] += annotate_clinvar(
+                sites, clinvar_index)
+            if args.clinvar_inject_density > 0:
+                overlay_stats["clinvar_injected"] += inject_clinvar(
+                    sites, clinvar_index,
+                    args.clinvar_inject_density, chrom_overlay_rng,
+                )
+        clinvar_reserved = {i for i, s in enumerate(sites)
+                            if s.get("clnsig")}
+        if rsid_pool and args.rsid_density > 0:
+            overlay_stats["rsid_injected"] += inject_rsids(
+                sites, rsid_pool, args.rsid_density,
+                chrom_overlay_rng,
+                reserve_indices=clinvar_reserved,
+            )
+        all_overlay_reserved = {i for i, s in enumerate(sites)
+                                if s.get("clnsig") or
+                                s["id"].startswith("rs")}
+        if cosmic_pool:
+            overlay_stats["cosmic_injected"] += inject_cosmic(
+                sites, cosmic_pool, args.cosmic_inject_density,
+                chrom_overlay_rng,
+                reserve_indices=all_overlay_reserved,
+            )
+        sfs_total.update(sfs_histogram(sites))
+        # Sort within-chrom by pos (overlays re-sort, but be defensive).
+        sites.sort(key=lambda s: s["pos"])
+        yield chrom, sites
+
+
+def _iter_chrom_sites_streaming(
+    *, chromosomes_to_simulate, args, demo_model, rng,
+    resume, clinvar_index, rsid_pool, cosmic_pool,
+    overlay_stats, sfs_total, chunk_size_mb,
+):
+    """Streaming per-chromosome iterator (Phase 5d.1 PR 3). Yields
+    ``(chrom, sites_generator)`` where ``sites_generator`` is the
+    output of :func:`coalescent.stream_cohort_sites` — sites flow
+    through the Arrow writer without ever being materialised in a
+    Python list. Parent peak drops from ~17 GB to a few hundred MB
+    at WGS scale.
+
+    Byte-identical to the materialised iterator at every fixed seed
+    combination (master rng + per-chrom overlay rng) — see the PR 2
+    parity tests in ``test_streaming_cohort.py``.
+
+    SFS histogram accumulation happens inline (a tee-style generator
+    wraps the stream so each yielded site updates ``sfs_total`` once).
+    Overlay counts are accumulated against ``overlay_stats`` once
+    per chromosome, before the generator is consumed, by inspecting
+    the plans before pass 2 runs.
+    """
+    from .coalescent import (
+        simulate_cohort_ts_iter,
+        stream_cohort_sites,
+        _tree_sequence_to_sites_meta,
+        _build_annotation_map,
+    )
+    from .clinvar import plan_inject_clinvar
+    from .dbsnp import plan_inject_rsids
+    from .cosmic import plan_inject_cosmic
+    from .titv import DEFAULT_TARGET_TITV
+
+    for chrom, ts, chrom_rng in simulate_cohort_ts_iter(
+        chromosomes=chromosomes_to_simulate, build=args.build,
+        n_people=args.n, length_mb=args.chr_length_mb,
+        demo_model=demo_model, population=args.population,
+        rec_rate=args.rec_rate, mu=args.mu,
+        rng=rng, verbose=True, chunk_size_mb=chunk_size_mb,
+    ):
+        memprofile_mark(f"chrom {chrom} ts ready ({ts.num_sites} sites)")
+        chrom_overlay_rng = random.Random(resume.overlay_seeds[chrom])
+
+        # Pre-compute the overlay plans once per chrom so we can both
+        # update ``overlay_stats`` and feed them into the stream
+        # without re-doing the rng-consuming work. Mirrors the rng
+        # bracket inside :func:`stream_cohort_sites`.
+        state_before = chrom_rng.getstate()
+        sites_meta = _tree_sequence_to_sites_meta(
+            ts, chrom, args.n, chrom_rng, DEFAULT_TARGET_TITV,
+        )
+        annotation_map = _build_annotation_map(
+            sites_meta, clinvar_index,
+        )
+        sites_meta_chrpos = [(m[0], m[1]) for m in sites_meta]
+        clinvar_plan = plan_inject_clinvar(
+            sites_meta_chrpos, clinvar_index or [],
+            args.clinvar_inject_density, chrom_overlay_rng,
+        )
+        clinvar_reserved = set(annotation_map.keys()) | set(
+            clinvar_plan.keys())
+        rsid_plan = plan_inject_rsids(
+            sites_meta_chrpos, rsid_pool or [],
+            args.rsid_density, chrom_overlay_rng,
+            reserve_indices=clinvar_reserved,
+        )
+        all_reserved = clinvar_reserved | set(rsid_plan.keys())
+        cosmic_plan = plan_inject_cosmic(
+            sites_meta_chrpos, cosmic_pool or [],
+            args.cosmic_inject_density, chrom_overlay_rng,
+            reserve_indices=all_reserved,
+        )
+        overlay_stats["clinvar_annotated"] += len(annotation_map)
+        overlay_stats["clinvar_injected"] += len(clinvar_plan)
+        overlay_stats["rsid_injected"] += len(rsid_plan)
+        overlay_stats["cosmic_injected"] += len(cosmic_plan)
+        chrom_rng.setstate(state_before)
+
+        # Build the streaming generator. We use the lower-level pass-2
+        # invocation directly (rather than the high-level
+        # stream_cohort_sites entry point) so we don't re-run the
+        # planners and re-consume overlay_rng — we already did that
+        # above. The chrom_rng has been restored to its
+        # pre-pass-1 state for the pass-2 walk.
+        from .coalescent import _stream_cohort_pass2
+        inject_map: dict = {}
+        inject_map.update(clinvar_plan)
+        inject_map.update(rsid_plan)
+        inject_map.update(cosmic_plan)
+        stream = _stream_cohort_pass2(
+            ts, chrom, args.n, chrom_rng, DEFAULT_TARGET_TITV,
+            sites_meta, inject_map, annotation_map,
+        )
+
+        # Tee the stream so we update sfs_total per site as it
+        # flows through to the Arrow writer.
+        def _tee_sfs(site_iter, sfs_total_ref):
+            for site in site_iter:
+                for ac in site.get("acs") or []:
+                    sfs_total_ref[ac] = sfs_total_ref.get(ac, 0) + 1
+                yield site
+
+        yield chrom, _tee_sfs(stream, sfs_total)
 
 
 def parse_chromosomes(spec: str, build: str) -> list[str]:
@@ -711,20 +953,28 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                         "for a given --seed across any --workers "
                         "value.")
     p.add_argument("--cohort-mode",
-                   choices=("sites_list", "arrow", "auto"),
+                   choices=("sites_list", "arrow", "arrow-streaming",
+                            "auto"),
                    default="auto",
                    help="[perf, Phase 5d.1] Cohort intermediate "
                         "between simulation and the BCF write. "
                         "`sites_list` (Phase B) keeps the cohort in "
                         "RAM and fork-shares to workers; works up to "
-                        "n~30k. `arrow` writes a streaming-mmap Arrow "
-                        "IPC scratch file per chromosome and workers "
-                        "consume it via memory_map (zero-copy); "
-                        "required for n=100k+, optional below. `auto` "
-                        "picks `arrow` for --n>=100000 and `sites_list` "
-                        "below. The Arrow path needs `pip install "
-                        "pyarrow`; without it, `auto` falls back to "
-                        "`sites_list` with a warning.")
+                        "n~30k. `arrow` materialises the sites list "
+                        "and streams it to an Arrow IPC scratch file "
+                        "per chromosome; workers mmap-read. "
+                        "`arrow-streaming` (option 3) skips the "
+                        "materialised sites list entirely — parent "
+                        "streams directly from the msprime tree "
+                        "sequence to the Arrow file, dropping parent "
+                        "peak from ~17 GB to a few hundred MB at WGS "
+                        "scale. `auto` picks `arrow-streaming` when "
+                        "predicted parent peak > 50%% host RAM, "
+                        "`arrow` for --n>=100000 below that, "
+                        "`sites_list` for smaller cohorts. The Arrow "
+                        "paths need `pip install pyarrow`; without "
+                        "it, `auto` falls back to `sites_list` with a "
+                        "warning.")
     p.add_argument("--cohort-arrow-batch-size", type=int, default=256,
                    help="[perf, Phase 5d.1] Sites-per-batch when "
                         "streaming the cohort Arrow IPC file. The "
@@ -860,28 +1110,31 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
     # and (if it ends up Arrow) pre-flight the disk before any
     # simulation work. Doing this before resume / sample draw means
     # an insufficient-disk run aborts cheaply.
-    cohort_mode = _resolve_cohort_mode(args.cohort_mode, args.n)
-    if cohort_mode == "arrow":
+    cohort_mode = _resolve_cohort_mode(
+        args.cohort_mode, args.n, chr_length_mb=args.chr_length_mb,
+    )
+    if cohort_mode in ("arrow", "arrow-streaming"):
         try:
             from . import cohort_arrow  # noqa: F401
         except ImportError as exc:
             if args.cohort_mode == "auto":
                 print(
-                    f"  WARNING: --cohort-mode auto chose `arrow` for "
-                    f"--n={args.n}, but pyarrow is not installed; "
-                    f"falling back to `sites_list`. Install with "
-                    f"`pip install pyarrow` to use the Arrow path. "
-                    f"({exc})",
+                    f"  WARNING: --cohort-mode auto chose "
+                    f"`{cohort_mode}` for --n={args.n}, but pyarrow "
+                    f"is not installed; falling back to `sites_list`. "
+                    f"Install with `pip install pyarrow` to use the "
+                    f"Arrow path. ({exc})",
                     file=sys.stderr,
                 )
                 cohort_mode = "sites_list"
             else:
                 sys.exit(
-                    f"--cohort-mode arrow requires pyarrow; install "
-                    f"with `pip install pyarrow` or pass --cohort-mode "
-                    f"sites_list (supported up to n~30000)."
+                    f"--cohort-mode {cohort_mode} requires pyarrow; "
+                    f"install with `pip install pyarrow` or pass "
+                    f"--cohort-mode sites_list (supported up to "
+                    f"n~30000)."
                 )
-    if cohort_mode == "arrow":
+    if cohort_mode in ("arrow", "arrow-streaming"):
         _preflight_arrow_disk_check(
             cohort_dir, args.n, args.chr_length_mb,
         )
@@ -1018,69 +1271,32 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
 
     memprofile_mark(
         f"streaming sim start ({len(chromosomes_to_simulate)} chroms)")
-    for chrom, sites in simulate_cohort_iter(
-        chromosomes=chromosomes_to_simulate, build=args.build,
-        n_people=args.n, length_mb=args.chr_length_mb,
-        demo_model=demo_model, population=args.population,
-        rec_rate=args.rec_rate, mu=args.mu,
-        rng=rng, verbose=True, workers=workers,
-        chunk_size_mb=chunk_size_mb,
-    ):
-        memprofile_mark(f"chrom {chrom} sites yielded ({len(sites)})")
-        # Each chromosome's overlays use a per-chrom rng seeded from
-        # the resume record so they're independent of streaming order
-        # and reproducible across resumes.
-        chrom_overlay_rng = random.Random(resume.overlay_seeds[chrom])
+    if cohort_mode == "arrow-streaming":
+        chrom_iter = _iter_chrom_sites_streaming(
+            chromosomes_to_simulate=chromosomes_to_simulate,
+            args=args, demo_model=demo_model, rng=rng,
+            resume=resume,
+            clinvar_index=clinvar_index, rsid_pool=rsid_pool,
+            cosmic_pool=cosmic_pool,
+            overlay_stats=overlay_stats, sfs_total=sfs_total,
+            chunk_size_mb=chunk_size_mb,
+        )
+    else:
+        chrom_iter = _iter_chrom_sites_materialised(
+            chromosomes_to_simulate=chromosomes_to_simulate,
+            args=args, demo_model=demo_model, rng=rng,
+            workers=workers,
+            resume=resume,
+            clinvar_index=clinvar_index, rsid_pool=rsid_pool,
+            cosmic_pool=cosmic_pool,
+            overlay_stats=overlay_stats, sfs_total=sfs_total,
+            chunk_size_mb=chunk_size_mb,
+        )
 
-        # Apply overlays to this chunk only. Density semantics are
-        # per-chrom; reservation tracking is local to the chunk.
-        if clinvar_index:
-            overlay_stats["clinvar_annotated"] += annotate_clinvar(
-                sites, clinvar_index)
-            if args.clinvar_inject_density > 0:
-                overlay_stats["clinvar_injected"] += inject_clinvar(
-                    sites, clinvar_index,
-                    args.clinvar_inject_density, chrom_overlay_rng,
-                )
-        clinvar_reserved = {i for i, s in enumerate(sites)
-                            if s.get("clnsig")}
-        if rsid_pool and args.rsid_density > 0:
-            overlay_stats["rsid_injected"] += inject_rsids(
-                sites, rsid_pool, args.rsid_density,
-                chrom_overlay_rng,
-                reserve_indices=clinvar_reserved,
-            )
-        all_overlay_reserved = {i for i, s in enumerate(sites)
-                                if s.get("clnsig") or
-                                s["id"].startswith("rs")}
-        if cosmic_pool:
-            overlay_stats["cosmic_injected"] += inject_cosmic(
-                sites, cosmic_pool, args.cosmic_inject_density,
-                chrom_overlay_rng,
-                reserve_indices=all_overlay_reserved,
-            )
-
-        # SFS contribution from this chunk.
-        sfs_total.update(sfs_histogram(sites))
-
+    for chrom, sites in chrom_iter:
         # Per-chrom BCF — `cohort.chr<N>.bcf`. The relative path goes
         # straight into the manifest's cohort_bcfs list.
         chrom_bcf = cohort_dir / f"cohort.chr{chrom}.bcf"
-        # Sort within-chrom by pos for genome-order output (overlays
-        # may have re-sorted but injection helpers do that too — be
-        # defensive).
-        sites.sort(key=lambda s: s["pos"])
-        # Phase 5e Phase A: parallelise the cohort BCF write across
-        # ``workers`` sample-slice writers. At workers <= 1 this
-        # collapses to the original serial CohortBcfWriter path.
-        # Cohort simulation itself is now serial across chromosomes
-        # (the parallel-chromosome ProcessPoolExecutor path was
-        # removed in this phase), so ``workers`` here controls
-        # within-chromosome parallelism only.
-        # Phase 5d.1: when --cohort-mode resolves to ``arrow``, the
-        # parent's sites list is streamed to a per-chrom Arrow IPC
-        # scratch file before fanout; workers consume it via mmap.
-        # See ``_write_cohort_chrom_bcf`` for the dispatch.
         _write_cohort_chrom_bcf(
             mode=cohort_mode,
             chrom=chrom,
