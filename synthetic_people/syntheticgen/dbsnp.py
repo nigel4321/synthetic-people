@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import random
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 
 # Default fraction of cohort sites to overwrite with a dbSNP-known rsID.
@@ -121,12 +123,12 @@ def _normalise_rsid(id_field: str, info_rs: str) -> str:
 
 
 def plan_inject_rsids(
-    sites_meta: list,
+    sites_meta: Sequence[tuple[str, int]],
     pool: list[dict],
     density: float,
     rng: random.Random,
     reserve_indices: set[int] | None = None,
-) -> dict:
+) -> dict[int, dict[str, Any]]:
     """Decide which sites to replace with dbSNP records.
 
     Twin of :func:`syntheticgen.clinvar.plan_inject_clinvar` for the

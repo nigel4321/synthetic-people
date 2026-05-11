@@ -24,7 +24,9 @@ from __future__ import annotations
 
 import random
 import subprocess
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 
 DEFAULT_COSMIC_INJECT_DENSITY = 0.005
@@ -80,12 +82,12 @@ def load_cosmic_records(cosmic_vcf: Path,
 
 
 def plan_inject_cosmic(
-    sites_meta: list,
+    sites_meta: Sequence[tuple[str, int]],
     cosmic_records: list[dict],
     density: float,
     rng: random.Random,
     reserve_indices: set[int] | None = None,
-) -> dict:
+) -> dict[int, dict[str, Any]]:
     """Decide which sites to replace with COSMIC records.
 
     Twin of :func:`syntheticgen.clinvar.plan_inject_clinvar` for the

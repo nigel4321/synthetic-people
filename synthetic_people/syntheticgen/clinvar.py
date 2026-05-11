@@ -23,7 +23,9 @@ import random
 import subprocess
 import sys
 import urllib.request
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from .builds import BUILDS
 
@@ -237,11 +239,11 @@ def annotate_clinvar(sites: list[dict],
 
 
 def plan_inject_clinvar(
-    sites_meta: list,
+    sites_meta: Sequence[tuple[str, int]],
     clinvar_records: list[dict],
     density: float,
     rng: random.Random,
-) -> dict:
+) -> dict[int, dict[str, Any]]:
     """Decide which sites to replace with ClinVar records.
 
     ``sites_meta`` is a sequence of ``(chrom, pos)`` tuples giving the

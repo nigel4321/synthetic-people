@@ -292,11 +292,21 @@ class WrapperParityTest(unittest.TestCase):
 
 
 class ReserveIndicesChainTest(unittest.TestCase):
-    """The cli runs ClinVar -> rsID -> COSMIC, passing each later
-    overlay the set of indices the earlier ones already claimed. The
-    planners must honour ``reserve_indices`` identically to the
-    in-place mutators so the streaming caller can build the same
-    chain."""
+    """Local contract test for ``reserve_indices``: when a chained-
+    overlay caller passes a set of already-claimed indices to
+    ``plan_inject_rsids`` or ``plan_inject_cosmic``, no claimed index
+    appears in the returned plan.
+
+    Note on scope: these methods don't validate full chained-overlay
+    *byte-identical equivalence* between the in-place mutators and a
+    plan-then-apply caller — that's a much bigger claim involving the
+    post-inject sort that ``inject_*`` runs internally, the
+    materialised cli's reserve set derivation from POST-sort indices,
+    etc. That broader equivalence is locked down by
+    ``test_streaming_cohort.StreamCohortChainedOverlayParityAtScaleTest``
+    where the full materialised-vs-streamed pipeline is compared at
+    ``n=20, length=1Mb, density=0.10`` across multiple seeds. Here
+    we only pin the narrower per-planner reserve_indices contract."""
 
     def test_rsids_planner_skips_reserved_indices(self):
         sites_meta = [("22", i * 100) for i in range(1, 21)]
@@ -324,6 +334,94 @@ class ReserveIndicesChainTest(unittest.TestCase):
         )
         for idx in plan:
             self.assertNotIn(idx, all_reserved)
+
+
+class WrapperThreadsReserveIndicesTest(unittest.TestCase):
+    """End-to-end coverage for the ``reserve_indices`` kwarg on the
+    legacy in-place wrappers ``inject_rsids`` and ``inject_cosmic``.
+
+    The wrappers are thin (``sites_meta = [(s["chrom"], s["pos"]) for
+    s in sites]`` → call planner → apply in place), but the threading
+    of ``reserve_indices`` through to the planner had no end-to-end
+    test before this PR. With the post-PR-#50 architecture the
+    planner half is covered by ``ReserveIndicesChainTest`` and the
+    apply half by the existing ``WrapperParityTest`` — these tests
+    pin the wrapper-level argument pass-through specifically, which
+    is the seam where a future refactor could silently lose the
+    reserve constraint."""
+
+    def test_inject_rsids_honours_reserve_indices(self):
+        sites = [_site("22", i * 100) for i in range(1, 21)]
+        pool = [_rsid_rec("22", 5_000_000 + i, "C", "T",
+                          rsid=f"rs{i}") for i in range(40)]
+        # Pre-mark some sites as "claimed" by a prior overlay (here we
+        # simulate clinvar's clnsig field rather than running it).
+        reserved = {2, 6, 10}
+        n = inject_rsids(sites, pool, density=0.4,
+                         rng=random.Random(11),
+                         reserve_indices=reserved)
+        self.assertGreater(n, 0)
+        # After sort, the original index→pos mapping is gone; check by
+        # carrying a marker through. Re-run with reserve covering EVERY
+        # site to prove that no rsID injection happens when nothing's
+        # eligible.
+        sites_full_reserve = [_site("22", i * 100) for i in range(1, 21)]
+        full_reserve = set(range(len(sites_full_reserve)))
+        n_blocked = inject_rsids(
+            sites_full_reserve, pool, density=0.4,
+            rng=random.Random(11),
+            reserve_indices=full_reserve,
+        )
+        self.assertEqual(
+            n_blocked, 0,
+            "reserve_indices covering all sites must block all "
+            "injections",
+        )
+
+    def test_inject_cosmic_honours_reserve_indices(self):
+        # Use a marker pattern: tag specific sites with a known field
+        # before injection, run inject_cosmic with reserve_indices
+        # protecting those tagged sites, then assert the tagged sites
+        # are unchanged.
+        sites = [_site("22", i * 100) for i in range(1, 21)]
+        protected_indices = {3, 7, 11, 15}
+        for i in protected_indices:
+            sites[i]["__test_marker"] = i  # marker only this test reads
+            sites[i]["__original_pos"] = sites[i]["pos"]
+            sites[i]["__original_ref"] = sites[i]["ref"]
+            sites[i]["__original_alt"] = sites[i]["alts"][0]
+
+        pool = [_cosmic_rec("22", 5_000_000 + i, "C", "T",
+                            cid=f"COSV{i}", gene="TP53")
+                for i in range(40)]
+        n = inject_cosmic(sites, pool, density=0.4,
+                          rng=random.Random(13),
+                          reserve_indices=protected_indices)
+        self.assertGreater(n, 0)
+
+        # Find the protected sites (by marker) in the post-sort list
+        # and assert they were not overwritten.
+        for s in sites:
+            if "__test_marker" in s:
+                self.assertEqual(s["pos"], s["__original_pos"])
+                self.assertEqual(s["ref"], s["__original_ref"])
+                self.assertEqual(s["alts"], [s["__original_alt"]])
+                self.assertNotIn("cosmic_id", s)
+                self.assertNotIn("cosmic_gene", s)
+
+    def test_inject_cosmic_full_reserve_is_noop(self):
+        sites = [_site("22", i * 100) for i in range(1, 11)]
+        pool = [_cosmic_rec("22", 5_000_000 + i, "C", "T",
+                            cid=f"COSV{i}", gene="TP53")
+                for i in range(20)]
+        n = inject_cosmic(
+            sites, pool, density=0.5,
+            rng=random.Random(7),
+            reserve_indices=set(range(len(sites))),
+        )
+        self.assertEqual(n, 0,
+            "reserve_indices covering all sites must block all "
+            "cosmic injections")
 
 
 if __name__ == "__main__":
