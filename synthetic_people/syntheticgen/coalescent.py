@@ -620,14 +620,36 @@ def _stream_cohort_pass2(ts, chrom: str, n_people: int,
     """
     import heapq
 
-    # Pre-compute sorted overlay positions so we know what's still
-    # ahead at each iteration. Each entry is `(pos, accepted_idx)`
-    # so we could in principle look up the overlay record by idx,
-    # but for the safe-yield bound we only need pos.
-    overlay_positions_sorted = sorted(
-        rec["pos"] for rec in inject_map.values()
+    # Pre-compute the future-min overlay position correctly.
+    #
+    # Earlier draft used ``overlay_positions_sorted[overlay_next_idx]``,
+    # but ``overlay_next_idx`` counts overlays in *tree-walk order* while
+    # the array was sorted by *position* — so the look-up reported the
+    # (k+1)-th smallest position, not "smallest pos among overlays not
+    # yet encountered." That false bound let tree sites yield ahead of
+    # a future overlay whose pos was smaller than the current tree pos
+    # but larger than already-encountered overlay positions. Concretely:
+    # if the first overlay we hit has pos 500 and a later overlay has
+    # pos 100, the buggy code allowed tree sites at pos 200 to yield
+    # before pos 100 was even discovered. PR #51 Copilot review caught
+    # the bug; this PR fixes it.
+    #
+    # The fix: sort the overlays by *accepted_idx* (tree-walk order),
+    # then build a suffix-min array over the resulting pos sequence.
+    # At any step we know the smallest pos among un-encountered
+    # overlays by reading ``suffix_min[overlay_next_ptr]``, where the
+    # pointer advances each time we encounter an injected idx.
+    overlay_by_idx_order = sorted(
+        [(idx, rec["pos"]) for idx, rec in inject_map.items()],
+        key=lambda kv: kv[0],
     )
-    overlay_next_idx = 0
+    n_inj = len(overlay_by_idx_order)
+    suffix_min_overlay_pos: list = [float("inf")] * (n_inj + 1)
+    for i in range(n_inj - 1, -1, -1):
+        suffix_min_overlay_pos[i] = min(
+            overlay_by_idx_order[i][1], suffix_min_overlay_pos[i + 1],
+        )
+    overlay_next_ptr = 0
 
     buffer: list = []  # min-heap of (pos, counter, site_dict)
     counter = 0
@@ -684,7 +706,7 @@ def _stream_cohort_pass2(ts, chrom: str, n_people: int,
                     site[k] = overlay[k]
             heapq.heappush(buffer, (site["pos"], counter, site))
             counter += 1
-            overlay_next_idx += 1
+            overlay_next_ptr += 1
         else:
             site = {
                 "chrom": chrom,
@@ -707,13 +729,12 @@ def _stream_cohort_pass2(ts, chrom: str, n_people: int,
             counter += 1
 
         # Safe-yield threshold: smallest pos any future site can have.
-        if overlay_next_idx < len(overlay_positions_sorted):
-            next_overlay_pos = overlay_positions_sorted[overlay_next_idx]
-        else:
-            next_overlay_pos = float("inf")
-        # Future tree pos > current pos; tighten using +1 because dedup
-        # always advances strictly.
-        smallest_future_pos = min(pos + 1, next_overlay_pos)
+        # Future tree pos > current pos (monotone + dedup); future
+        # overlay pos is given by the suffix-min over un-encountered
+        # overlays (see overlay_by_idx_order construction above).
+        smallest_future_pos = min(
+            pos + 1, suffix_min_overlay_pos[overlay_next_ptr],
+        )
 
         while buffer and buffer[0][0] < smallest_future_pos:
             yield heapq.heappop(buffer)[2]
@@ -754,6 +775,119 @@ def _build_annotation_map(sites_meta: list,
         if rec is not None:
             out[i] = rec
     return out
+
+
+def _plan_cohort_overlays(
+    sites_meta: list,
+    annotation_map: dict,
+    *,
+    clinvar_records: list | None,
+    clinvar_inject_density: float,
+    rsid_pool: list | None,
+    rsid_density: float,
+    cosmic_records: list | None,
+    cosmic_inject_density: float,
+    overlay_rng: random.Random,
+):
+    """Run the chained-overlay planners (clinvar → rsids → cosmic)
+    against ``sites_meta`` *while mirroring the materialised path's
+    sort-between-injects semantics*. Returns ``(clinvar_plan,
+    rsid_plan, cosmic_plan)`` all keyed by **tree-walk idx**
+    (= ``accepted_idx``) so the streaming pass 2 can look injections
+    up by the same index it advances.
+
+    Why the sort-between-injects matters:
+
+      The materialised path is::
+
+          inject_clinvar(sites, ...)   # mutates pos in place, then sorts
+          clinvar_reserved = {i: sites[i].clnsig}   # POST-SORT indices
+          inject_rsids(sites, ..., reserve=clinvar_reserved)
+          ...
+
+      ``inject_rsids`` sees the *post-clinvar-sort* sites_meta. Its
+      ``used_keys`` collision set contains the new clinvar positions
+      (not the original tree positions at the injected indices); its
+      ``candidate`` list shuffles different integers than a streaming
+      pre-sort caller would see. PR #51's first draft ran all three
+      planners against the original tree-walk-order ``sites_meta``,
+      which diverged from the materialised path on chained overlays
+      — Copilot caught it. This helper mirrors the sort-between-
+      injects logic so byte-identical output is restored.
+
+    Mechanism:
+
+      A light "view" tracks each tree-walk-idx's CURRENT (chrom, pos)
+      plus two boolean flags — ``has_clnsig`` and ``has_rs_id`` —
+      that match exactly what the materialised cli's reserve sets
+      key on (``s.get("clnsig")`` and ``s["id"].startswith("rs")``).
+      After each plan we mutate the view's positions for injected
+      indices, update flags, and stable-sort by (chrom, pos). The
+      next planner sees the post-sort view; we map its output
+      indices back to tree-walk idx for the streaming pass 2.
+    """
+    from .clinvar import plan_inject_clinvar
+    from .dbsnp import plan_inject_rsids
+    from .cosmic import plan_inject_cosmic
+
+    # View entry: [tree_walk_idx, chrom, pos, has_clnsig, has_rs_id]
+    view: list = []
+    for i, m in enumerate(sites_meta):
+        view.append([i, m[0], m[1],
+                     i in annotation_map,  # clinvar match by annotate
+                     False])
+
+    # 1) Plan clinvar inject against the tree-walk-order view
+    #    (sites_meta_chrpos at this step is the (chrom, pos) of the
+    #    view, which is still tree-walk order since no sort has run).
+    clinvar_plan_treewalk = plan_inject_clinvar(
+        [(v[1], v[2]) for v in view],
+        clinvar_records or [], clinvar_inject_density, overlay_rng,
+    )
+    # Apply mutations
+    for tw_idx, rec in clinvar_plan_treewalk.items():
+        v = view[tw_idx]
+        v[2] = rec["pos"]
+        v[3] = True  # has_clnsig
+    # Sort by (chrom, pos). Stable.
+    view.sort(key=lambda e: (e[1], e[2]))
+
+    # 2) Reserve = indices (post-clinvar-sort) where has_clnsig is True.
+    clinvar_reserved_post_sort = {i for i, v in enumerate(view) if v[3]}
+
+    # 3) Plan rsids against the post-clinvar-sort view
+    rsid_plan_post_sort = plan_inject_rsids(
+        [(v[1], v[2]) for v in view],
+        rsid_pool or [], rsid_density, overlay_rng,
+        reserve_indices=clinvar_reserved_post_sort,
+    )
+    # Map back to tree-walk idx
+    rsid_plan_treewalk: dict = {}
+    for ps_idx, rec in rsid_plan_post_sort.items():
+        tw_idx = view[ps_idx][0]
+        rsid_plan_treewalk[tw_idx] = rec
+        v = view[ps_idx]
+        v[2] = rec["pos"]
+        v[4] = True  # has_rs_id (inject_rsids sets id=rec["rsid"] which starts with "rs")
+    view.sort(key=lambda e: (e[1], e[2]))
+
+    # 4) Reserve = indices (post-rsid-sort) where has_clnsig OR has_rs_id.
+    all_reserved_post_sort = {
+        i for i, v in enumerate(view) if v[3] or v[4]
+    }
+
+    # 5) Plan cosmic against the post-rsid-sort view
+    cosmic_plan_post_sort = plan_inject_cosmic(
+        [(v[1], v[2]) for v in view],
+        cosmic_records or [], cosmic_inject_density, overlay_rng,
+        reserve_indices=all_reserved_post_sort,
+    )
+    cosmic_plan_treewalk: dict = {}
+    for ps_idx, rec in cosmic_plan_post_sort.items():
+        tw_idx = view[ps_idx][0]
+        cosmic_plan_treewalk[tw_idx] = rec
+
+    return clinvar_plan_treewalk, rsid_plan_treewalk, cosmic_plan_treewalk
 
 
 def stream_cohort_sites(
@@ -816,34 +950,21 @@ def stream_cohort_sites(
 
     annotation_map = _build_annotation_map(sites_meta, clinvar_records)
 
-    # Light (chrom, pos) view for the planners — sufficient for index
-    # picking and pos-collision avoidance.
-    sites_meta_chrpos = [(m[0], m[1]) for m in sites_meta]
-
-    from .clinvar import plan_inject_clinvar
-    from .dbsnp import plan_inject_rsids
-    from .cosmic import plan_inject_cosmic
-
     rng_for_plans = overlay_rng if overlay_rng is not None else rng
 
-    clinvar_plan = plan_inject_clinvar(
-        sites_meta_chrpos, clinvar_records or [],
-        clinvar_inject_density, rng_for_plans,
-    )
-    clinvar_reserved = set(annotation_map.keys()) | set(clinvar_plan.keys())
-    rsid_plan = plan_inject_rsids(
-        sites_meta_chrpos, rsid_pool or [],
-        rsid_density, rng_for_plans,
-        reserve_indices=clinvar_reserved,
-    )
-    all_reserved = clinvar_reserved | set(rsid_plan.keys())
-    cosmic_plan = plan_inject_cosmic(
-        sites_meta_chrpos, cosmic_records or [],
-        cosmic_inject_density, rng_for_plans,
-        reserve_indices=all_reserved,
+    clinvar_plan, rsid_plan, cosmic_plan = _plan_cohort_overlays(
+        sites_meta, annotation_map,
+        clinvar_records=clinvar_records,
+        clinvar_inject_density=clinvar_inject_density,
+        rsid_pool=rsid_pool, rsid_density=rsid_density,
+        cosmic_records=cosmic_records,
+        cosmic_inject_density=cosmic_inject_density,
+        overlay_rng=rng_for_plans,
     )
 
-    # Combine: cosmic last so its keys override on (impossible) collisions.
+    # Combine: each plan is keyed by tree-walk idx; the three sets of
+    # keys are disjoint by construction (reserve_indices), so update
+    # order doesn't matter for correctness.
     inject_map: dict = {}
     inject_map.update(clinvar_plan)
     inject_map.update(rsid_plan)

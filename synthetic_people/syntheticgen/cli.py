@@ -596,13 +596,11 @@ def _iter_chrom_sites_streaming(
     """
     from .coalescent import (
         simulate_cohort_ts_iter,
-        stream_cohort_sites,
         _tree_sequence_to_sites_meta,
         _build_annotation_map,
+        _plan_cohort_overlays,
+        _stream_cohort_pass2,
     )
-    from .clinvar import plan_inject_clinvar
-    from .dbsnp import plan_inject_rsids
-    from .cosmic import plan_inject_cosmic
     from .titv import DEFAULT_TARGET_TITV
 
     for chrom, ts, chrom_rng in simulate_cohort_ts_iter(
@@ -615,10 +613,13 @@ def _iter_chrom_sites_streaming(
         memprofile_mark(f"chrom {chrom} ts ready ({ts.num_sites} sites)")
         chrom_overlay_rng = random.Random(resume.overlay_seeds[chrom])
 
-        # Pre-compute the overlay plans once per chrom so we can both
-        # update ``overlay_stats`` and feed them into the stream
-        # without re-doing the rng-consuming work. Mirrors the rng
-        # bracket inside :func:`stream_cohort_sites`.
+        # Pre-compute the overlay plans once per chrom (so overlay_stats
+        # can be incremented before pass 2 drains the generator) while
+        # bracketing chrom_rng across the meta walk so pass 2's rng
+        # reproduces the same ref/alt picks. The chained-overlay
+        # planner mirrors the materialised path's sort-between-injects
+        # semantics for byte-identical output — see
+        # :func:`coalescent._plan_cohort_overlays`.
         state_before = chrom_rng.getstate()
         sites_meta = _tree_sequence_to_sites_meta(
             ts, chrom, args.n, chrom_rng, DEFAULT_TARGET_TITV,
@@ -626,23 +627,14 @@ def _iter_chrom_sites_streaming(
         annotation_map = _build_annotation_map(
             sites_meta, clinvar_index,
         )
-        sites_meta_chrpos = [(m[0], m[1]) for m in sites_meta]
-        clinvar_plan = plan_inject_clinvar(
-            sites_meta_chrpos, clinvar_index or [],
-            args.clinvar_inject_density, chrom_overlay_rng,
-        )
-        clinvar_reserved = set(annotation_map.keys()) | set(
-            clinvar_plan.keys())
-        rsid_plan = plan_inject_rsids(
-            sites_meta_chrpos, rsid_pool or [],
-            args.rsid_density, chrom_overlay_rng,
-            reserve_indices=clinvar_reserved,
-        )
-        all_reserved = clinvar_reserved | set(rsid_plan.keys())
-        cosmic_plan = plan_inject_cosmic(
-            sites_meta_chrpos, cosmic_pool or [],
-            args.cosmic_inject_density, chrom_overlay_rng,
-            reserve_indices=all_reserved,
+        clinvar_plan, rsid_plan, cosmic_plan = _plan_cohort_overlays(
+            sites_meta, annotation_map,
+            clinvar_records=clinvar_index,
+            clinvar_inject_density=args.clinvar_inject_density,
+            rsid_pool=rsid_pool, rsid_density=args.rsid_density,
+            cosmic_records=cosmic_pool,
+            cosmic_inject_density=args.cosmic_inject_density,
+            overlay_rng=chrom_overlay_rng,
         )
         overlay_stats["clinvar_annotated"] += len(annotation_map)
         overlay_stats["clinvar_injected"] += len(clinvar_plan)
@@ -650,13 +642,6 @@ def _iter_chrom_sites_streaming(
         overlay_stats["cosmic_injected"] += len(cosmic_plan)
         chrom_rng.setstate(state_before)
 
-        # Build the streaming generator. We use the lower-level pass-2
-        # invocation directly (rather than the high-level
-        # stream_cohort_sites entry point) so we don't re-run the
-        # planners and re-consume overlay_rng — we already did that
-        # above. The chrom_rng has been restored to its
-        # pre-pass-1 state for the pass-2 walk.
-        from .coalescent import _stream_cohort_pass2
         inject_map: dict = {}
         inject_map.update(clinvar_plan)
         inject_map.update(rsid_plan)
