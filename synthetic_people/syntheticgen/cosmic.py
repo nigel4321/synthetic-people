@@ -79,36 +79,49 @@ def load_cosmic_records(cosmic_vcf: Path,
     return out
 
 
-def inject_cosmic(sites: list[dict],
-                  cosmic_records: list[dict],
-                  density: float,
-                  rng: random.Random,
-                  reserve_indices: set[int] | None = None) -> int:
-    """Replace `density` × len(sites) cohort sites with COSMIC records.
+def plan_inject_cosmic(
+    sites_meta: list,
+    cosmic_records: list[dict],
+    density: float,
+    rng: random.Random,
+    reserve_indices: set[int] | None = None,
+) -> dict:
+    """Decide which sites to replace with COSMIC records.
 
-    Mirrors `clinvar.inject_clinvar` but writes COSMIC_GENE / COSMIC_ID
-    (and the ID column when present). Returns the number of injections.
+    Twin of :func:`syntheticgen.clinvar.plan_inject_clinvar` for the
+    somatic-overlay path. ``sites_meta`` is a sequence of ``(chrom,
+    pos)`` tuples; ``reserve_indices`` excludes sites already claimed
+    by an earlier overlay.
+
+    Returns ``{site_index: overlay_record}`` where each
+    ``overlay_record`` carries ``pos`` / ``ref`` / ``alts`` and
+    optionally ``id`` / ``cosmic_gene`` / ``cosmic_id`` when the
+    source record has non-``"."`` ``id`` / non-empty ``gene``. The
+    conditional-set semantics mirror :func:`inject_cosmic` exactly so
+    the apply path stays trivial.
+
+    RNG consumption order matches :func:`inject_cosmic` exactly.
     """
-    if density <= 0 or not sites or not cosmic_records:
-        return 0
-    chrom_set = {s["chrom"] for s in sites}
+    if density <= 0 or not sites_meta or not cosmic_records:
+        return {}
+    chrom_set = {meta[0] for meta in sites_meta}
     pool = [r for r in cosmic_records if r["chrom"] in chrom_set]
     if not pool:
-        return 0
+        return {}
 
     reserve_indices = reserve_indices or set()
-    candidate = [i for i in range(len(sites)) if i not in reserve_indices]
+    candidate = [i for i in range(len(sites_meta)) if i not in reserve_indices]
     if not candidate:
-        return 0
+        return {}
 
-    n_target = max(1, int(round(density * len(sites))))
+    n_target = max(1, int(round(density * len(sites_meta))))
     n_target = min(n_target, len(candidate), len(pool))
 
     rng.shuffle(candidate)
     pool_choices = rng.sample(pool, n_target)
 
-    used_keys: set = {(s["chrom"], s["pos"]) for s in sites}
-    injected = 0
+    used_keys: set = {(meta[0], meta[1]) for meta in sites_meta}
+    plan: dict = {}
     cursor = 0
     for rec in pool_choices:
         key = (rec["chrom"], rec["pos"])
@@ -118,25 +131,57 @@ def inject_cosmic(sites: list[dict],
         while cursor < len(candidate):
             i = candidate[cursor]
             cursor += 1
-            if sites[i]["chrom"] == rec["chrom"]:
+            if sites_meta[i][0] == rec["chrom"]:
                 target_i = i
                 break
         if target_i is None:
             break
-        site = sites[target_i]
-        old_key = (site["chrom"], site["pos"])
+        old_key = sites_meta[target_i]
         used_keys.discard(old_key)
         used_keys.add(key)
+        overlay: dict = {
+            "pos": rec["pos"],
+            "ref": rec["ref"],
+            "alts": [rec["alt"]],
+        }
+        if rec["id"] and rec["id"] != ".":
+            overlay["id"] = rec["id"]
+            overlay["cosmic_id"] = rec["id"]
+        if rec["gene"]:
+            overlay["cosmic_gene"] = rec["gene"]
+        plan[target_i] = overlay
+    return plan
+
+
+def inject_cosmic(sites: list[dict],
+                  cosmic_records: list[dict],
+                  density: float,
+                  rng: random.Random,
+                  reserve_indices: set[int] | None = None) -> int:
+    """Replace `density` × len(sites) cohort sites with COSMIC records.
+
+    Mirrors `clinvar.inject_clinvar` but writes COSMIC_GENE / COSMIC_ID
+    (and the ID column when present). Returns the number of injections.
+
+    Implementation note: delegates the rng-consuming planning to
+    :func:`plan_inject_cosmic` and then applies the resulting
+    ``{index: overlay}`` plan in place.
+    """
+    sites_meta = [(s["chrom"], s["pos"]) for s in sites]
+    plan = plan_inject_cosmic(
+        sites_meta, cosmic_records, density, rng,
+        reserve_indices=reserve_indices,
+    )
+    for idx, rec in plan.items():
+        site = sites[idx]
         site["pos"] = rec["pos"]
         site["ref"] = rec["ref"]
-        site["alts"] = [rec["alt"]]
-        if rec["id"] and rec["id"] != ".":
+        site["alts"] = rec["alts"]
+        if "id" in rec:
             site["id"] = rec["id"]
-        if rec["gene"]:
-            site["cosmic_gene"] = rec["gene"]
-        if rec["id"] and rec["id"] != ".":
-            site["cosmic_id"] = rec["id"]
-        injected += 1
-
+        if "cosmic_id" in rec:
+            site["cosmic_id"] = rec["cosmic_id"]
+        if "cosmic_gene" in rec:
+            site["cosmic_gene"] = rec["cosmic_gene"]
     sites.sort(key=lambda s: (s["chrom"], s["pos"]))
-    return injected
+    return len(plan)

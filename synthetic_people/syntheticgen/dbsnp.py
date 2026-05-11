@@ -120,6 +120,77 @@ def _normalise_rsid(id_field: str, info_rs: str) -> str:
     return ""
 
 
+def plan_inject_rsids(
+    sites_meta: list,
+    pool: list[dict],
+    density: float,
+    rng: random.Random,
+    reserve_indices: set[int] | None = None,
+) -> dict:
+    """Decide which sites to replace with dbSNP records.
+
+    Twin of :func:`syntheticgen.clinvar.plan_inject_clinvar` for the
+    rsID path. ``sites_meta`` is a sequence of ``(chrom, pos)`` tuples;
+    ``reserve_indices`` excludes sites already claimed by a previous
+    overlay (typically ClinVar injection) so two overlays don't fight
+    for the same row.
+
+    Returns ``{site_index: overlay_record}`` where each
+    ``overlay_record`` carries ``pos`` / ``ref`` / ``alts`` /
+    ``id`` (= ``rec["rsid"]``).
+
+    RNG consumption order matches :func:`inject_rsids` exactly:
+
+      1. ``rng.shuffle`` of the non-reserved candidate indices.
+      2. ``rng.sample`` of ``n_target`` records from the chrom-filtered
+         rsID pool.
+    """
+    if density <= 0 or not sites_meta or not pool:
+        return {}
+    chrom_set = {meta[0] for meta in sites_meta}
+    pool_local = [r for r in pool if r["chrom"] in chrom_set]
+    if not pool_local:
+        return {}
+
+    reserve_indices = reserve_indices or set()
+    candidate = [i for i in range(len(sites_meta)) if i not in reserve_indices]
+    if not candidate:
+        return {}
+
+    n_target = max(1, int(round(density * len(sites_meta))))
+    n_target = min(n_target, len(candidate), len(pool_local))
+
+    rng.shuffle(candidate)
+    pool_choices = rng.sample(pool_local, n_target)
+
+    used_keys: set = {(meta[0], meta[1]) for meta in sites_meta}
+    plan: dict = {}
+    cursor = 0
+    for rec in pool_choices:
+        key = (rec["chrom"], rec["pos"])
+        if key in used_keys:
+            continue
+        target_i = None
+        while cursor < len(candidate):
+            i = candidate[cursor]
+            cursor += 1
+            if sites_meta[i][0] == rec["chrom"]:
+                target_i = i
+                break
+        if target_i is None:
+            break
+        old_key = sites_meta[target_i]
+        used_keys.discard(old_key)
+        used_keys.add(key)
+        plan[target_i] = {
+            "pos": rec["pos"],
+            "ref": rec["ref"],
+            "alts": [rec["alt"]],
+            "id": rec["rsid"],
+        }
+    return plan
+
+
 def inject_rsids(sites: list[dict],
                  pool: list[dict],
                  density: float,
@@ -134,50 +205,21 @@ def inject_rsids(sites: list[dict],
 
     Sites are sorted by (chrom, pos) on exit. Returns the number of
     injections performed.
+
+    Implementation note: delegates the rng-consuming planning to
+    :func:`plan_inject_rsids` and then applies the resulting
+    ``{index: overlay}`` plan in place.
     """
-    if density <= 0 or not sites or not pool:
-        return 0
-    chrom_set = {s["chrom"] for s in sites}
-    pool_local = [r for r in pool if r["chrom"] in chrom_set]
-    if not pool_local:
-        return 0
-
-    reserve_indices = reserve_indices or set()
-    candidate = [i for i in range(len(sites)) if i not in reserve_indices]
-    if not candidate:
-        return 0
-
-    n_target = max(1, int(round(density * len(sites))))
-    n_target = min(n_target, len(candidate), len(pool_local))
-
-    rng.shuffle(candidate)
-    pool_choices = rng.sample(pool_local, n_target)
-
-    used_keys: set = {(s["chrom"], s["pos"]) for s in sites}
-    injected = 0
-    cursor = 0
-    for rec in pool_choices:
-        key = (rec["chrom"], rec["pos"])
-        if key in used_keys:
-            continue
-        target_i = None
-        while cursor < len(candidate):
-            i = candidate[cursor]
-            cursor += 1
-            if sites[i]["chrom"] == rec["chrom"]:
-                target_i = i
-                break
-        if target_i is None:
-            break
-        site = sites[target_i]
-        old_key = (site["chrom"], site["pos"])
-        used_keys.discard(old_key)
-        used_keys.add(key)
+    sites_meta = [(s["chrom"], s["pos"]) for s in sites]
+    plan = plan_inject_rsids(
+        sites_meta, pool, density, rng,
+        reserve_indices=reserve_indices,
+    )
+    for idx, rec in plan.items():
+        site = sites[idx]
         site["pos"] = rec["pos"]
         site["ref"] = rec["ref"]
-        site["alts"] = [rec["alt"]]
-        site["id"] = rec["rsid"]
-        injected += 1
-
+        site["alts"] = rec["alts"]
+        site["id"] = rec["id"]
     sites.sort(key=lambda s: (s["chrom"], s["pos"]))
-    return injected
+    return len(plan)

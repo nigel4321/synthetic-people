@@ -236,6 +236,83 @@ def annotate_clinvar(sites: list[dict],
     return n
 
 
+def plan_inject_clinvar(
+    sites_meta: list,
+    clinvar_records: list[dict],
+    density: float,
+    rng: random.Random,
+) -> dict:
+    """Decide which sites to replace with ClinVar records.
+
+    ``sites_meta`` is a sequence of ``(chrom, pos)`` tuples giving the
+    light-weight view of the cohort sites — exactly enough information
+    for the planner to (a) pick injection indices, (b) avoid position
+    collisions with existing sites. The full site dicts (with carriers,
+    AF, etc.) are not needed here.
+
+    Returns a ``{site_index: overlay_record}`` dict where each
+    ``overlay_record`` carries the fields ``inject_clinvar`` would
+    write into the site at that index: ``pos`` / ``ref`` / ``alts``
+    (list) / ``id`` / ``clnsig`` / ``clndn``.
+
+    RNG consumption order matches ``inject_clinvar`` exactly:
+
+      1. ``rng.shuffle`` of ``range(len(sites_meta))``.
+      2. ``rng.sample`` of ``n_target`` records from the chrom-filtered
+         ClinVar pool.
+
+    Phase 5d streaming-cohort follow-up: this function is the
+    rng-consuming half of the overlay logic, extracted so it can be
+    called from a streaming context (where the full sites list never
+    exists in memory) and from the legacy in-place
+    :func:`inject_clinvar` (where it still does). Both paths give
+    byte-identical output at every fixed seed.
+    """
+    if density <= 0 or not sites_meta or not clinvar_records:
+        return {}
+    chrom_set = {meta[0] for meta in sites_meta}
+    pool = [r for r in clinvar_records if r["chrom"] in chrom_set]
+    if not pool:
+        return {}
+    n_target = max(1, int(round(density * len(sites_meta))))
+    n_target = min(n_target, len(sites_meta), len(pool))
+
+    site_indices = list(range(len(sites_meta)))
+    rng.shuffle(site_indices)
+    pool_choices = rng.sample(pool, n_target)
+
+    used_keys: set = {(meta[0], meta[1]) for meta in sites_meta}
+    plan: dict = {}
+    cursor = 0
+    for rec in pool_choices:
+        key = (rec["chrom"], rec["pos"])
+        # Skip ClinVar records whose coordinate is already occupied —
+        # keeps positions unique without re-deriving them.
+        if key in used_keys:
+            continue
+        target_i = None
+        while cursor < len(site_indices):
+            i = site_indices[cursor]
+            cursor += 1
+            if sites_meta[i][0] == rec["chrom"]:
+                target_i = i
+                break
+        if target_i is None:
+            break
+        old_key = sites_meta[target_i]
+        used_keys.discard(old_key)
+        used_keys.add(key)
+        plan[target_i] = {
+            "pos": rec["pos"],
+            "ref": rec["ref"],
+            "alts": [rec["alt"]],
+            "id": rec["id"],
+            "clnsig": rec["clnsig"],
+            "clndn": rec["clndn"],
+        }
+    return plan
+
+
 def inject_clinvar(sites: list[dict],
                    clinvar_records: list[dict],
                    density: float,
@@ -251,50 +328,21 @@ def inject_clinvar(sites: list[dict],
 
     Sites are sorted by (chrom, pos) on exit, so the cohort site list
     stays monotone for downstream consumers.
+
+    Implementation note: delegates the rng-consuming planning to
+    :func:`plan_inject_clinvar` and then applies the resulting
+    ``{index: overlay}`` plan in place. Byte-identical at every fixed
+    seed to the pre-refactor implementation.
     """
-    if density <= 0 or not sites or not clinvar_records:
-        return 0
-    chrom_set = {s["chrom"] for s in sites}
-    pool = [r for r in clinvar_records if r["chrom"] in chrom_set]
-    if not pool:
-        return 0
-    n_target = max(1, int(round(density * len(sites))))
-    n_target = min(n_target, len(sites), len(pool))
-
-    site_indices = list(range(len(sites)))
-    rng.shuffle(site_indices)
-    pool_choices = rng.sample(pool, n_target)
-
-    used_keys: set = {(s["chrom"], s["pos"]) for s in sites}
-    injected = 0
-    cursor = 0
-    for rec in pool_choices:
-        key = (rec["chrom"], rec["pos"])
-        # Skip ClinVar records whose coordinate is already occupied by a
-        # cohort site — keeps positions unique without re-deriving them.
-        if key in used_keys:
-            continue
-        # Find the next site index on the same chromosome to swap into.
-        target_i = None
-        while cursor < len(site_indices):
-            i = site_indices[cursor]
-            cursor += 1
-            if sites[i]["chrom"] == rec["chrom"]:
-                target_i = i
-                break
-        if target_i is None:
-            break
-        site = sites[target_i]
-        old_key = (site["chrom"], site["pos"])
-        used_keys.discard(old_key)
-        used_keys.add(key)
+    sites_meta = [(s["chrom"], s["pos"]) for s in sites]
+    plan = plan_inject_clinvar(sites_meta, clinvar_records, density, rng)
+    for idx, rec in plan.items():
+        site = sites[idx]
         site["pos"] = rec["pos"]
         site["ref"] = rec["ref"]
-        site["alts"] = [rec["alt"]]
+        site["alts"] = rec["alts"]
         site["id"] = rec["id"]
         site["clnsig"] = rec["clnsig"]
         site["clndn"] = rec["clndn"]
-        injected += 1
-
     sites.sort(key=lambda s: (s["chrom"], s["pos"]))
-    return injected
+    return len(plan)
