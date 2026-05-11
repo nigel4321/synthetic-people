@@ -8,18 +8,7 @@
 #     for the per-VCF cohort PCA scatter. Missing any of those is not
 #     fatal — the script writes a tombstone JSON and a zero-byte PNG
 #     so the pipeline doesn't abort, but no PCA is produced.
-multiqc>=1.18,<1.28
-# Multiqc 1.28 made a previously-tolerant code path strict: where 1.27.1
-# and earlier logged "Tried to make bar plot, but had no data: <id>" and
-# continued, 1.28+ raise ``ValueError("No datasets to plot")`` from
-# ``multiqc/plots/plot.py:initialize`` and abort. The bcftools-stats
-# module triggers this every time a per-sample plot dataset is all
-# zeros (e.g. our test VCFs emit GT only, no DP/FORMAT, so the
-# Sequencing-depth bargraph receives all-zero depths). Pin to the last
-# lenient release (1.27.x) until either we add per-call DP to the
-# pipeline output or multiqc restores the tolerant behaviour. Verified
-# the boundary by bisecting 1.18 / 1.25.2 / 1.27.1 / 1.28: 1.27.1 has
-# only the ``logger.warning`` path; 1.28 already has the ``raise``.
+multiqc>=1.18
 numpy>=1.24
 scikit-learn>=1.3
 matplotlib>=3.7

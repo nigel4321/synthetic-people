@@ -160,6 +160,63 @@ DEFAULT_REFERENCE = (
 )
 
 
+def _format_per_call(gt_str: str, rng: random.Random) -> str:
+    """Build the ``GT:DP:GQ:AD`` value for one sample's call.
+
+    The pipeline's test VCFs were originally GT-only, which left
+    bcftools stats reporting zero average depth and zero singletons
+    per sample. MultiQC 1.28+ now raises ``ValueError("No datasets
+    to plot")`` whenever a per-sample plot dataset is all zeros
+    (e.g. the Sequencing-depth bargraph), so the e2e test would
+    crash inside MultiQC even though the rest of the pipeline ran
+    cleanly. Emitting plausible quality metrics here keeps the test
+    fixtures within the data shape those downstream tools expect,
+    without touching production code.
+
+    Distributions are intentionally light: mean DP ~30 (Gaussian,
+    clamped to [10, 60]); GQ 99 for confident hom calls, ~85 for
+    heterozygous; AD allocated so the two counts sum to DP and
+    proportions reflect the GT (50/50 for het with small noise,
+    DP/0 or 0/DP for hom). Drawn from the same seeded RNG that
+    produces the genotype so the entire VCF stays deterministic at
+    a given seed.
+
+    Missing calls (``./.`` or ``.|.``) emit ``./.:.:.:.,.`` — the
+    VCF convention for "no data for this sample".
+    """
+    if gt_str in ("./.", ".|."):
+        return f"{gt_str}:.:.:.,."
+
+    sep = "|" if "|" in gt_str else "/"
+    try:
+        a1, a2 = gt_str.split(sep)
+        a1_int = int(a1)
+        a2_int = int(a2)
+    except ValueError:
+        return f"{gt_str}:.:.:.,."
+
+    is_hom_ref = a1_int == 0 and a2_int == 0
+    is_hom_alt = a1_int == a2_int and a1_int != 0
+    is_het = a1_int != a2_int
+
+    dp = max(10, min(60, int(rng.gauss(30, 5))))
+    if is_het:
+        gq = max(30, min(99, int(rng.gauss(85, 8))))
+    else:
+        gq = max(60, min(99, int(rng.gauss(99, 5))))
+
+    if is_hom_ref:
+        ref_d, alt_d = dp, 0
+    elif is_hom_alt:
+        ref_d, alt_d = 0, dp
+    else:
+        # Het: ~50/50 with small jitter, then re-clamp to sum to DP
+        ref_d = max(0, min(dp, int(rng.gauss(dp / 2, dp * 0.1))))
+        alt_d = dp - ref_d
+
+    return f"{gt_str}:{dp}:{gq}:{ref_d},{alt_d}"
+
+
 def _build_header(
     chrom: str,
     cohort: SyntheticCohort,
@@ -207,9 +264,22 @@ def _build_header(
         ]
     lines.extend(info_declarations)
     if declare_format_gt:
-        lines.append(
-            '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">'
-        )
+        lines.extend([
+            '##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">',
+            # DP/GQ/AD declarations support the GT:DP:GQ:AD per-sample
+            # block emitted by write_vcf. Real Phase 3 VCFs use just GT,
+            # but downstream tools (bcftools stats Sequencing-depth
+            # bargraph; MultiQC's bcftools module from 1.28+) require
+            # non-trivial per-call quality data to render. Synthesising
+            # plausible DP / GQ / AD per call keeps the test fixtures
+            # within the data shape those tools expect.
+            '##FORMAT=<ID=DP,Number=1,Type=Integer,'
+            'Description="Approximate read depth">',
+            '##FORMAT=<ID=GQ,Number=1,Type=Integer,'
+            'Description="Genotype quality">',
+            '##FORMAT=<ID=AD,Number=R,Type=Integer,'
+            'Description="Allelic depths for the ref and alt alleles">',
+        ])
     lines.append(
         "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\t"
         + "\t".join(cohort.samples)
@@ -272,9 +342,10 @@ def write_vcf(
             gts = _realize_genotypes(v, cohort, rng)
             ac, an, pop_af = _compute_pop_stats(gts, cohort.samples, cohort)
             info = _format_info(ac, an, pop_af, v)
+            per_call = [_format_per_call(g, rng) for g in gts]
             fields = [
                 chrom, str(v.pos), v.variant_id, v.ref, v.alt,
-                "100", "PASS", info, "GT", *gts,
+                "100", "PASS", info, "GT:DP:GQ:AD", *per_call,
             ]
             fh.write("\t".join(fields) + "\n")
 
