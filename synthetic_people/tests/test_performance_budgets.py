@@ -96,9 +96,17 @@ CANARY_N = 20
 CANARY_SEED = 4242
 
 
+# Hard ceiling on subprocess runtime. The canary completes in ~12 s
+# locally; a 5-minute deadline gives generous headroom for slow CI
+# runners while still bounding the worst case so a stalled child
+# can't hang the job indefinitely.
+SUBPROCESS_TIMEOUT_SECONDS = 300
+
+
 def _canary_args(
     out_dir: Path,
     cohort_mode: str,
+    cache_dir: Path,
 ) -> list[str]:
     """CLI args for the canary cohort run.
 
@@ -107,6 +115,14 @@ def _canary_args(
     which is exactly what the budgets are gating on. ``--workers 1``
     pins the parent path; worker fan-out has its own per-worker
     budget that's separate from parent peak.
+
+    ``cache_dir`` is taken as a parameter rather than derived from
+    ``out_dir`` so multiple tests in the same class can share one
+    cache — defensive against the possibility that a future cli
+    change makes ClinVar/dbSNP fetching unconditional (today
+    overlay-density=0 skips it). Sharing one cache means the
+    network hit is paid at most once per test class, not once per
+    cohort mode.
     """
     return [
         "--no-config",  # ignore any cwd config that would skew results
@@ -123,7 +139,7 @@ def _canary_args(
         "--dropout-rate", "0",
         "--workers", "1",
         "--output-dir", str(out_dir),
-        "--cache-dir", str(out_dir / "cache"),
+        "--cache-dir", str(cache_dir),
         "--mode", "cohort",
         "--cohort-mode", cohort_mode,
     ]
@@ -146,6 +162,7 @@ _CANARY_RUNNER_SCRIPT = textwrap.dedent("""
 def _run_canary_in_subprocess(
     test_case: unittest.TestCase,
     cohort_mode: str,
+    cache_dir: Path,
 ) -> float:
     """Spawn a fresh Python subprocess that runs the canary cli;
     sample its RSS at 50 ms cadence; return absolute peak in MB.
@@ -154,6 +171,12 @@ def _run_canary_in_subprocess(
     across tests: a fresh interpreter has none of the prior tests'
     sticky allocations, so the peak reflects exactly what this mode
     requires when run cold.
+
+    Wall-clock-bounded: a stalled child (network hang, deadlock,
+    bug) is killed at ``SUBPROCESS_TIMEOUT_SECONDS`` rather than
+    being allowed to wedge the CI job. stderr is redirected to a
+    file rather than a pipe so the cli's progress prints can't fill
+    the pipe buffer and block the child mid-run.
     """
     import json
     import psutil
@@ -161,40 +184,68 @@ def _run_canary_in_subprocess(
     script = _CANARY_RUNNER_SCRIPT.format(repo_root=repo_root)
     with tempfile.TemporaryDirectory() as tmp:
         out_dir = Path(tmp) / "out"
-        args = _canary_args(out_dir, cohort_mode)
+        args = _canary_args(out_dir, cohort_mode, cache_dir)
         # Write args to a temp file rather than stdin: stdin pipes
         # interact awkwardly with the RSS-sampling loop (closing
         # stdin from the parent races with the child's read), and a
         # short file is simpler than getting that timing right.
         args_path = Path(tmp) / "args.json"
         args_path.write_text(json.dumps(args))
-        # ``stdout=DEVNULL`` and ``stderr=PIPE`` so the cli's
-        # progress prints don't fill a pipe buffer and block the
-        # child while we're polling.
-        proc = subprocess.Popen(
-            [sys.executable, "-c", script, str(args_path)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-        ps_proc = psutil.Process(proc.pid)
-        peak_bytes = 0
-        # Sample until the subprocess exits. ``poll() is None`` is
-        # the fast non-blocking liveness check; ``memory_info`` will
-        # raise NoSuchProcess once the child reaps.
-        while proc.poll() is None:
-            try:
-                rss = ps_proc.memory_info().rss
-                if rss > peak_bytes:
-                    peak_bytes = rss
-            except (psutil.NoSuchProcess, psutil.ZombieProcess):
-                break
-            time.sleep(0.05)
-        # Drain stderr (which might have content) and finalise.
-        _, stderr = proc.communicate(timeout=30)
+        # stderr → temp file rather than PIPE: the cli prints
+        # progress lines and warnings to stderr throughout the run;
+        # a PIPE without a concurrent reader can fill its ~64 KB
+        # buffer and block the child write, which would never let
+        # ``poll()`` return non-None and would hang the test. A file
+        # has unbounded capacity and is trivially readable for
+        # diagnostics on failure.
+        stderr_path = Path(tmp) / "stderr.txt"
+        with stderr_path.open("wb") as stderr_fh:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", script, str(args_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=stderr_fh,
+            )
+            ps_proc = psutil.Process(proc.pid)
+            peak_bytes = 0
+            deadline = time.monotonic() + SUBPROCESS_TIMEOUT_SECONDS
+            # Sample until the subprocess exits or we hit the
+            # deadline. ``poll() is None`` is the fast non-blocking
+            # liveness check; ``memory_info`` raises NoSuchProcess
+            # once the child reaps.
+            timed_out = False
+            while proc.poll() is None:
+                if time.monotonic() > deadline:
+                    timed_out = True
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    break
+                try:
+                    rss = ps_proc.memory_info().rss
+                    if rss > peak_bytes:
+                        peak_bytes = rss
+                except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                    break
+                time.sleep(0.05)
+        # Read the stderr tail unconditionally — useful diagnostic
+        # for either timeout or non-zero exit.
+        try:
+            stderr_text = stderr_path.read_text(errors="replace")
+        except OSError:
+            stderr_text = "<could not read stderr file>"
+        if timed_out:
+            test_case.fail(
+                f"canary subprocess for --cohort-mode {cohort_mode} "
+                f"did not exit within {SUBPROCESS_TIMEOUT_SECONDS}s; "
+                f"killed. Args: {args!r}\n"
+                f"stderr tail:\n{stderr_text[-1500:]}",
+            )
         test_case.assertEqual(
             proc.returncode, 0,
             f"canary subprocess returned {proc.returncode}.\n"
-            f"stderr: {stderr.decode(errors='replace')[-1500:]}",
+            f"stderr tail:\n{stderr_text[-1500:]}",
         )
         return peak_bytes / (1024 * 1024)
 
@@ -215,8 +266,35 @@ class CohortPeakRssBudgetTest(unittest.TestCase):
     not a downstream OOM days later at WGS scale.
     """
 
+    # Class-level shared cache so all three mode-budget tests reuse
+    # one ClinVar/dbSNP cache rather than fetching fresh per test.
+    # Today's cli skips overlay-fetch when densities are 0 (which
+    # the canary sets), but if a future change makes the fetch
+    # unconditional, sharing the cache caps the network cost at
+    # one download per CI job instead of three.
+    _cache_tmp: tempfile.TemporaryDirectory | None = None
+    _cache_dir: Path | None = None
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._cache_tmp = tempfile.TemporaryDirectory(
+            prefix="perf_budget_cache_",
+        )
+        cls._cache_dir = Path(cls._cache_tmp.name)
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls._cache_tmp is not None:
+            cls._cache_tmp.cleanup()
+            cls._cache_tmp = None
+            cls._cache_dir = None
+        super().tearDownClass()
+
     def _check_budget(self, cohort_mode: str) -> None:
-        peak_mb = _run_canary_in_subprocess(self, cohort_mode)
+        peak_mb = _run_canary_in_subprocess(
+            self, cohort_mode, self._cache_dir,
+        )
         budget_mb = PEAK_RSS_BUDGET_MB[cohort_mode]
         # Report both numbers so a failure tells the developer
         # immediately whether they're over by a hair or by a lot.
