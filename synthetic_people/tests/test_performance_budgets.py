@@ -344,9 +344,10 @@ class CohortPeakRssBudgetTest(unittest.TestCase):
         # error here is clearer than the downstream ``str(None)``
         # call that would otherwise produce a confused
         # ``--cache-dir None`` cli invocation.
-        assert self._cache_dir is not None, (
+        self.assertIsNotNone(
+            self._cache_dir,
             "setUpClass did not initialise _cache_dir; the class-"
-            "level cache directory contract is violated."
+            "level cache directory contract is violated.",
         )
         peak_mb = _run_canary_in_subprocess(
             self, cohort_mode, self._cache_dir,
