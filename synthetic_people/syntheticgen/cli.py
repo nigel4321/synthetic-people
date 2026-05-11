@@ -316,6 +316,53 @@ _ARROW_AUTO_THRESHOLD = 100_000
 _VARIANTS_PER_MB = 5_000
 
 
+def _effective_chr_length_mb(
+    chr_length_mb: float,
+    chromosomes: list | None,
+    build: str | None,
+) -> float:
+    """Per-chromosome length the auto-pick heuristics should use.
+
+    ``--chr-length-mb`` semantics: ``> 0`` caps each chromosome's
+    simulated prefix to that many Mb; ``0`` (default) means simulate
+    the full contig length. For RAM / disk estimates the BINDING
+    constraint is one chromosome's working set (we process them
+    serially), so when ``chr_length_mb <= 0`` we need to look at the
+    *longest* contig in the requested set — typically chr1 at ~249 Mb
+    on GRCh38.
+
+    Returns the resolved length in Mb. Falls through to ``0.0`` when
+    neither an explicit length nor enough info to derive one is
+    available (the caller's heuristics should then skip
+    chr_length-driven checks rather than misfire on stale data).
+    """
+    if chr_length_mb > 0:
+        return chr_length_mb
+    if not chromosomes or not build:
+        return 0.0
+    from .builds import BUILDS
+    contigs = BUILDS[build]["contigs"]
+    max_bp = max(
+        (contigs[c] for c in chromosomes if c in contigs),
+        default=0,
+    )
+    return max_bp / 1_000_000 if max_bp > 0 else 0.0
+
+
+def _chunking_would_split(chunk_size_mb: float,
+                          effective_chr_length_mb: float) -> bool:
+    """True iff ``chunk_size_mb`` would actually split the per-chrom
+    simulation into multiple chunks. Mirrors the predicate inside
+    :func:`coalescent.simulate_chromosome_ts` / ``simulate_chromosome``:
+    a chunk size of 0 or one ≥ the chrom length is a no-op.
+    """
+    if chunk_size_mb <= 0:
+        return False
+    if effective_chr_length_mb <= 0:
+        return False
+    return chunk_size_mb < effective_chr_length_mb
+
+
 def _estimate_materialised_parent_peak_bytes(
     n_samples: int, chr_length_mb: float
 ) -> int:
@@ -337,10 +384,13 @@ def _estimate_materialised_parent_peak_bytes(
 
 def _resolve_cohort_mode(cli_mode: str, n: int,
                          chr_length_mb: float = 0.0,
+                         chromosomes: list | None = None,
+                         build: str | None = None,
+                         chunk_size_mb: float = 0.0,
                          host_ram_bytes: int | None = None) -> str:
     """Map ``--cohort-mode {sites_list,arrow,arrow-streaming,auto}``
-    + ``--n`` + chromosome size to the concrete mode used by the
-    cohort-write loop.
+    + ``--n`` + chromosome size + chunking to the concrete mode used
+    by the cohort-write loop.
 
     Returns one of ``"sites_list"``, ``"arrow"``, or
     ``"arrow-streaming"`` (never ``"auto"``).
@@ -348,23 +398,26 @@ def _resolve_cohort_mode(cli_mode: str, n: int,
     ``auto`` resolution:
 
     - First, check whether the predicted materialised parent peak
-      exceeds ~50% of host RAM. If so, pick ``arrow-streaming`` so
-      the parent never holds the full sites list — required for
-      WGS-scale runs (predicted ~60 GB parent at n=3000 × chr1 full
-      length).
-    - Otherwise, pick ``arrow`` for ``n >= 100000`` (the existing
-      threshold — keeps the materialised+arrow path for medium-n
-      runs where the per-site Python overhead isn't yet the binding
-      cost).
+      exceeds ~50% of host RAM. If so, *and* chunking would not
+      actually split the simulation (streaming doesn't yet support
+      chunked sim), pick ``arrow-streaming``.
+    - Otherwise, pick ``arrow`` for ``n >= 100000``.
     - Otherwise, pick ``sites_list`` (Phase B; bounded at n~30k by
       the refcount-COW divergence).
 
-    ``host_ram_bytes`` defaults to ``psutil.virtual_memory().total``
-    when ``psutil`` is available; otherwise a conservative fallback
-    of 32 GB (the smallest workstation class we target). The
-    ``chr_length_mb`` argument is used only for the predicted-peak
-    auto-pick; pass ``0`` when the caller doesn't care about
-    streaming-mode escalation.
+    For the predicted-peak check the effective per-chromosome length
+    is needed. When ``chr_length_mb > 0`` use it directly; when it's
+    0 (= full contig length), derive the longest contig from
+    ``(chromosomes, build)`` since we process chromosomes serially
+    and chr1 is typically the binding constraint.
+
+    ``chunk_size_mb`` is consulted only for the streaming branch:
+    streaming doesn't yet support a chunked simulation that would
+    actually split a chromosome, so auto avoids streaming when
+    chunking would split. The cli still has a separate explicit-
+    mode check that hard-errors on
+    ``--cohort-mode arrow-streaming --chr-chunk-mb > 0`` when the
+    chunk would split.
     """
     if cli_mode == "sites_list":
         return "sites_list"
@@ -379,15 +432,28 @@ def _resolve_cohort_mode(cli_mode: str, n: int,
             host_ram_bytes = psutil.virtual_memory().total
         except ImportError:
             host_ram_bytes = 32 * 1024**3  # 32 GB conservative fallback
-    if chr_length_mb > 0:
-        # Predicted peak is per-chromosome (we process one at a time
-        # so this is the binding constraint, not the cohort-wide
-        # cumulative).
+    effective_length_mb = _effective_chr_length_mb(
+        chr_length_mb, chromosomes, build,
+    )
+    if effective_length_mb > 0:
         predicted = _estimate_materialised_parent_peak_bytes(
-            n, chr_length_mb,
+            n, effective_length_mb,
         )
         if predicted > 0.5 * host_ram_bytes:
-            return "arrow-streaming"
+            # Streaming wins on memory — *unless* chunking would
+            # split the simulation, in which case the chunked
+            # materialised+arrow path is the right call (chunked
+            # streaming isn't implemented yet). When chunking
+            # blocks streaming we still prefer ``arrow`` over
+            # ``sites_list`` regardless of the n>=100k threshold:
+            # the workload that triggered the predicted-peak gate
+            # is large enough that workers benefit from mmap-share
+            # even if parent still materialises the sites list.
+            if not _chunking_would_split(
+                chunk_size_mb, effective_length_mb,
+            ):
+                return "arrow-streaming"
+            return "arrow"
     return "arrow" if n >= _ARROW_AUTO_THRESHOLD else "sites_list"
 
 
@@ -1095,9 +1161,39 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
     # and (if it ends up Arrow) pre-flight the disk before any
     # simulation work. Doing this before resume / sample draw means
     # an insufficient-disk run aborts cheaply.
+    #
+    # Auto-pick considers full-contig length (when --chr-length-mb 0)
+    # by deriving the longest contig in the requested chromosome set
+    # — chr1 at ~249 Mb on GRCh38 is what drives the WGS-n=3000
+    # streaming pick. Chunking is also taken into account because
+    # streaming doesn't yet support a chunked simulation that would
+    # split a chromosome; in that case auto stays on arrow.
     cohort_mode = _resolve_cohort_mode(
-        args.cohort_mode, args.n, chr_length_mb=args.chr_length_mb,
+        args.cohort_mode, args.n,
+        chr_length_mb=args.chr_length_mb,
+        chromosomes=chromosomes, build=args.build,
+        chunk_size_mb=args.chr_chunk_mb,
     )
+    # Pre-flight: explicit ``--cohort-mode arrow-streaming`` combined
+    # with an explicit ``--chr-chunk-mb`` that would split the
+    # simulation isn't supported (simulate_chromosome_ts raises
+    # NotImplementedError if it gets there). Catch it here so the
+    # user sees a clear message immediately rather than after several
+    # minutes of msprime work.
+    if (args.cohort_mode == "arrow-streaming"
+            and args.chr_chunk_mb > 0):
+        eff_len_mb = _effective_chr_length_mb(
+            args.chr_length_mb, chromosomes, args.build,
+        )
+        if _chunking_would_split(args.chr_chunk_mb, eff_len_mb):
+            sys.exit(
+                f"--cohort-mode arrow-streaming does not yet support "
+                f"a chunked simulation that splits chromosomes "
+                f"(--chr-chunk-mb {args.chr_chunk_mb} Mb < effective "
+                f"chrom length {eff_len_mb:.1f} Mb). Either pass "
+                f"--chr-chunk-mb 0 (no chunking) or use "
+                f"--cohort-mode arrow / sites_list."
+            )
     if cohort_mode in ("arrow", "arrow-streaming"):
         try:
             from . import cohort_arrow  # noqa: F401
@@ -1217,6 +1313,39 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
             f"  --chr-chunk-mb override: {chunk_size_mb:.2f} Mb",
             file=sys.stderr,
         )
+
+    # Second-pass cohort-mode adjustment: if the resolved
+    # ``chunk_size_mb`` (auto-picked or explicit) would actually
+    # split the simulation, and we previously resolved cohort_mode to
+    # arrow-streaming, we have to handle the unsupported combination.
+    # For ``--cohort-mode auto``: silently demote streaming → arrow
+    # since the chunked materialised+arrow path covers the same
+    # memory ceiling. For explicit ``--cohort-mode arrow-streaming``
+    # the early pre-flight above already handled the explicit-chunk
+    # case; the auto-picked-chunk case is what we catch here.
+    if cohort_mode == "arrow-streaming":
+        eff_len_mb = _effective_chr_length_mb(
+            args.chr_length_mb, chromosomes, args.build,
+        )
+        if _chunking_would_split(chunk_size_mb, eff_len_mb):
+            if args.cohort_mode == "arrow-streaming":
+                sys.exit(
+                    f"--cohort-mode arrow-streaming does not yet "
+                    f"support a chunked simulation that splits "
+                    f"chromosomes. Chunk size auto-picked at "
+                    f"{chunk_size_mb:.2f} Mb < effective chrom "
+                    f"length {eff_len_mb:.1f} Mb. Pass an explicit "
+                    f"--chr-chunk-mb 0 to disable chunking, or use "
+                    f"--cohort-mode arrow / sites_list."
+                )
+            print(
+                f"  --cohort-mode auto demoted arrow-streaming → "
+                f"arrow because chunk_size_mb={chunk_size_mb:.2f} "
+                f"would split the simulation (streaming does not yet "
+                f"support chunked sim)",
+                file=sys.stderr,
+            )
+            cohort_mode = "arrow"
 
     print(
         f"Simulating coalescent cohort (streamed): {args.n} people "

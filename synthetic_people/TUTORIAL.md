@@ -773,7 +773,7 @@ shaves one disk pass per person.
 > falls back to `sites_list` and prints a one-line warning.
 
 Between simulation and the BCF write, the cohort lives in some
-intermediate form. `--cohort-mode {sites_list, arrow, auto}`
+intermediate form. `--cohort-mode {sites_list, arrow, arrow-streaming, auto}`
 selects which:
 
 | Mode | What happens | When to use |

@@ -353,5 +353,158 @@ class ResolveCohortModeAutoPickStreamingTest(unittest.TestCase):
         )
 
 
+class ResolveCohortModeFullLengthAutoPickTest(unittest.TestCase):
+    """Regression test for PR #52 Copilot review comments 1 & 4.
+
+    Pre-fix bug: ``--chr-length-mb 0`` (full contig length) skipped
+    the predicted-peak check entirely, so the auto-pick fell through
+    to the n>=100k cascade. For WGS-n=3000 (the exact scenario the
+    streaming refactor was built for) this auto-picked ``sites_list``
+    — the OOM-prone path. Now ``_resolve_cohort_mode`` derives the
+    effective per-chrom length from the build's contig table when
+    ``chr_length_mb <= 0``."""
+
+    def test_full_length_wgs_n3000_picks_streaming_on_32gb_host(self):
+        from syntheticgen.cli import _resolve_cohort_mode
+        # chr1 on GRCh38 is ~249 Mb. n=3000 × 249 Mb × ~90 KB/sample/Mb
+        # ≈ 67 GB predicted parent peak. On a 32 GB host this is well
+        # above the 50% threshold (16 GB), so auto must pick streaming.
+        self.assertEqual(
+            _resolve_cohort_mode(
+                "auto", 3_000, chr_length_mb=0,
+                chromosomes=["1"], build="GRCh38",
+                host_ram_bytes=32 * 1024**3,
+            ),
+            "arrow-streaming",
+        )
+
+    def test_full_length_chr22_only_small_n_stays_on_sites_list(self):
+        from syntheticgen.cli import _resolve_cohort_mode
+        # chr22 on GRCh38 is ~51 Mb. n=1000 × 51 × 90 KB ≈ 4.6 GB
+        # — well under the 50% threshold on any host. Falls through
+        # to the n>=100k cascade; n=1000 picks sites_list.
+        self.assertEqual(
+            _resolve_cohort_mode(
+                "auto", 1_000, chr_length_mb=0,
+                chromosomes=["22"], build="GRCh38",
+                host_ram_bytes=32 * 1024**3,
+            ),
+            "sites_list",
+        )
+
+    def test_full_length_multi_chrom_uses_largest_as_binding(self):
+        from syntheticgen.cli import _resolve_cohort_mode
+        # User passes --chromosomes 1,22. We process serially, so the
+        # per-chrom peak is bound by chr1 (longest). The effective
+        # length should be ~249 Mb, not the average or chr22.
+        self.assertEqual(
+            _resolve_cohort_mode(
+                "auto", 3_000, chr_length_mb=0,
+                chromosomes=["1", "22"], build="GRCh38",
+                host_ram_bytes=32 * 1024**3,
+            ),
+            "arrow-streaming",
+        )
+
+    def test_explicit_length_still_used_when_provided(self):
+        from syntheticgen.cli import _resolve_cohort_mode
+        # When --chr-length-mb is set, it overrides the contig lookup
+        # — this is the original (pre-fix) behaviour, preserved.
+        self.assertEqual(
+            _resolve_cohort_mode(
+                "auto", 3_000, chr_length_mb=70,
+                chromosomes=["1"], build="GRCh38",
+                host_ram_bytes=32 * 1024**3,
+            ),
+            "arrow-streaming",
+        )
+
+
+class ResolveCohortModeChunkingInteractionTest(unittest.TestCase):
+    """Regression test for PR #52 Copilot review comment 2.
+
+    Pre-fix bug: ``--cohort-mode arrow-streaming`` (or auto picking
+    it) combined with ``--chr-chunk-mb > 0`` that would split the
+    simulation would crash inside ``simulate_chromosome_ts`` with
+    ``NotImplementedError`` mid-run. Now the auto-pick avoids
+    streaming when chunking would split, and the cli pre-flight
+    catches the explicit-explicit combination early."""
+
+    def test_auto_skips_streaming_when_chunking_would_split(self):
+        from syntheticgen.cli import _resolve_cohort_mode
+        # WGS-n3000 scenario that would normally pick streaming, but
+        # the user requested --chr-chunk-mb 5 (which would split a
+        # 249 Mb chromosome 50 ways). Auto must fall back to arrow.
+        self.assertEqual(
+            _resolve_cohort_mode(
+                "auto", 3_000, chr_length_mb=0,
+                chromosomes=["1"], build="GRCh38",
+                chunk_size_mb=5,
+                host_ram_bytes=32 * 1024**3,
+            ),
+            "arrow",
+        )
+
+    def test_auto_picks_streaming_when_chunk_equal_or_above_length(self):
+        from syntheticgen.cli import _resolve_cohort_mode
+        # --chr-chunk-mb >= chrom length is a no-op (no actual split).
+        # Auto-pick should not avoid streaming in this case.
+        self.assertEqual(
+            _resolve_cohort_mode(
+                "auto", 3_000, chr_length_mb=70,
+                chromosomes=["22"], build="GRCh38",
+                chunk_size_mb=70,  # equal to chr_length
+                host_ram_bytes=32 * 1024**3,
+            ),
+            "arrow-streaming",
+        )
+
+    def test_explicit_streaming_passes_through_regardless_of_chunking(self):
+        from syntheticgen.cli import _resolve_cohort_mode
+        # _resolve_cohort_mode itself doesn't enforce the explicit-
+        # combination check; the cli main does that pre-flight.
+        # The function just passes through.
+        self.assertEqual(
+            _resolve_cohort_mode(
+                "arrow-streaming", 3_000, chr_length_mb=0,
+                chromosomes=["1"], build="GRCh38",
+                chunk_size_mb=5,
+            ),
+            "arrow-streaming",
+        )
+
+
+class EffectiveChrLengthTest(unittest.TestCase):
+    def test_explicit_chr_length_passes_through(self):
+        from syntheticgen.cli import _effective_chr_length_mb
+        self.assertEqual(
+            _effective_chr_length_mb(70.0, ["1"], "GRCh38"), 70.0,
+        )
+
+    def test_zero_chr_length_resolves_to_max_contig(self):
+        from syntheticgen.cli import _effective_chr_length_mb
+        # GRCh38 chr1 ≈ 248.96 Mb
+        result = _effective_chr_length_mb(0, ["1"], "GRCh38")
+        self.assertGreater(result, 240.0)
+        self.assertLess(result, 260.0)
+
+    def test_zero_chr_length_with_multi_chrom_uses_max(self):
+        from syntheticgen.cli import _effective_chr_length_mb
+        # max(chr22 ~51, chr1 ~249) → chr1's length
+        result = _effective_chr_length_mb(0, ["1", "22"], "GRCh38")
+        self.assertGreater(result, 240.0)
+
+    def test_zero_chr_length_no_chromosomes_returns_zero(self):
+        from syntheticgen.cli import _effective_chr_length_mb
+        # Defensive fall-through: returns 0 so callers' heuristics
+        # skip chr_length-driven checks rather than misfire.
+        self.assertEqual(
+            _effective_chr_length_mb(0, None, None), 0.0,
+        )
+        self.assertEqual(
+            _effective_chr_length_mb(0, [], "GRCh38"), 0.0,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
