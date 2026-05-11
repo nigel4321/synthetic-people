@@ -861,6 +861,88 @@ def stream_cohort_sites(
     )
 
 
+def simulate_chromosome_ts(chrom: str, build: str, n_people: int,
+                          length_mb: float, demo_model: str | None,
+                          population: str, rec_rate: float, mu: float,
+                          rng: random.Random,
+                          chunk_size_mb: float = 0.0):
+    """Sibling of :func:`simulate_chromosome` that returns the raw
+    TreeSequence (instead of a materialised site list) so the caller
+    can stream variants via :func:`stream_cohort_sites`.
+
+    Consumes the master ``rng`` identically to :func:`simulate_chromosome`
+    *up to the point where _tree_sequence_to_sites would start consuming
+    rng for ref/alt picks*. That is: one ``rng.randint`` call for the
+    msprime seed, then return. The caller is then expected to pass the
+    same ``rng`` into :func:`stream_cohort_sites`, which will consume
+    further (identically to the materialised path) for its own
+    ref/alt picks. Net cumulative rng consumption matches the
+    materialised path call-for-call.
+
+    For PR 3 the chunked path (``chunk_size_mb > 0`` producing multiple
+    chunks) is not yet supported in streaming mode; the caller should
+    auto-pick the materialised path when chunking is requested.
+    """
+    _require_deps()
+    if chrom not in BUILDS[build]["contigs"]:
+        raise ValueError(f"unknown chromosome {chrom!r} for build {build}")
+    chrom_length = BUILDS[build]["contigs"][chrom]
+    sim_length_bp = int(chrom_length if length_mb <= 0
+                        else min(chrom_length, length_mb * 1_000_000))
+    chunk_size_bp = int(chunk_size_mb * 1_000_000) if chunk_size_mb > 0 else 0
+    if chunk_size_bp > 0 and chunk_size_bp < sim_length_bp:
+        raise NotImplementedError(
+            "Streaming-cohort mode does not yet support "
+            "--chr-chunk-mb > 0. Pass --chr-chunk-mb 0 or use "
+            "--cohort-mode arrow / sites_list."
+        )
+    seed = rng.randint(1, 2**31 - 1)
+    return _simulate_one(chrom, build, n_people, sim_length_bp,
+                         demo_model, population, rec_rate, mu, seed)
+
+
+def simulate_cohort_ts_iter(chromosomes: list, build: str, n_people: int,
+                            length_mb: float, demo_model: str | None,
+                            population: str, rec_rate: float, mu: float,
+                            rng: random.Random,
+                            verbose: bool = False,
+                            chunk_size_mb: float = 0.0):
+    """Yield ``(chrom, ts, walk_rng)`` triples one chromosome at a time.
+
+    Streaming counterpart of :func:`simulate_cohort_iter`. Where
+    ``simulate_cohort_iter`` materialises the per-chrom sites list,
+    this generator yields the raw TreeSequence and a fresh rng
+    instance the caller can pass to :func:`stream_cohort_sites`.
+
+    Per-chrom rng derivation matches :func:`simulate_cohort_iter` so
+    a given ``rng`` seed produces byte-identical TreeSequences (and
+    therefore byte-identical cohort BCFs after streaming + writing)
+    regardless of which iterator the cli routes through.
+    """
+    seeds = [rng.randint(1, 2**31 - 1) for _ in chromosomes]
+
+    for chrom, seed in zip(chromosomes, seeds):
+        if verbose:
+            print(f"  simulating chrom {chrom} (length {length_mb} "
+                  f"Mb, model={demo_model or 'uniform'})...",
+                  file=sys.stderr)
+        chrom_rng = random.Random(seed)
+        ts = simulate_chromosome_ts(
+            chrom, build, n_people, length_mb, demo_model,
+            population, rec_rate, mu, chrom_rng,
+            chunk_size_mb=chunk_size_mb,
+        )
+        if verbose:
+            print(f"    chrom {chrom} TreeSequence ready "
+                  f"({ts.num_sites} variant sites)", file=sys.stderr)
+        yield chrom, ts, chrom_rng
+        # Drop local refs so the per-chrom TreeSequence can be GC'd
+        # before the next chromosome's simulation starts (mirrors the
+        # cleanup in :func:`simulate_cohort_iter`).
+        ts = None
+        chrom_rng = None
+
+
 def _simulate_chromosome_from_seed(chrom: str, build: str, n_people: int,
                                    length_mb: float,
                                    demo_model: str | None,

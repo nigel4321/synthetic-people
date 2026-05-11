@@ -245,5 +245,113 @@ class CohortModeArrowParityTest(unittest.TestCase):
         self.assertFalse(arrow_dir.exists())
 
 
+@unittest.skipUnless(
+    _HAVE_BCFTOOLS and _HAVE_TABIX and _HAVE_BGZIP
+    and _HAVE_MSPRIME and _HAVE_STDPOPSIM and _HAVE_PYARROW,
+    "needs bcftools/tabix/bgzip + msprime + stdpopsim + pyarrow",
+)
+class CohortModeArrowStreamingParityTest(unittest.TestCase):
+    """Phase 5d.1 PR 3: ``--cohort-mode arrow-streaming`` end-to-end.
+
+    Same byte-identical contract as :class:`CohortModeArrowParityTest`:
+    a cli run with ``--cohort-mode arrow-streaming`` at the same seed
+    produces the exact same cohort BCF as ``--cohort-mode arrow`` (the
+    materialised path). This locks the streaming refactor as a pure
+    performance change with zero observable output difference.
+
+    Intentionally tiny scale (n=3, 0.05 Mb, chr22) — the byte-
+    identical assertion is what matters; coverage of WGS-scale
+    behaviour lives in the unit-level streaming-cohort tests + the
+    memprof-based smoke runs the operator triggers manually.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmpdir_arrow = Path(
+            tempfile.mkdtemp(prefix="cohort_mode_arrow_"),
+        )
+        cls.tmpdir_stream = Path(
+            tempfile.mkdtemp(prefix="cohort_mode_arrow_streaming_"),
+        )
+        rc_arrow = cli_module.main(_common_args(cls.tmpdir_arrow, "arrow"))
+        if rc_arrow != 0:
+            raise RuntimeError(f"cli.main(arrow) exited {rc_arrow}")
+        rc_stream = cli_module.main(
+            _common_args(cls.tmpdir_stream, "arrow-streaming"),
+        )
+        if rc_stream != 0:
+            raise RuntimeError(
+                f"cli.main(arrow-streaming) exited {rc_stream}",
+            )
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmpdir_arrow, ignore_errors=True)
+        shutil.rmtree(cls.tmpdir_stream, ignore_errors=True)
+
+    def test_byte_identical_cohort_bcf(self):
+        bcf_arrow = self.tmpdir_arrow / "cohort" / "cohort.chr22.bcf"
+        bcf_stream = self.tmpdir_stream / "cohort" / "cohort.chr22.bcf"
+        self.assertTrue(bcf_arrow.exists(), f"missing {bcf_arrow}")
+        self.assertTrue(bcf_stream.exists(), f"missing {bcf_stream}")
+        self.assertEqual(_bcf_data_md5(bcf_arrow),
+                         _bcf_data_md5(bcf_stream))
+
+    def test_streaming_run_cleans_up_arrow_scratch(self):
+        arrow_dir = self.tmpdir_stream / "cohort" / ".arrow"
+        self.assertFalse(
+            arrow_dir.exists(),
+            f"streaming Arrow scratch dir was not cleaned up: {arrow_dir}",
+        )
+
+
+class ResolveCohortModeAutoPickStreamingTest(unittest.TestCase):
+    """Pin the auto-pick threshold logic: when the predicted
+    materialised parent peak exceeds 50% of host RAM, ``--cohort-mode
+    auto`` resolves to ``arrow-streaming``. Below that, the existing
+    n>=100k → ``arrow`` / else → ``sites_list`` cascade applies."""
+
+    def test_explicit_arrow_streaming_passes_through(self):
+        from syntheticgen.cli import _resolve_cohort_mode
+        self.assertEqual(
+            _resolve_cohort_mode("arrow-streaming", 1), "arrow-streaming",
+        )
+
+    def test_auto_picks_arrow_streaming_when_predicted_peak_exceeds_half_ram(self):
+        from syntheticgen.cli import _resolve_cohort_mode
+        # n=3000 × 70 Mb predicts ~18 GB parent peak. With a 32 GB
+        # host (half = 16 GB), auto must pick arrow-streaming.
+        self.assertEqual(
+            _resolve_cohort_mode(
+                "auto", 3000, chr_length_mb=70,
+                host_ram_bytes=32 * 1024**3,
+            ),
+            "arrow-streaming",
+        )
+
+    def test_auto_picks_arrow_for_large_n_when_peak_below_half_ram(self):
+        from syntheticgen.cli import _resolve_cohort_mode
+        # n=100k × 1 Mb predicts ~9 GB. On a 64 GB host (half = 32 GB),
+        # we stay on the materialised+arrow path.
+        self.assertEqual(
+            _resolve_cohort_mode(
+                "auto", 100_000, chr_length_mb=1,
+                host_ram_bytes=64 * 1024**3,
+            ),
+            "arrow",
+        )
+
+    def test_auto_picks_sites_list_at_small_n_low_chr_length(self):
+        from syntheticgen.cli import _resolve_cohort_mode
+        # Small everything on a big host — stays on the in-RAM path.
+        self.assertEqual(
+            _resolve_cohort_mode(
+                "auto", 1_000, chr_length_mb=5,
+                host_ram_bytes=128 * 1024**3,
+            ),
+            "sites_list",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
