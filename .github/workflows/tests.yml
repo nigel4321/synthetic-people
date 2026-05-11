@@ -77,8 +77,12 @@ jobs:
       # The pipeline itself runs local-exec with no container
       # directives (verified in main.nf + modules/*), so we only
       # need nextflow itself + Java (pre-installed on ubuntu-latest).
+      # v3 (released 2026-04-17) upgrades to Node 24 and flattens
+      # the composite action — removing the Node-20 deprecation
+      # warnings for `./setup-nextflow/subaction` + the transitive
+      # `actions/checkout` / `actions/setup-java` SHAs v2 pinned.
       - name: Set up Nextflow
-        uses: nf-core/setup-nextflow@v2
+        uses: nf-core/setup-nextflow@v3
 
       - name: Run unit tests
         run: python .github/scripts/run_tests.py nextflow_pipeline
