@@ -488,12 +488,27 @@ def merge_config_into_args(
     args: Namespace,
     config,
     explicit_cli: set,
+    parser: argparse.ArgumentParser | None = None,
 ) -> Namespace:
     """Apply ``cli > config > defaults`` precedence.
 
     ``args`` is the regular argparse Namespace (defaults filled in).
     ``config`` is the loaded Pydantic Config or ``None``.
     ``explicit_cli`` is the set of dest names the user actually typed.
+    ``parser`` is the argparse parser the args came from; when supplied
+    we apply each action's ``type=`` callable to config-loaded values
+    so they match the post-parse types argparse produces when the same
+    flag is set on the CLI.
+
+    Why parser-aware coercion matters: ``--cache-dir`` has
+    ``type=Path``, so ``args.cache_dir`` is a ``Path`` when set via
+    the CLI. The pydantic model stores the same field as ``str``
+    (YAML's natural type), so without coercion ``cache_dir: "./cache"``
+    in a config file leaves ``args.cache_dir`` as a ``str`` and
+    downstream code that calls ``cache_dir.mkdir(...)`` crashes
+    with ``AttributeError: 'str' object has no attribute 'mkdir'``.
+    Coercing here closes the type gap between the two precedence
+    paths.
 
     Returns a fresh Namespace with the merged values. The original
     ``args`` is left untouched so callers can compare before/after if
@@ -503,12 +518,26 @@ def merge_config_into_args(
     if config is None:
         return merged
 
+    # dest → type-coercion callable, harvested from the parser. We
+    # only coerce when ``type`` is callable AND the value is not
+    # ``None`` — ``Path(None)`` would raise, and ``None`` is the
+    # legitimate "absent" sentinel for optional path flags like
+    # --dbsnp-vcf / --cosmic-vcf / --profile-memory.
+    type_by_dest: dict = {}
+    if parser is not None:
+        for action in parser._actions:
+            if action.type is not None and callable(action.type):
+                type_by_dest[action.dest] = action.type
+
     flat = _flatten_config_to_argparse_dests(config)
     for dest, value in flat.items():
         if dest in explicit_cli:
             continue  # CLI wins
         if not hasattr(merged, dest):
             continue  # config has a field with no CLI counterpart; skip
+        coerce = type_by_dest.get(dest)
+        if coerce is not None and value is not None:
+            value = coerce(value)
         setattr(merged, dest, value)
     return merged
 

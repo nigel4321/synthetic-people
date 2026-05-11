@@ -256,7 +256,11 @@ class MergePrecedenceTest(unittest.TestCase):
         args = self.parser.parse_args(argv)
         config = self.load(self.path)
         explicit = self.explicit(self.parser, argv)
-        return self.merge(args, config, explicit), explicit
+        # Pass parser=parser so the merge applies argparse type
+        # coercion to config-loaded values — without it, Path-typed
+        # flags would stay as str (the bug this test class guards).
+        merged = self.merge(args, config, explicit, parser=self.parser)
+        return merged, explicit
 
     def test_config_value_used_when_no_cli(self):
         merged, _ = self._run([])
@@ -290,6 +294,178 @@ class MergePrecedenceTest(unittest.TestCase):
         merged = merge_config_into_args(args, None, {"n"})
         self.assertEqual(merged.n, 55)
         self.assertEqual(merged.workers, 0)  # argparse default
+
+    def test_path_typed_flags_coerced_from_config(self):
+        # Regression: previously --cache-dir / --output-dir /
+        # --dbsnp-vcf / --cosmic-vcf / --profile-memory all have
+        # argparse ``type=Path``, but the config-merge path stored
+        # their values as ``str`` (YAML's natural type for a string).
+        # Downstream code that called ``cache_dir.mkdir(...)`` then
+        # crashed with ``AttributeError: 'str' object has no
+        # attribute 'mkdir'``. Lock in the parser-aware coercion
+        # so all five flags become Path objects regardless of source.
+        self.path.write_text(
+            "schema_version: 1\n"
+            "output:\n"
+            "  dir: /tmp/synthpeople_test_out\n"
+            "  cache_dir: /tmp/synthpeople_test_cache\n"
+            "overlays:\n"
+            "  rsid:\n"
+            "    vcf: /tmp/dbsnp_override.vcf.gz\n"
+            "  cosmic:\n"
+            "    vcf: /tmp/cosmic_override.vcf.gz\n"
+            "performance:\n"
+            "  profile_memory: /tmp/memprof.tsv\n"
+        )
+        merged, _ = self._run([])
+        self.assertIsInstance(merged.output_dir, Path)
+        self.assertIsInstance(merged.cache_dir, Path)
+        self.assertIsInstance(merged.dbsnp_vcf, Path)
+        self.assertIsInstance(merged.cosmic_vcf, Path)
+        self.assertIsInstance(merged.profile_memory, Path)
+        # Spot-check one value to confirm the string content survived.
+        self.assertEqual(
+            str(merged.cache_dir), "/tmp/synthpeople_test_cache",
+        )
+
+    def test_null_optional_path_stays_none(self):
+        # Optional path flags (--dbsnp-vcf, --cosmic-vcf,
+        # --profile-memory) all default to None. If the config
+        # explicitly sets one to ``null``, the merge must NOT call
+        # ``Path(None)`` (which raises). None should pass through.
+        self.path.write_text(
+            "schema_version: 1\n"
+            "overlays:\n"
+            "  rsid:\n"
+            "    vcf: null\n"
+            "performance:\n"
+            "  profile_memory: null\n"
+        )
+        merged, _ = self._run([])
+        self.assertIsNone(merged.dbsnp_vcf)
+        self.assertIsNone(merged.profile_memory)
+
+    def test_cli_path_still_wins_over_config_path(self):
+        # CLI > config precedence must still hold for path-typed
+        # flags after the coercion change. argparse already parsed
+        # the CLI value as Path; coercion must not override it.
+        self.path.write_text(
+            "schema_version: 1\n"
+            "output:\n"
+            "  cache_dir: /tmp/from_config\n"
+        )
+        merged, explicit = self._run(["--cache-dir", "/tmp/from_cli"])
+        self.assertEqual(str(merged.cache_dir), "/tmp/from_cli")
+        self.assertIsInstance(merged.cache_dir, Path)
+        self.assertIn("cache_dir", explicit)
+
+    def test_realistic_mixed_cli_and_config_across_sections(self):
+        # End-to-end mixed-sources scenario: a "stable baseline"
+        # config covering several sections (cohort, simulation,
+        # overlays, performance, output, sequencing_errors), with
+        # a handful of CLI overrides for a one-off run. Verifies:
+        #
+        # 1. Every config-only field reaches the merged Namespace
+        #    with the expected value AND the correct Python type
+        #    (Path for path-typed flags, int/float/bool/str
+        #    otherwise).
+        # 2. CLI flags override their config counterparts cleanly,
+        #    regardless of which section the field lives in.
+        # 3. Fields touched by neither CLI nor config fall through
+        #    to argparse defaults.
+        # 4. ``explicit_cli`` reports the dests the user actually
+        #    typed and nothing else.
+        self.path.write_text(
+            "schema_version: 1\n"
+            "cohort:\n"
+            "  n: 200\n"
+            "  seed: 7\n"
+            "  build: GRCh37\n"
+            "  chromosomes: '21,22'\n"
+            "  chr_length_mb: 5.0\n"
+            "simulation:\n"
+            "  demo_model: OutOfAfrica_3G09\n"
+            "  population: YRI\n"
+            "overlays:\n"
+            "  clinvar:\n"
+            "    inject_density: 0.02\n"
+            "  rsid:\n"
+            "    density: 0.3\n"
+            "    vcf: /tmp/dbsnp.vcf.gz\n"
+            "sequencing_errors:\n"
+            "  gt_flip_rate: 0.002\n"
+            "  dropout_rate: 0.001\n"
+            "performance:\n"
+            "  workers: 4\n"
+            "  cohort_mode: arrow\n"
+            "  fanout_batch_size: 8\n"
+            "output:\n"
+            "  dir: /tmp/baseline_out\n"
+            "  mode: cohort\n"
+        )
+        merged, explicit = self._run([
+            # Overrides from three different sections — cohort,
+            # performance, output — plus one path-typed flag to
+            # exercise CLI > config precedence on Paths.
+            "--n", "500",
+            "--workers", "16",
+            "--output-dir", "/tmp/one_off_out",
+        ])
+
+        # CLI wins for the three overridden dests.
+        self.assertEqual(merged.n, 500)
+        self.assertEqual(merged.workers, 16)
+        self.assertEqual(str(merged.output_dir), "/tmp/one_off_out")
+        self.assertIsInstance(merged.output_dir, Path)
+
+        # Config-only values land with the right values + types
+        # across several sections.
+        # cohort
+        self.assertEqual(merged.seed, 7)
+        self.assertEqual(merged.build, "GRCh37")
+        self.assertEqual(merged.chromosomes, "21,22")
+        self.assertEqual(merged.chr_length_mb, 5.0)
+        # simulation
+        self.assertEqual(merged.demo_model, "OutOfAfrica_3G09")
+        self.assertEqual(merged.population, "YRI")
+        # overlays
+        self.assertEqual(merged.clinvar_inject_density, 0.02)
+        self.assertEqual(merged.rsid_density, 0.3)
+        self.assertIsInstance(merged.dbsnp_vcf, Path)
+        self.assertEqual(str(merged.dbsnp_vcf), "/tmp/dbsnp.vcf.gz")
+        # sequencing_errors
+        self.assertEqual(merged.error_rate, 0.002)
+        self.assertEqual(merged.dropout_rate, 0.001)
+        # performance (workers overridden above — these are the
+        # config-only siblings)
+        self.assertEqual(merged.cohort_mode, "arrow")
+        self.assertEqual(merged.fanout_batch_size, 8)
+        # output
+        self.assertEqual(merged.mode, "cohort")
+
+        # Untouched fields fall through to argparse defaults.
+        # cohort.n had no value in config originally — well, n=200
+        # IS in config. Pick an actually-defaulted field: somatic.
+        self.assertFalse(merged.somatic)
+        # svs_per_person defaults to 3 (cohort_mode auto-disables
+        # via SV pydantic field) — neither CLI nor config set it.
+        self.assertEqual(merged.svs_per_person, 3)
+
+        # explicit_cli reports exactly the dests the user typed.
+        self.assertEqual(
+            explicit, {"n", "workers", "output_dir"},
+        )
+
+    def test_int_typed_flags_still_int_after_coercion(self):
+        # Defensive: the coercion is generic over any callable
+        # ``action.type``. Confirm an int-typed flag stays int
+        # (pydantic delivers int already; coerce is the identity
+        # int() call). Catches a regression where we accidentally
+        # narrowed coercion to only Path.
+        merged, _ = self._run([])
+        self.assertIsInstance(merged.n, int)
+        self.assertEqual(merged.n, 3000)
+        self.assertIsInstance(merged.workers, int)
 
     def test_parse_explicit_cli_args_does_not_mutate_parser(self):
         # The shadow-parse must restore parser defaults so the parser

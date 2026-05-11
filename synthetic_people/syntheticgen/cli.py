@@ -1894,7 +1894,9 @@ def main(argv: list[str] | None = None) -> int:
         explicit_cli = parse_explicit_cli_args(parser, argv)
         # Re-parse so the parser's defaults are restored if
         # parse_explicit_cli_args left anything inconsistent.
-        args = merge_config_into_args(args, config_obj, explicit_cli)
+        args = merge_config_into_args(
+            args, config_obj, explicit_cli, parser=parser,
+        )
         parser_defaults = {
             a.dest: a.default for a in parser._actions
             if a.dest not in ("help", "config", "no_config")
