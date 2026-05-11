@@ -432,14 +432,22 @@ def _check_cohort_mode_chunking_compat(
     # Streaming + chunking-would-split is unsupported. Branch on
     # whether the user picked streaming explicitly or via auto.
     if cli_cohort_mode == "arrow-streaming":
+        # NB: ``--chr-chunk-mb 0`` is the auto-pick sentinel, NOT a
+        # no-chunking flag, so we can't recommend it as a remedy —
+        # an explicit-streaming user who passes 0 would just trip
+        # this same check on whatever the auto-picker lands at.
+        # Recommend an explicit chunk size at or above the effective
+        # chrom length (which guarantees no split), or switching
+        # modes.
         return (
             resolved_cohort_mode,
             f"ERROR: --cohort-mode arrow-streaming does not yet "
             f"support a chunked simulation that splits chromosomes "
             f"(chunk_size_mb={chunk_size_mb:.2f} Mb < effective "
-            f"chrom length {eff_len_mb:.1f} Mb). Pass "
-            f"--chr-chunk-mb 0 (no chunking) or use --cohort-mode "
-            f"arrow / sites_list.",
+            f"chrom length {eff_len_mb:.1f} Mb). Pass an explicit "
+            f"--chr-chunk-mb {eff_len_mb:.0f} (or larger) to keep "
+            f"the chromosome unsplit, or use --cohort-mode arrow / "
+            f"sites_list.",
         )
     return (
         "arrow",

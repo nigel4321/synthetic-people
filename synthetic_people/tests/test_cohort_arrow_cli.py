@@ -582,10 +582,14 @@ class CheckCohortModeChunkingCompatTest(unittest.TestCase):
 
     def test_streaming_with_chunk_zero_is_noop(self):
         from syntheticgen.cli import _check_cohort_mode_chunking_compat
-        # The cli default of --chr-chunk-mb 0 means "no chunking" so
-        # the helper has nothing to do — important because the cli's
-        # pre-flight call site passes args.chr_chunk_mb (0 if user
-        # didn't set it) and would otherwise misfire.
+        # At the pre-flight call site (before chunk auto-pick) the
+        # cli passes ``args.chr_chunk_mb`` directly — and the
+        # user-facing flag treats 0 as the *auto-pick sentinel*, not
+        # as "no chunking". The helper must treat 0 as "chunk not
+        # yet resolved, defer": only an explicit user-supplied
+        # ``--chr-chunk-mb`` should be able to fire ERROR at
+        # pre-flight; the auto-picked-chunk case is caught later by
+        # the second-pass call site after chunk_size_mb is set.
         final, msg = _check_cohort_mode_chunking_compat(
             cli_cohort_mode="arrow-streaming",
             resolved_cohort_mode="arrow-streaming",
@@ -635,6 +639,14 @@ class CheckCohortModeChunkingCompatTest(unittest.TestCase):
         )
         self.assertIn("chunk_size_mb=5.00", msg)
         self.assertIn("70.0 Mb", msg)
+        # PR #58 review: the message must not recommend
+        # ``--chr-chunk-mb 0`` since that's the auto-pick sentinel,
+        # not a no-chunking flag. It must instead point the user at
+        # an explicit chunk >= eff_len_mb (70 here, rounded to 70)
+        # or a mode switch.
+        self.assertNotIn("--chr-chunk-mb 0", msg)
+        self.assertIn("--chr-chunk-mb 70", msg)
+        self.assertIn("--cohort-mode arrow", msg)
 
     def test_auto_streaming_with_splitting_chunk_demotes_to_arrow(self):
         from syntheticgen.cli import _check_cohort_mode_chunking_compat
