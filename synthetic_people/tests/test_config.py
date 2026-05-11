@@ -88,6 +88,31 @@ class PydanticModelTest(unittest.TestCase):
             )
         self.assertIn("cohort_mode", str(ctx.exception))
 
+    def test_cohort_mode_accepts_every_cli_choice(self):
+        # Regression: the pydantic Literal must stay in sync with
+        # the cli's ``--cohort-mode`` choices. The original Literal
+        # was missing ``arrow-streaming`` (added to the cli in
+        # PR #52 but not the schema), which made every config file
+        # carrying that value crash with a validation error before
+        # the run could start.
+        from syntheticgen.cli import _parser
+        parser = _parser(Path(__file__).resolve().parent.parent)
+        cli_choices = None
+        for action in parser._actions:
+            if action.dest == "cohort_mode":
+                cli_choices = tuple(action.choices)
+                break
+        self.assertIsNotNone(
+            cli_choices, "cli has no --cohort-mode action",
+        )
+        # Every cli choice must validate cleanly through pydantic.
+        for choice in cli_choices:
+            c = self.Config(
+                schema_version=1,
+                performance={"cohort_mode": choice},
+            )
+            self.assertEqual(c.performance.cohort_mode, choice)
+
     def test_inject_density_bounded_zero_to_one(self):
         with self.assertRaises(pydantic.ValidationError):
             self.Config(

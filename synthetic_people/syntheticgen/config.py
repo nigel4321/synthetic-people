@@ -221,7 +221,9 @@ def _models():
             description="Worker processes; 0=auto (cpu_count), 1=serial.",
             json_schema_extra={"argparse_dest": "workers"},
         )
-        cohort_mode: Literal["auto", "sites_list", "arrow"] = Field(
+        cohort_mode: Literal[
+            "auto", "sites_list", "arrow", "arrow-streaming",
+        ] = Field(
             default="auto",
             description="Cohort intermediate between simulation and BCF write.",
             json_schema_extra={"argparse_dest": "cohort_mode"},

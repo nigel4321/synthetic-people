@@ -297,7 +297,8 @@
           "enum": [
             "auto",
             "sites_list",
-            "arrow"
+            "arrow",
+            "arrow-streaming"
           ],
           "title": "Cohort Mode",
           "type": "string"
