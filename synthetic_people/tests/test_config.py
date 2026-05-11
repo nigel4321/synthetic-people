@@ -444,11 +444,11 @@ class MergePrecedenceTest(unittest.TestCase):
         self.assertEqual(merged.mode, "cohort")
 
         # Untouched fields fall through to argparse defaults.
-        # cohort.n had no value in config originally — well, n=200
-        # IS in config. Pick an actually-defaulted field: somatic.
+        # ``somatic`` and ``svs_per_person`` are both absent from
+        # this test's config and not passed on the CLI, so they
+        # should land at the argparse defaults (False and 3
+        # respectively, matching the pydantic model defaults too).
         self.assertFalse(merged.somatic)
-        # svs_per_person defaults to 3 (cohort_mode auto-disables
-        # via SV pydantic field) — neither CLI nor config set it.
         self.assertEqual(merged.svs_per_person, 3)
 
         # explicit_cli reports exactly the dests the user typed.
