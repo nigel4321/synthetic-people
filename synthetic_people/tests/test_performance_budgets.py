@@ -227,27 +227,67 @@ def _run_canary_in_subprocess(
                     if rss > peak_bytes:
                         peak_bytes = rss
                 except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                    # Child exited between ``poll()`` and
+                    # ``memory_info()``. Break out and let the
+                    # post-loop ``wait`` populate returncode.
                     break
                 time.sleep(0.05)
-        # Read the stderr tail unconditionally — useful diagnostic
-        # for either timeout or non-zero exit.
-        try:
-            stderr_text = stderr_path.read_text(errors="replace")
-        except OSError:
-            stderr_text = "<could not read stderr file>"
+        # Reap the child explicitly when we didn't time out. If the
+        # sampling loop broke via ``NoSuchProcess``/``ZombieProcess``,
+        # ``proc.returncode`` can still be ``None`` here until
+        # ``wait()`` populates it — and asserting on ``None`` would
+        # mask the real exit status. Use a short wait, escalate to
+        # kill if the child is somehow still running.
+        if not timed_out:
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+        # Read just the tail of stderr — the test is supposed to
+        # guard memory, so reading a potentially-large file in full
+        # would be self-defeating. Bounded at ``_STDERR_TAIL_BYTES``.
+        stderr_text = _read_file_tail(stderr_path, _STDERR_TAIL_BYTES)
         if timed_out:
             test_case.fail(
                 f"canary subprocess for --cohort-mode {cohort_mode} "
                 f"did not exit within {SUBPROCESS_TIMEOUT_SECONDS}s; "
                 f"killed. Args: {args!r}\n"
-                f"stderr tail:\n{stderr_text[-1500:]}",
+                f"stderr tail:\n{stderr_text}",
             )
         test_case.assertEqual(
             proc.returncode, 0,
             f"canary subprocess returned {proc.returncode}.\n"
-            f"stderr tail:\n{stderr_text[-1500:]}",
+            f"stderr tail:\n{stderr_text}",
         )
         return peak_bytes / (1024 * 1024)
+
+
+# How many bytes of stderr we keep for diagnostics. Sized to fit
+# the cli's "Loading config… / Effective non-default values…"
+# preamble plus a screenful of error context. Bounded so reading
+# the tail doesn't itself inflate the test process's memory.
+_STDERR_TAIL_BYTES = 4096
+
+
+def _read_file_tail(path: Path, max_bytes: int) -> str:
+    """Return the last ``max_bytes`` of ``path`` as a string,
+    decoding with ``errors='replace'``. Empty string if the file
+    doesn't exist or can't be read."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return "<could not stat stderr file>"
+    try:
+        with path.open("rb") as fh:
+            if size > max_bytes:
+                fh.seek(size - max_bytes)
+            return fh.read().decode(errors="replace")
+    except OSError:
+        return "<could not read stderr file>"
 
 
 @unittest.skipUnless(
@@ -272,6 +312,13 @@ class CohortPeakRssBudgetTest(unittest.TestCase):
     # the canary sets), but if a future change makes the fetch
     # unconditional, sharing the cache caps the network cost at
     # one download per CI job instead of three.
+    #
+    # ``_cache_tmp`` is the TemporaryDirectory handle (kept alive
+    # for its cleanup-on-GC contract); ``_cache_dir`` is the Path
+    # view the tests use. Both are ``Optional`` only between class
+    # tear-down and the next ``setUpClass`` — every test method
+    # asserts ``_cache_dir is not None`` to fail fast and clearly
+    # if that contract is ever violated.
     _cache_tmp: tempfile.TemporaryDirectory | None = None
     _cache_dir: Path | None = None
 
@@ -292,6 +339,16 @@ class CohortPeakRssBudgetTest(unittest.TestCase):
         super().tearDownClass()
 
     def _check_budget(self, cohort_mode: str) -> None:
+        # Defensive guard: if ``setUpClass`` was bypassed (e.g., a
+        # test that subclasses and forgets to call ``super()``) the
+        # error here is clearer than the downstream ``str(None)``
+        # call that would otherwise produce a confused
+        # ``--cache-dir None`` cli invocation.
+        self.assertIsNotNone(
+            self._cache_dir,
+            "setUpClass did not initialise _cache_dir; the class-"
+            "level cache directory contract is violated.",
+        )
         peak_mb = _run_canary_in_subprocess(
             self, cohort_mode, self._cache_dir,
         )
