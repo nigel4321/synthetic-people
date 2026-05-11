@@ -803,7 +803,7 @@ def _plan_cohort_overlays(
           inject_clinvar(sites, ...)   # mutates pos in place, then sorts
           clinvar_reserved = {i for i, s in enumerate(sites)
                               if s.get("clnsig")}   # POST-SORT indices
-          inject_rsids(sites, ..., reserve=clinvar_reserved)
+          inject_rsids(sites, ..., reserve_indices=clinvar_reserved)
           ...
 
       ``inject_rsids`` sees the *post-clinvar-sort* sites_meta. Its
