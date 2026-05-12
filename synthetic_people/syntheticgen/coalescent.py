@@ -574,8 +574,11 @@ def _build_carriers_from_variant(var) -> np.ndarray:
     and the inline producer in :func:`_tree_sequence_to_sites`.
 
     Uses ``np.flatnonzero`` + ``np.column_stack`` rather than a
-    Python loop so the conversion stays linear in the number of
-    carriers (not haplotype-total) at WGS-scale n.
+    Python ``enumerate`` loop. Asymptotic complexity is unchanged
+    — ``np.flatnonzero`` still scans the full ``gts_arr`` of
+    length ``n_haplotypes`` — but the constant factor is ~10×
+    smaller at WGS scale because the scan is one vectorised
+    numpy pass instead of a Python-interpreter loop.
     """
     gts_arr = var.genotypes
     nonzero = np.flatnonzero(gts_arr)

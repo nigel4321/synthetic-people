@@ -40,9 +40,20 @@ def _assert_site_dicts_equal(test_case, m, s, idx):
     Standalone helper so the carriers-aware comparison is one
     place — both ``_assert_byte_identical`` methods in this file
     use it, plus any future test in this module.
+
+    Explicit ``assertIn`` (not ``.get()``) for the carriers key:
+    ``np.array_equal(None, None)`` evaluates True, so silently
+    accepting absent carriers in both dicts would mask a real
+    regression where the field got dropped entirely.
     """
-    m_carriers = m.get("carriers")
-    s_carriers = s.get("carriers")
+    test_case.assertIn(
+        "carriers", m, f"site {idx}: materialised dict missing carriers",
+    )
+    test_case.assertIn(
+        "carriers", s, f"site {idx}: streamed dict missing carriers",
+    )
+    m_carriers = m["carriers"]
+    s_carriers = s["carriers"]
     test_case.assertTrue(
         np.array_equal(m_carriers, s_carriers),
         f"site {idx} carriers diverge:\n  m={m_carriers}\n  s={s_carriers}",
