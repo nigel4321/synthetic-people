@@ -146,6 +146,72 @@ delete the test.
 
 ---
 
+## Known scaling ceiling — `arrow-streaming` at n ≥ ~1M
+
+**Empirical data point, 2026-05-12.** A user-driven run at
+**n=1 000 000**, full WGS (chr 1-22 + X @ 70 Mb per chrom),
+`--cohort-mode arrow-streaming`, `--mode per-person` was killed
+at **63 GB parent RSS** ~115 min into chrom 1's streaming-write
+pass — before any worker fan-out (`children_rss_mb` was 0
+throughout). memprof phase trail:
+
+| t | parent RSS | phase |
+|---|---|---|
+| 16 s | 718 MB | streaming sim start (23 chroms) |
+| 901 s | 2.6 GB | chrom 1 TS ready (1 081 579 sites) |
+| 6905 s | **63.3 GB** | killed (no further phase mark reached) |
+
+### Root cause
+
+The streaming heap in `_stream_cohort_pass2` (see
+`coalescent.py:611-619` for the design-time memory model) holds
+**full site dicts** whose `carriers` field is a Python
+`list[tuple[int, int]]` — one tuple per non-zero haplotype.
+Per-site cost scales linearly with n:
+
+| AF | n=3 000 | n=100 000 | n=1 000 000 |
+|---|---|---|---|
+| singleton | ~80 B | ~80 B | ~80 B |
+| 5 % common | ~24 KB | ~800 KB | **~8 MB** |
+| 30 % common | ~144 KB | ~4.8 MB | **~48 MB** |
+
+The buffer depth is bounded by overlay-injection-position pressure
+(~`O(sqrt(N_inject))` if positions are uniform, larger when they
+cluster). At the canonical 0.2 rsid density × real dbSNP positions
+on chr1, the buffer plausibly holds hundreds of common-AF sites
+concurrently — fine at n=3000 (hundreds of MB), fatal at n=1M
+(hundreds of GB).
+
+### Why this isn't caught by the PR-time canary
+
+The canary at n=20 has a per-site cost of ~1.6 KB even for common
+AF — six orders of magnitude smaller than n=1M. The architectural
+scaling problem is invisible until n is large enough for
+per-site cost to dominate, which is exactly why a nightly
+WGS-scale memprof CI is on the deferred list.
+
+### Supported envelope (today)
+
+- **n ≤ ~100 000**, full WGS, `--mode cohort` — comfortable.
+- **n ≤ ~500 000**, full WGS, `--mode cohort` — feasible with
+  reduced overlay density (rsid ≤ 0.05) on a 64 GB host.
+- **n ≥ ~1 000 000** — needs the carriers-packing fix below.
+
+### Fix sketch (not yet implemented)
+
+Pack `carriers` as a numpy array of haplotype indices rather than
+a list of `(int, int)` tuples. For biallelic sites (the vast
+majority) the allele field is always 1 and can be elided.
+`np.array(hap_indices, dtype=np.int32)` ≈ 4 B per carrier, vs
+~80 B for the Python tuple representation — a **~20× memory
+reduction** across all carriers-holding code paths (streaming
+heap, Arrow writer batches, materialised sites list). Should
+push the streaming ceiling from ~n=500K to ~n=5M without
+architectural change. Tracked in deferred-guardrails below as
+**carriers packing**.
+
+---
+
 ## Updating a budget
 
 The right reasons to widen a budget:
@@ -175,9 +241,10 @@ These would tighten the safety net further but each carries its
 own infrastructure cost; ship when the cost is justified by an
 actual regression they would have caught.
 
-| Guardrail | Catches | Why not yet |
+| Guardrail / fix | Catches | Why not yet / justification |
 |---|---|---|
-| Nightly WGS-scale memprof CI | Subtle O(n) re-materialisation, slow-bleed drift | Needs a dedicated runner with predictable RAM; ongoing cost. Worth ~1 day of plumbing once we have a regression case that justifies it. |
+| **Carriers packing** (numpy array, drop allele field for biallelics) | The n=1M scaling ceiling documented above — direct ~20× memory reduction across streaming heap + Arrow writer + materialised sites | We now have a concrete regression case (2026-05-12 user run). Right next move after this doc update. Estimate: 1 day implementation + 1 day touching consumers (Arrow writer, BCF emission). |
+| Nightly WGS-scale memprof CI | Subtle O(n) re-materialisation, slow-bleed drift, scaling-ceiling regressions | Needs a dedicated runner with predictable RAM; ongoing cost. The 2026-05-12 incident is exactly the case that justifies this. Worth ~1 day of plumbing now that we have a regression case. |
 | Auto-picker calibration test | Drift between `_estimate_materialised_parent_peak_bytes` and reality | The estimator is itself an approximation; calibration would need a tolerance band that's hard to set without observing real drift first. |
 | pytest-benchmark wall-clock regression | Time-only regressions (no RSS impact) | Variance on shared CI runners makes time-based gates noisy; only worth wiring up if a real time regression hits us. |
 | Per-worker peak RSS | Worker-side leaks under multi-process fan-out | Today only the parent is gated; per-worker is a smaller scaling concern (workers spawn fresh and reap promptly). |

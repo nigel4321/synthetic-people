@@ -214,6 +214,50 @@ longer binds:
 | No selection | Neutral-only was simpler | stdpopsim has DFE catalogues per population |
 | Lightweight error model | ART/SimNGS need real reads | Keep the lightweight model as default but make it **context-aware** by sampling kmer / homopolymer / GC features from the now-loaded reference |
 
+### 6.1 Empirical scaling ceiling for `arrow-streaming` (2026-05-12)
+
+A user-driven run at **n=1 000 000**, full WGS (chromosomes 1-22 + X
+@ 70 Mb per chrom), `--cohort-mode arrow-streaming`, `--mode
+per-person`, `--workers 12` was killed by the kernel at **63 GB
+parent RSS** roughly 115 minutes into chrom 1. memprof phase marks
+showed the kill happened *during chrom 1's streaming-write pass*,
+after `chrom 1 ts ready (1 081 579 sites)` at 2.6 GB and before any
+worker fan-out (`children_rss_mb` stayed at 0 throughout).
+
+Root cause (see `coalescent.py:611-619` for the architectural
+budget the design bet against): the streaming heap in
+`_stream_cohort_pass2` holds **full site dicts** whose `carriers`
+field is a Python `list[tuple[int, int]]` — one tuple per non-zero
+haplotype. At n=1M:
+
+- A singleton (AF ≈ 1/2M) costs ~80 bytes per site.
+- A common-AF site (AF ≈ 0.3) costs ~600 K tuples × ~80 bytes ≈
+  **~50 MB per site**.
+
+The buffer depth is bounded by overlay-injection-position pressure
+(roughly `O(sqrt(N_inject))` if positions are uniform, larger when
+they cluster). At the canonical 0.2 rsid density × real dbSNP
+positions on chr1, the buffer plausibly holds hundreds of
+common-AF sites concurrently — pushing RAM well above the host
+ceiling.
+
+**The streaming guarantee that Phase 5d.1 validated at n=3000
+extrapolated cleanly to n=10 000; it does *not* extrapolate
+linearly to n=1M**, because the per-site `carriers` payload
+itself scales linearly with n. The fix is not architectural —
+it's representational (pack `carriers` into a numpy array, ~10–20×
+smaller) — and is captured as deferred work in
+`PERFORMANCE_BUDGETS.md` § "Known scaling ceiling."
+
+Today's supported envelope, updated:
+
+- **n ≤ ~100 000, full WGS, `--mode cohort`** — comfortable.
+- **n ≤ ~500 000, full WGS, `--mode cohort`** — feasible with
+  reduced overlay densities (rsid ≤ 0.05) on a 64 GB host.
+- **n ≥ ~1 000 000** — needs the carriers-packing fix (or a
+  user-side workaround: `chr_length_mb` ≤ 10, overlay density 0,
+  `--mode cohort`).
+
 ---
 
 ## 7. Proposal — prioritised roadmap
