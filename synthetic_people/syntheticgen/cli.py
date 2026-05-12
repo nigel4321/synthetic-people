@@ -542,26 +542,30 @@ def _resolve_cohort_mode(cli_mode: str, n: int,
 
 
 def _estimate_arrow_chrom_scratch_bytes(
-    n_samples: int, chr_length_mb: float
+    n_samples: int, chr_length_mb: float,
+    cohort_mode: str = "arrow",
 ) -> int:
     """Estimate per-chromosome scratch disk for the Arrow intermediate
-    plus the Fix B.1 carriers sidecar.
+    (and, for the ``arrow-streaming`` mode only, the Fix B.1 carriers
+    sidecar).
 
     Used by :func:`_preflight_arrow_disk_check`. Two terms:
 
-    1. **Arrow file**: ``n_haplotypes × variants_per_chrom × 1 byte``
-       (dense int8 genotypes; INFO + offsets add ~5 %). This is the
-       on-disk size of the cohort intermediate after compression by
-       Arrow's IPC writer — flat int8 of zeros + a sparse fraction
-       of ones at AF.
-    2. **Carriers sidecar** (Fix B.1 carriers spill-to-disk): packed
+    1. **Arrow file** (all arrow modes): ``n_haplotypes ×
+       variants_per_chrom × 1 byte`` (dense int8 genotypes; INFO +
+       offsets add ~5 %). This is the on-disk size of the cohort
+       intermediate after Arrow's IPC writer encodes it.
+    2. **Carriers sidecar** (``arrow-streaming`` only): packed
        ``np.int32 × 2`` per non-zero haplotype. Each site averages
-       ``~θ × log(n)`` carriers under coalescent SFS — empirically
-       sums to roughly the same byte total as the Arrow file at
-       canonical AFs. Budget 1× the Arrow term as a conservative
-       sidecar estimate; the kernel page cache makes this less
-       binding than the Arrow IPC scratch in practice but the
-       allocation must still fit on the filesystem.
+       ~θ × log(n) carriers under coalescent SFS — empirically sums
+       to roughly the same byte total as the Arrow file at canonical
+       AFs. Budget 1× the Arrow term as a conservative estimate.
+
+    Only the ``arrow-streaming`` path creates a sidecar; the
+    materialised ``arrow`` mode keeps carriers in the in-RAM sites
+    list and never spills. Adding the sidecar term unconditionally
+    would falsely fail tight-disk runs that use ``--cohort-mode
+    arrow``. PR #77 review caught this.
 
     Rough accuracy is OK — the check produces a warning when free
     disk is tight, not a hard refusal.
@@ -569,14 +573,16 @@ def _estimate_arrow_chrom_scratch_bytes(
     variants = max(1, int(chr_length_mb * _VARIANTS_PER_MB))
     arrow_raw = 2 * n_samples * variants
     arrow_with_overhead = int(arrow_raw * 1.05)
-    # Carriers sidecar — same order of magnitude as the Arrow file
-    # for canonical AFs; budget 1× as a conservative estimate.
-    sidecar = arrow_with_overhead
-    return arrow_with_overhead + sidecar
+    if cohort_mode == "arrow-streaming":
+        # Sidecar ~same order of magnitude as the Arrow file at
+        # canonical AFs; budget 1× as a conservative estimate.
+        return arrow_with_overhead + arrow_with_overhead
+    return arrow_with_overhead
 
 
 def _preflight_arrow_disk_check(
-    cohort_dir: Path, n_samples: int, chr_length_mb: float
+    cohort_dir: Path, n_samples: int, chr_length_mb: float,
+    cohort_mode: str = "arrow",
 ) -> None:
     """Warn (or fail) if the cohort directory's filesystem doesn't have
     enough free space to hold one chromosome's Arrow scratch + the
@@ -587,10 +593,16 @@ def _preflight_arrow_disk_check(
     require ``2x`` the per-chrom estimate free; below ``1x`` we fail
     with a clear message because the Arrow write itself wouldn't
     complete.
+
+    ``cohort_mode`` is plumbed through to
+    :func:`_estimate_arrow_chrom_scratch_bytes` so the sidecar term
+    is only added for ``arrow-streaming`` runs (PR #77 review).
     """
     cohort_dir = Path(cohort_dir)
     cohort_dir.mkdir(parents=True, exist_ok=True)
-    per_chrom = _estimate_arrow_chrom_scratch_bytes(n_samples, chr_length_mb)
+    per_chrom = _estimate_arrow_chrom_scratch_bytes(
+        n_samples, chr_length_mb, cohort_mode=cohort_mode,
+    )
     try:
         free = shutil.disk_usage(cohort_dir).free
     except OSError:
@@ -1358,11 +1370,15 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
         # turning the disk pre-flight into a no-op for exactly the
         # WGS-scale runs that need it most. PR #55 Copilot review
         # caught this; resolve to chr1-equivalent here too.
+        # ``cohort_mode`` is passed so the sidecar term in the
+        # scratch estimate is only added for ``arrow-streaming``
+        # — materialised ``arrow`` doesn't spill (PR #77 review).
         _preflight_arrow_disk_check(
             cohort_dir, args.n,
             _effective_chr_length_mb(
                 args.chr_length_mb, chromosomes, args.build,
             ),
+            cohort_mode=cohort_mode,
         )
     print(
         f"  cohort intermediate mode: {cohort_mode} "

@@ -174,6 +174,78 @@ class CarriersSidecarLifecycleTest(unittest.TestCase):
             sc.write(np.array([[3, 1]], dtype=np.int32))
             self.assertEqual(sc.n_bytes_written, 24)
 
+    def test_init_failure_cleans_up_partial_state(self):
+        # PR #77 review: ``__init__`` opens two fds sequentially —
+        # if the second open fails after the first succeeded, the
+        # first must be released and the file unlinked. Patch
+        # ``os.open`` to raise so the second fd acquisition fails;
+        # ``open()`` (the first call, for the write fd) is left
+        # alone. After the exception, no file should remain.
+        from unittest.mock import patch
+        with patch(
+            "syntheticgen.carriers_sidecar.os.open",
+            side_effect=OSError("simulated read-fd open failure"),
+        ):
+            with self.assertRaises(OSError):
+                CarriersSidecar(self.path)
+        # File created by the write-fd open() must have been
+        # unlinked when the read-fd open() raised. Otherwise the
+        # cli's per-chrom retry path would see a phantom sidecar
+        # from a prior crash.
+        self.assertFalse(self.path.exists())
+
+
+class CarriersSidecarShortWriteTest(unittest.TestCase):
+    """PR #77 review #3: the unbuffered write fd's ``write()`` can
+    return fewer bytes than requested under EINTR / disk-full /
+    signal interruption. The implementation loops until all bytes
+    are written, but if no progress is made (true 0-byte write)
+    it must raise rather than spin forever."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "short_write.spill"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_partial_writes_are_retried(self):
+        # Simulate a series of partial writes (e.g. one byte at a
+        # time) — ``write()`` must loop until all bytes land, and
+        # the read-back must produce the full payload.
+        from unittest.mock import patch
+        with CarriersSidecar(self.path) as sc:
+            real_write = sc._write_fh.write
+            call_count = [0]
+            def short_write(data: memoryview) -> int:
+                # First three calls advance one byte each; later
+                # calls write everything remaining.
+                call_count[0] += 1
+                if call_count[0] <= 3:
+                    return real_write(bytes(data[:1]))
+                return real_write(bytes(data))
+            with patch.object(sc._write_fh, "write",
+                              side_effect=short_write):
+                c = np.array([[1, 1], [2, 1], [3, 1]], dtype=np.int32)
+                # 24 bytes total; first 3 calls write 1 byte each
+                # (3 bytes), call 4 finishes the remaining 21.
+                ref = sc.write(c)
+                self.assertEqual(ref, (0, 24))
+                self.assertGreaterEqual(call_count[0], 4)
+            back = sc.read(*ref)
+            self.assertTrue(np.array_equal(back, c))
+
+    def test_zero_byte_write_raises(self):
+        # A write that makes literally no progress would loop
+        # forever without the guard. Stub returns 0 to simulate
+        # this pathological case.
+        from unittest.mock import patch
+        with CarriersSidecar(self.path) as sc:
+            with patch.object(sc._write_fh, "write", return_value=0):
+                with self.assertRaises(OSError) as ctx:
+                    sc.write(np.array([[1, 1]], dtype=np.int32))
+                self.assertIn("no progress", str(ctx.exception))
+
 
 class CarriersSidecarErrorPathsTest(unittest.TestCase):
     """Pathological inputs surface clear errors rather than corrupt
@@ -187,19 +259,25 @@ class CarriersSidecarErrorPathsTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_wrong_dtype_rejected(self):
+        # PR #77 review: dtype/shape validation must raise real
+        # exceptions (not ``assert``) so they fire under
+        # ``python -O`` too. Silent corruption-mode is not OK
+        # because the sidecar's byte layout depends on the input
+        # shape.
         with CarriersSidecar(self.path) as sc:
             bad = np.array([[1, 1]], dtype=np.int64)
-            with self.assertRaises(AssertionError) as ctx:
+            with self.assertRaises(TypeError) as ctx:
                 sc.write(bad)
             self.assertIn("int32", str(ctx.exception))
 
     def test_wrong_shape_rejected(self):
         # 1-D carriers (the pre-Fix-A list-of-tuples shape) must be
         # caught — they'd silently corrupt the sidecar's byte
-        # layout.
+        # layout. ``ValueError`` not ``AssertionError`` so the
+        # check stands under ``python -O``.
         with CarriersSidecar(self.path) as sc:
             bad = np.array([0, 1, 2], dtype=np.int32)
-            with self.assertRaises(AssertionError):
+            with self.assertRaises(ValueError):
                 sc.write(bad)
 
     def test_short_read_raises(self):
@@ -209,8 +287,21 @@ class CarriersSidecarErrorPathsTest(unittest.TestCase):
         with CarriersSidecar(self.path) as sc:
             sc.write(np.array([[1, 1]], dtype=np.int32))
             with self.assertRaises(OSError) as ctx:
-                sc.read(0, 999)
+                sc.read(0, 24)  # 3 rows requested, only 1 written
             self.assertIn("short read", str(ctx.exception))
+
+    def test_non_multiple_read_length_raises(self):
+        # ``read(offset, n_bytes)`` requires ``n_bytes`` be a
+        # multiple of 8 (the per-row size: 2 × int32). A non-
+        # multiple would previously have hit numpy's reshape with
+        # a confusing "cannot reshape array of size N into shape
+        # (M, 2)" error; now it raises ValueError with a clear
+        # message.
+        with CarriersSidecar(self.path) as sc:
+            sc.write(np.array([[1, 1], [2, 1]], dtype=np.int32))
+            with self.assertRaises(ValueError) as ctx:
+                sc.read(0, 12)  # not a multiple of 8
+            self.assertIn("multiple of", str(ctx.exception))
 
 
 if __name__ == "__main__":
