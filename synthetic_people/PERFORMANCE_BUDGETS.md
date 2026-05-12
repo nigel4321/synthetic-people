@@ -192,10 +192,17 @@ WGS-scale memprof CI is on the deferred list.
 
 ### Supported envelope (today)
 
-- **n ≤ ~100 000**, full WGS, `--mode cohort` — comfortable.
-- **n ≤ ~500 000**, full WGS, `--mode cohort` — feasible with
-  reduced overlay density (rsid ≤ 0.05) on a 64 GB host.
-- **n ≥ ~1 000 000** — needs the carriers-packing fix below.
+These limits apply to the streamed cohort BCF generation step
+regardless of `--mode` (`cohort`, `per-person`, or `both`); the
+primary control surface is `--cohort-mode`.
+
+- **n ≤ ~100 000**, full WGS, streamed cohort generation —
+  comfortable.
+- **n ≤ ~500 000**, full WGS, streamed cohort generation —
+  feasible with reduced overlay density (rsid ≤ 0.05) on a
+  64 GB host.
+- **n ≥ ~1 000 000** for streamed cohort generation — needs the
+  carriers-packing fix below.
 
 ### Fix sketch (not yet implemented)
 
