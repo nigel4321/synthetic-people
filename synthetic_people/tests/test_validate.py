@@ -292,8 +292,11 @@ class TestJsonable(unittest.TestCase):
     and per-chrom Ti/Tv goes to ``inf`` when ``tv == 0``)."""
 
     def setUp(self):
-        # ``validate_batch.py`` lives at the repo root; importable
-        # because tests already insert that path.
+        # ``validate_batch.py`` lives alongside the ``syntheticgen``
+        # package in ``synthetic_people/``. The top-of-file
+        # ``sys.path.insert(0, str(Path(__file__).resolve().parent.parent))``
+        # adds that directory to ``sys.path``, so it's importable
+        # by its bare module name.
         import validate_batch  # noqa: F401
         self._jsonable = validate_batch._jsonable
 
@@ -387,14 +390,29 @@ class TestCheckRefAgainstFasta(unittest.TestCase):
     test below verifies the helper returns a structured failure
     rather than crashing, so downstream consumers can display it."""
 
+    def _mock_popen(self, stderr_bytes: bytes, returncode: int = 0):
+        """Build a MagicMock that simulates ``subprocess.Popen``'s
+        contract for the streaming-stderr ref-check flow.
+
+        ``stderr`` is iterated line-by-line by the helper, so the
+        mock exposes a byte-stream iterable rather than a single
+        captured blob. ``wait`` returns the configured returncode.
+        """
+        from unittest.mock import MagicMock
+        import io
+        fake = MagicMock()
+        fake.stderr = io.BytesIO(stderr_bytes)
+        fake.wait = MagicMock(return_value=returncode)
+        return fake
+
     def test_missing_bcftools_returns_errored(self):
         # When bcftools isn't on PATH, the helper must surface a
         # structured ``errored=True`` result rather than crash. Mock
-        # subprocess.run to raise FileNotFoundError as if the
-        # executable couldn't be located.
+        # Popen to raise FileNotFoundError as if the executable
+        # couldn't be located.
         from unittest.mock import patch
         with patch(
-            "syntheticgen.validate.subprocess.run",
+            "syntheticgen.validate.subprocess.Popen",
             side_effect=FileNotFoundError("bcftools"),
         ):
             r = check_ref_against_fasta(
@@ -406,20 +424,19 @@ class TestCheckRefAgainstFasta(unittest.TestCase):
         self.assertIn("bcftools", r["stderr_tail"])
 
     def test_mismatches_counted_from_stderr(self):
-        # When bcftools writes REF_MISMATCH warnings to stderr, the
-        # helper must count them. Mock subprocess.run to return a
-        # CompletedProcess whose stderr is the canonical
-        # REF_MISMATCH-line format bcftools emits.
-        from unittest.mock import patch, MagicMock
-        fake = MagicMock()
-        fake.returncode = 0
-        fake.stderr = (
+        # When bcftools writes REF_MISMATCH warnings, the helper
+        # streams stderr line-by-line and counts them. Mock Popen so
+        # ``proc.stderr`` is an iterable byte-stream of the canonical
+        # REF_MISMATCH-line format.
+        from unittest.mock import patch
+        stderr = (
             b"REF_MISMATCH\t20\t12345\tA\tG\n"
             b"REF_MISMATCH\t20\t67890\tT\tC\n"
             b"Lines reformatted: 2\n"
         )
         with patch(
-            "syntheticgen.validate.subprocess.run", return_value=fake,
+            "syntheticgen.validate.subprocess.Popen",
+            return_value=self._mock_popen(stderr, returncode=0),
         ):
             r = check_ref_against_fasta(
                 Path("/nonexistent.vcf.gz"), Path("/nonexistent.fa"),
@@ -432,12 +449,12 @@ class TestCheckRefAgainstFasta(unittest.TestCase):
 
     def test_clean_pass(self):
         # No REF_MISMATCH lines + zero exit = passed.
-        from unittest.mock import patch, MagicMock
-        fake = MagicMock()
-        fake.returncode = 0
-        fake.stderr = b"Lines total: 1000\n"
+        from unittest.mock import patch
         with patch(
-            "syntheticgen.validate.subprocess.run", return_value=fake,
+            "syntheticgen.validate.subprocess.Popen",
+            return_value=self._mock_popen(
+                b"Lines total: 1000\n", returncode=0,
+            ),
         ):
             r = check_ref_against_fasta(
                 Path("/nonexistent.vcf.gz"), Path("/nonexistent.fa"),
@@ -445,6 +462,36 @@ class TestCheckRefAgainstFasta(unittest.TestCase):
         self.assertTrue(r["passed"])
         self.assertEqual(r["mismatches"], 0)
         self.assertFalse(r["errored"])
+
+    def test_stderr_tail_bounded_under_high_mismatch_volume(self):
+        # Regression for PR #75 review #1: ``--check-ref w`` emits one
+        # REF_MISMATCH line per mismatched record; on today's
+        # fabricated-REF synthetic output that's millions of lines per
+        # chrom. The helper must stream stderr rather than capturing
+        # it in full — feeding 100K mismatch lines must yield the full
+        # count without retaining the full stderr in memory.
+        from unittest.mock import patch
+        n_lines = 100_000
+        stderr = b"".join(
+            f"REF_MISMATCH\t1\t{i}\tA\tG\n".encode()
+            for i in range(n_lines)
+        )
+        with patch(
+            "syntheticgen.validate.subprocess.Popen",
+            return_value=self._mock_popen(stderr, returncode=0),
+        ):
+            r = check_ref_against_fasta(
+                Path("/nonexistent.vcf.gz"), Path("/nonexistent.fa"),
+            )
+        # All mismatches counted.
+        self.assertEqual(r["mismatches"], n_lines)
+        # Diagnostic tail is bounded — not the full stderr blob.
+        # The helper truncates to ~1500 bytes for human-readable
+        # output; verify we're not retaining megabytes.
+        self.assertLess(len(r["stderr_tail"]), 2000)
+        # Tail contains the LAST mismatch lines, not the first
+        # (deque-with-maxlen semantics).
+        self.assertIn(f"\t{n_lines - 1}\t", r["stderr_tail"])
 
 
 class TestSummariseVcfOverlayCounters(unittest.TestCase):

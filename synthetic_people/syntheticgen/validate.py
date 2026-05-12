@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 import subprocess
+import collections
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -446,20 +447,24 @@ def check_ref_against_fasta(
     or the FASTA is unavailable — the caller can surface that
     distinct from a real mismatch.
     """
+    # ``-Ou`` makes bcftools write the normalised BCF stream to
+    # stdout in uncompressed form — on a real WGS VCF that's
+    # multiple GB of binary, so we always discard stdout. stderr
+    # is streamed line-by-line rather than captured wholesale:
+    # ``--check-ref w`` emits one ``REF_MISMATCH`` warning per
+    # mismatched record, so on today's fabricated-REF synthetic
+    # output the stderr volume can reach hundreds of MB per chrom
+    # (one line per record × ~30 bytes × ~1M records). Counting
+    # incrementally and retaining only ``_REF_CHECK_STDERR_TAIL``
+    # bytes for diagnostics keeps memory bounded.
     try:
-        # ``-Ou`` makes bcftools write the normalised BCF stream to
-        # stdout in uncompressed form — on a real WGS VCF that's
-        # multiple GB of binary. ``capture_output=True`` would slurp
-        # all of it into Python bytes and OOM the validator. We only
-        # need stderr (for ``REF_MISMATCH`` lines), so discard stdout.
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             ["bcftools", "norm", "--check-ref", "w",
              "-f", str(fasta_path), str(vcf_path), "-Ou"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            check=False, timeout=600,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+    except FileNotFoundError as exc:
         return {
             "path": str(vcf_path),
             "passed": False,
@@ -467,20 +472,49 @@ def check_ref_against_fasta(
             "errored": True,
             "stderr_tail": f"<could not run bcftools: {exc}>",
         }
-    stderr = proc.stderr.decode(errors="replace")
-    # bcftools --check-ref w writes a warning line per mismatch:
-    #   "REF_MISMATCH\t<chrom>\t<pos>\t<ref-in-vcf>\t<ref-in-fasta>"
-    # Count those; the line prefix is the stable contract.
-    mismatches = sum(
-        1 for ln in stderr.splitlines() if ln.startswith("REF_MISMATCH")
-    )
+
+    mismatches = 0
+    tail = collections.deque(maxlen=_REF_CHECK_STDERR_TAIL_LINES)
+    try:
+        # bcftools writes one warning line per mismatch:
+        #   "REF_MISMATCH\t<chrom>\t<pos>\t<ref-in-vcf>\t<ref-in-fasta>"
+        # ``stderr`` is a binary stream; iterating yields one line at
+        # a time so we never materialise the full stderr.
+        assert proc.stderr is not None
+        for raw_line in proc.stderr:
+            line = raw_line.decode(errors="replace")
+            if line.startswith("REF_MISMATCH"):
+                mismatches += 1
+            tail.append(line)
+        rc = proc.wait(timeout=600)
+    except subprocess.TimeoutExpired as exc:
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        return {
+            "path": str(vcf_path),
+            "passed": False,
+            "mismatches": mismatches,
+            "errored": True,
+            "stderr_tail": f"<timeout: {exc}>",
+        }
+    stderr_tail = "".join(tail)
     return {
         "path": str(vcf_path),
-        "passed": (proc.returncode == 0 and mismatches == 0),
+        "passed": (rc == 0 and mismatches == 0),
         "mismatches": mismatches,
-        "errored": proc.returncode != 0,
-        "stderr_tail": stderr[-1500:] if stderr else "",
+        "errored": rc != 0,
+        "stderr_tail": stderr_tail[-1500:],
     }
+
+
+# Cap how many stderr lines we retain from bcftools for diagnostics.
+# bcftools emits one short line per mismatched record, so 200 lines
+# is plenty of context if the run fails while bounding the per-VCF
+# memory cost to a few KB regardless of cohort size or chrom length.
+_REF_CHECK_STDERR_TAIL_LINES = 200
 
 
 # ---------------------------------------------------------------------------
