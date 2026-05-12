@@ -213,38 +213,60 @@ class CarriersSidecarShortWriteTest(unittest.TestCase):
         # Simulate a series of partial writes (e.g. one byte at a
         # time) — ``write()`` must loop until all bytes land, and
         # the read-back must produce the full payload.
-        from unittest.mock import patch
+        #
+        # Replaces ``sc._write_fh`` with a ``Mock(wraps=...)``
+        # proxy rather than patching ``write`` on the raw
+        # ``_io.FileIO`` instance directly. The latter happens to
+        # work on CPython 3.12 but isn't guaranteed by the data
+        # model — ``_io.FileIO`` methods are slot wrappers that
+        # alternative implementations may treat as read-only.
+        # The proxy is a regular Python object so attribute
+        # assignment is well-defined. PR #78 review caught this.
+        from unittest.mock import MagicMock
         with CarriersSidecar(self.path) as sc:
-            real_write = sc._write_fh.write
+            real_fh = sc._write_fh
+            real_write = real_fh.write
             call_count = [0]
-            def short_write(data: memoryview) -> int:
+            def short_write(data) -> int:
                 # First three calls advance one byte each; later
-                # calls write everything remaining.
+                # calls write everything remaining. Uses the real
+                # underlying file's write to actually persist bytes.
                 call_count[0] += 1
                 if call_count[0] <= 3:
                     return real_write(bytes(data[:1]))
                 return real_write(bytes(data))
-            with patch.object(sc._write_fh, "write",
-                              side_effect=short_write):
+            wrapper = MagicMock(wraps=real_fh)
+            wrapper.write.side_effect = short_write
+            sc._write_fh = wrapper
+            try:
                 c = np.array([[1, 1], [2, 1], [3, 1]], dtype=np.int32)
                 # 24 bytes total; first 3 calls write 1 byte each
                 # (3 bytes), call 4 finishes the remaining 21.
                 ref = sc.write(c)
                 self.assertEqual(ref, (0, 24))
                 self.assertGreaterEqual(call_count[0], 4)
+            finally:
+                sc._write_fh = real_fh
             back = sc.read(*ref)
             self.assertTrue(np.array_equal(back, c))
 
     def test_zero_byte_write_raises(self):
         # A write that makes literally no progress would loop
-        # forever without the guard. Stub returns 0 to simulate
-        # this pathological case.
-        from unittest.mock import patch
+        # forever without the guard. Wrapper returns 0 to simulate
+        # this pathological case. Same wrapping pattern as
+        # ``test_partial_writes_are_retried`` for portability.
+        from unittest.mock import MagicMock
         with CarriersSidecar(self.path) as sc:
-            with patch.object(sc._write_fh, "write", return_value=0):
+            real_fh = sc._write_fh
+            wrapper = MagicMock(wraps=real_fh)
+            wrapper.write.return_value = 0
+            sc._write_fh = wrapper
+            try:
                 with self.assertRaises(OSError) as ctx:
                     sc.write(np.array([[1, 1]], dtype=np.int32))
                 self.assertIn("no progress", str(ctx.exception))
+            finally:
+                sc._write_fh = real_fh
 
 
 class CarriersSidecarErrorPathsTest(unittest.TestCase):

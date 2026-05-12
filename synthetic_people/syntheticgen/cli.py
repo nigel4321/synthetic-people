@@ -609,22 +609,32 @@ def _preflight_arrow_disk_check(
         # Best-effort — if disk_usage fails we don't block the run.
         return
 
+    # Sidecar-aware scratch note for arrow-streaming users — the
+    # ~2× budget vs plain ``arrow`` is intentional, not a bug.
+    if cohort_mode == "arrow-streaming":
+        scratch_note = (
+            " (Arrow IPC file + carriers sidecar)"
+        )
+    else:
+        scratch_note = ""
+
     if free < per_chrom:
         raise SystemExit(
-            f"--cohort-mode arrow needs ~{per_chrom / 1e9:.1f} GB scratch "
-            f"per chromosome (n={n_samples}, length={chr_length_mb} Mb); "
+            f"--cohort-mode {cohort_mode} needs "
+            f"~{per_chrom / 1e9:.1f} GB scratch{scratch_note} per "
+            f"chromosome (n={n_samples}, length={chr_length_mb} Mb); "
             f"only {free / 1e9:.1f} GB free under {cohort_dir}. "
-            f"Free up disk or pass --cohort-mode sites_list (supported "
-            f"up to n~30000)."
+            f"Free up disk or pass --cohort-mode sites_list "
+            f"(supported up to n~30000)."
         )
     if free < 2 * per_chrom:
         print(
-            f"  WARNING: --cohort-mode arrow estimates "
-            f"~{per_chrom / 1e9:.1f} GB scratch per chromosome and only "
-            f"{free / 1e9:.1f} GB is free under {cohort_dir}. The first "
-            f"chromosome will fit, but the final BCF + Arrow file may "
-            f"not coexist. Free up disk or set "
-            f"`--cohort-mode sites_list` to be safe.",
+            f"  WARNING: --cohort-mode {cohort_mode} estimates "
+            f"~{per_chrom / 1e9:.1f} GB scratch{scratch_note} per "
+            f"chromosome and only {free / 1e9:.1f} GB is free under "
+            f"{cohort_dir}. The first chromosome will fit, but the "
+            f"final BCF + Arrow file may not coexist. Free up disk "
+            f"or set `--cohort-mode sites_list` to be safe.",
             file=sys.stderr,
         )
 
