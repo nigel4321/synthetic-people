@@ -452,9 +452,11 @@ Choose-your-own-adventure, ordered by catch-rate per cost.
    (skip cleanly if no FASTA). Even without M12 in place, this
    proves the validator catches the bug if/when M12 lands
    incomplete. ~1 hour.
-2. **Realised overlay density counters**. Walk `INFO/RS`,
-   `INFO/CLNSIG`, `INFO/COSMIC_ID`; tally non-empty fractions;
-   compare against manifest's requested densities. ~1 hour.
+2. **Realised overlay density counters**. Walk the VCF `ID`
+   column for rsIDs (for example, `ID` values starting with `rs`),
+   plus `INFO/CLNSIG` and `INFO/COSMIC_ID`; tally non-empty
+   fractions; compare against manifest's requested densities.
+   ~1 hour.
 3. **Per-chromosome breakouts**. Re-emit all the aggregate stats
    (Ti/Tv, het/hom, AF histogram, indel lengths) per chromosome,
    not just cohort-wide. ~2 hours.
