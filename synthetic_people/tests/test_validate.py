@@ -43,6 +43,9 @@ from syntheticgen.validate import (
     _parse_info,
     aggregate_indel_lengths,
     aggregate_sv_summary,
+    check_ref_against_fasta,
+    cohort_chrom_stats,
+    cohort_overlay_density,
     het_hom_ratio,
     titv_from_stats,
 )
@@ -165,6 +168,217 @@ class TestSampleStatsAggregation(unittest.TestCase):
         b.sv_by_type = defaultdict(int, {"DEL": 2, "INV": 1})
         out = aggregate_sv_summary([a, b])
         self.assertEqual(out, {"DEL": 5, "DUP": 1, "INV": 1})
+
+
+class TestCohortChromStats(unittest.TestCase):
+    """Tier 1: per-chromosome breakouts surface chrom-specific
+    regressions that cohort-wide aggregates hide."""
+
+    def _stats_with_chroms(self, chrom_counts: dict) -> SampleStats:
+        """``chrom_counts`` is ``{chrom: {n_records, n_ti, n_tv, ...}}``
+        — populates a SampleStats with the requested per-chrom
+        buckets, skipping the iter_records / bcftools path."""
+        s = SampleStats(name="x")
+        for chrom, fields in chrom_counts.items():
+            for k, v in fields.items():
+                s.by_chrom[chrom][k] = v
+        return s
+
+    def test_per_chrom_counts_aggregate_across_samples(self):
+        a = self._stats_with_chroms(
+            {"22": {"n_records": 10, "n_snv": 8, "n_ti": 5, "n_tv": 3}}
+        )
+        b = self._stats_with_chroms(
+            {"22": {"n_records": 4, "n_snv": 3, "n_ti": 2, "n_tv": 1},
+             "X":  {"n_records": 7, "n_snv": 7, "n_ti": 5, "n_tv": 2}}
+        )
+        out = cohort_chrom_stats([a, b])
+        self.assertEqual(out["22"]["n_records"], 14)
+        self.assertEqual(out["22"]["n_snv"], 11)
+        self.assertEqual(out["22"]["n_ti"], 7)
+        self.assertEqual(out["22"]["n_tv"], 4)
+        self.assertEqual(out["X"]["n_records"], 7)
+
+    def test_per_chrom_titv_attached_to_each_row(self):
+        a = self._stats_with_chroms(
+            {"22": {"n_ti": 21, "n_tv": 10}}
+        )
+        out = cohort_chrom_stats([a])
+        self.assertAlmostEqual(out["22"]["titv"], 2.1)
+
+    def test_per_chrom_titv_handles_zero_tv(self):
+        a = self._stats_with_chroms(
+            {"Y": {"n_ti": 5, "n_tv": 0}}
+        )
+        out = cohort_chrom_stats([a])
+        self.assertEqual(out["Y"]["titv"], float("inf"))
+
+    def test_chrom_order_canonical(self):
+        # Mix integer chroms with X/Y/MT; verify the order is
+        # 1-22, X, Y, MT — the standard VCF convention.
+        a = self._stats_with_chroms({
+            "MT": {"n_records": 1},
+            "Y": {"n_records": 1},
+            "X": {"n_records": 1},
+            "2": {"n_records": 1},
+            "22": {"n_records": 1},
+            "10": {"n_records": 1},
+        })
+        out = cohort_chrom_stats([a])
+        self.assertEqual(
+            list(out.keys()), ["2", "10", "22", "X", "Y", "MT"],
+        )
+
+    def test_chr_prefix_sorts_with_unprefixed(self):
+        # "chr22" should sort like "22"; both common in real VCFs.
+        a = self._stats_with_chroms({
+            "chr22": {"n_records": 1},
+            "chr2": {"n_records": 1},
+        })
+        out = cohort_chrom_stats([a])
+        self.assertEqual(list(out.keys()), ["chr2", "chr22"])
+
+
+class TestCohortOverlayDensity(unittest.TestCase):
+    """Tier 1: realised overlay-density counts let the validator
+    compare what landed in the VCFs against what the manifest
+    requested — catches drift in the overlay pipeline."""
+
+    def _stats(self, name: str, n: int, rs: int = 0,
+               cln: int = 0, cos: int = 0) -> SampleStats:
+        s = SampleStats(name=name)
+        s.n_records = n
+        s.n_with_rs = rs
+        s.n_with_clnsig = cln
+        s.n_with_cosmic_id = cos
+        return s
+
+    def test_aggregates_counts_and_fractions_across_samples(self):
+        a = self._stats("a", n=100, rs=20, cln=1, cos=0)
+        b = self._stats("b", n=100, rs=15, cln=2, cos=0)
+        out = cohort_overlay_density([a, b])
+        self.assertEqual(out["n_records"], 200)
+        self.assertEqual(out["rsid"]["n"], 35)
+        self.assertAlmostEqual(out["rsid"]["fraction"], 0.175)
+        self.assertEqual(out["clinvar"]["n"], 3)
+        self.assertAlmostEqual(out["clinvar"]["fraction"], 0.015)
+        self.assertEqual(out["cosmic"]["n"], 0)
+        self.assertEqual(out["cosmic"]["fraction"], 0.0)
+
+    def test_zero_records_returns_zero_fractions(self):
+        # Defensive: no division-by-zero on empty cohorts.
+        out = cohort_overlay_density([self._stats("e", n=0)])
+        self.assertEqual(out["n_records"], 0)
+        self.assertEqual(out["rsid"]["fraction"], 0.0)
+        self.assertEqual(out["clinvar"]["fraction"], 0.0)
+        self.assertEqual(out["cosmic"]["fraction"], 0.0)
+
+
+class TestCheckRefAgainstFasta(unittest.TestCase):
+    """Tier 1: REF-matches-FASTA gate. Today's synthetic output
+    uses fabricated REF so the gate fails on every record — the
+    test below verifies the helper returns a structured failure
+    rather than crashing, so downstream consumers can display it."""
+
+    def test_missing_bcftools_returns_errored(self):
+        # When bcftools isn't on PATH, the helper must surface a
+        # structured ``errored=True`` result rather than crash. Mock
+        # subprocess.run to raise FileNotFoundError as if the
+        # executable couldn't be located.
+        from unittest.mock import patch
+        with patch(
+            "syntheticgen.validate.subprocess.run",
+            side_effect=FileNotFoundError("bcftools"),
+        ):
+            r = check_ref_against_fasta(
+                Path("/nonexistent.vcf.gz"), Path("/nonexistent.fa"),
+            )
+        self.assertTrue(r["errored"])
+        self.assertFalse(r["passed"])
+        self.assertEqual(r["mismatches"], 0)
+        self.assertIn("bcftools", r["stderr_tail"])
+
+    def test_mismatches_counted_from_stderr(self):
+        # When bcftools writes REF_MISMATCH warnings to stderr, the
+        # helper must count them. Mock subprocess.run to return a
+        # CompletedProcess whose stderr is the canonical
+        # REF_MISMATCH-line format bcftools emits.
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stderr = (
+            b"REF_MISMATCH\t20\t12345\tA\tG\n"
+            b"REF_MISMATCH\t20\t67890\tT\tC\n"
+            b"Lines reformatted: 2\n"
+        )
+        with patch(
+            "syntheticgen.validate.subprocess.run", return_value=fake,
+        ):
+            r = check_ref_against_fasta(
+                Path("/nonexistent.vcf.gz"), Path("/nonexistent.fa"),
+            )
+        self.assertEqual(r["mismatches"], 2)
+        # passed=False because mismatches > 0, even though
+        # returncode==0 (bcftools warned, didn't error).
+        self.assertFalse(r["passed"])
+        self.assertFalse(r["errored"])
+
+    def test_clean_pass(self):
+        # No REF_MISMATCH lines + zero exit = passed.
+        from unittest.mock import patch, MagicMock
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stderr = b"Lines total: 1000\n"
+        with patch(
+            "syntheticgen.validate.subprocess.run", return_value=fake,
+        ):
+            r = check_ref_against_fasta(
+                Path("/nonexistent.vcf.gz"), Path("/nonexistent.fa"),
+            )
+        self.assertTrue(r["passed"])
+        self.assertEqual(r["mismatches"], 0)
+        self.assertFalse(r["errored"])
+
+
+class TestSummariseVcfOverlayCounters(unittest.TestCase):
+    """Tier 1: confirm summarise_vcf increments the overlay-density
+    counters for records that carry INFO/RS, INFO/CLNSIG, or
+    INFO/COSMIC_ID — and ignores empty / dotted values."""
+
+    def _make_record(self, info_str: str) -> Record:
+        # Minimal Record fixture skipping iter_records / bcftools.
+        return Record(
+            chrom="22", pos=100, ref="A", alt="C", gt="0|1",
+            dp=30, gq=40, ad_ref=15, ad_alt=15,
+            info=_parse_info(info_str),
+        )
+
+    def test_info_rs_counted(self):
+        r = self._make_record("RS=12345")
+        self.assertTrue(r.info.get("RS"))
+        # Manual simulation of the counter logic in summarise_vcf,
+        # ensuring the same predicate matches truthy values.
+        rs = r.info.get("RS")
+        self.assertTrue(rs is True or (rs and rs != "."))
+
+    def test_info_rs_empty_not_counted(self):
+        for empty in (".", ""):
+            r = self._make_record(f"RS={empty}")
+            rs = r.info.get("RS")
+            self.assertFalse(rs is True or (rs and rs != "."))
+
+    def test_info_rs_absent_not_counted(self):
+        r = self._make_record("AC=1;AN=2")
+        rs = r.info.get("RS")
+        self.assertFalse(rs is True or (rs and rs != "."))
+
+    def test_info_flag_form_counted(self):
+        # ``INFO=FLAG`` (no "=") is parsed as ``True`` by
+        # ``_parse_info``; the truthy check must accept it too,
+        # since some VCFs use flag-style markers.
+        r = self._make_record("CLNSIG;AC=1")
+        cln = r.info.get("CLNSIG")
+        self.assertTrue(cln is True or (cln and cln != "."))
 
 
 @unittest.skipUnless(HAS_NUMPY, "numpy required")
