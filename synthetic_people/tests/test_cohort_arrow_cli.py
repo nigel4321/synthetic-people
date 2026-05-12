@@ -93,6 +93,32 @@ class EstimateArrowScratchTest(unittest.TestCase):
         self.assertGreater(b, 100 * 1e9)   # > 100 GB
         self.assertLess(b, 1500 * 1e9)     # < 1.5 TB upper sanity
 
+    def test_arrow_mode_excludes_sidecar_term(self):
+        # PR #77 review: only ``arrow-streaming`` allocates a
+        # carriers sidecar. ``arrow`` mode keeps carriers in RAM
+        # and must not be charged for it — would falsely fail
+        # tight-disk runs.
+        arrow_only = _estimate_arrow_chrom_scratch_bytes(
+            1_000, 1.0, cohort_mode="arrow",
+        )
+        streaming = _estimate_arrow_chrom_scratch_bytes(
+            1_000, 1.0, cohort_mode="arrow-streaming",
+        )
+        # Streaming budget is roughly 2× arrow (one Arrow file +
+        # one sidecar of comparable size).
+        self.assertAlmostEqual(streaming, 2 * arrow_only)
+
+    def test_default_cohort_mode_is_arrow(self):
+        # Defensive: callers passing no cohort_mode should get the
+        # arrow-only (no-sidecar) estimate, not the wider streaming
+        # one. The sidecar charge has to be opt-in for the runtime
+        # not to surprise legacy callers.
+        defaulted = _estimate_arrow_chrom_scratch_bytes(1_000, 1.0)
+        arrow_only = _estimate_arrow_chrom_scratch_bytes(
+            1_000, 1.0, cohort_mode="arrow",
+        )
+        self.assertEqual(defaulted, arrow_only)
+
 
 class PreflightArrowDiskCheckTest(unittest.TestCase):
     """The pre-flight check has three observable behaviours: pass

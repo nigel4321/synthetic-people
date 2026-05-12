@@ -78,14 +78,36 @@ class CarriersSidecar:
     def __init__(self, path: Path):
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        # Truncate any leftover from a prior aborted run.
-        self._write_fh = open(self._path, "wb", buffering=0)
-        # Separate read fd so the kernel doesn't have to flush the
-        # write fd to let reads see recent data. ``os.pread`` is
-        # positional — does not touch the read fd's offset.
-        self._read_fd = os.open(str(self._path), os.O_RDONLY)
+        self._write_fh = None
+        self._read_fd = -1
         self._offset = 0
         self._closed = False
+        # Exception-safe construction: if the second fd-open fails
+        # after the first succeeds, the partially-acquired write
+        # handle would leak AND the file would linger on disk.
+        # Catch the failure, undo prior state, then re-raise.
+        try:
+            # Unbuffered writes (``buffering=0``) so reads via
+            # ``os.pread`` see them immediately — Python's default
+            # 8 KB write buffer would otherwise hide recent writes.
+            self._write_fh = open(self._path, "wb", buffering=0)
+            # Separate read fd: ``os.pread`` is positional and does
+            # not touch the read fd's offset, so writes (which
+            # advance the write fd's offset) and reads don't
+            # interfere.
+            self._read_fd = os.open(str(self._path), os.O_RDONLY)
+        except OSError:
+            if self._write_fh is not None:
+                try:
+                    self._write_fh.close()
+                except OSError:
+                    pass
+                self._write_fh = None
+            try:
+                self._path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     def write(self, carriers: np.ndarray) -> tuple[int, int]:
         """Append packed carriers; return ``(offset, n_bytes)``.
@@ -94,23 +116,51 @@ class CarriersSidecar:
         ``(n_rows, 2)`` — the post-PR-#71 packed shape. Empty
         carriers (shape ``(0, 2)``) write 0 bytes and return
         ``(current_offset, 0)`` so the round-trip is symmetric.
+
+        Raises ``TypeError`` for wrong dtype, ``ValueError`` for
+        wrong shape, and ``OSError`` on a short write. These are
+        real exceptions (not ``assert``) so they fire under
+        ``python -O`` too — the sidecar's byte layout depends on
+        the input shape and a silent-corruption mode is not OK.
         """
-        assert carriers.dtype == np.int32, (
-            f"carriers must be np.int32; got {carriers.dtype}"
-        )
-        assert carriers.ndim == 2 and carriers.shape[1] == 2, (
-            f"carriers must be shape (N, 2); got {carriers.shape}"
-        )
+        if carriers.dtype != np.int32:
+            raise TypeError(
+                f"carriers must be np.int32; got {carriers.dtype}",
+            )
+        if carriers.ndim != 2 or carriers.shape[1] != 2:
+            raise ValueError(
+                f"carriers must be shape (N, 2); got {carriers.shape}",
+            )
         if carriers.shape[0] == 0:
             return (self._offset, 0)
         # Ensure C-contiguous so ``tobytes`` is a single block.
         if not carriers.flags["C_CONTIGUOUS"]:
             carriers = np.ascontiguousarray(carriers)
         data = carriers.tobytes()
-        self._write_fh.write(data)
+        n_expected = len(data)
+        # Unbuffered file.write(bytes) on a raw binary file returns
+        # the bytes actually written, which may be less than
+        # requested on EINTR / disk-full / signal interruption.
+        # Loop until everything's flushed, or raise on a true
+        # zero-byte write (which would loop forever).
+        view = memoryview(data)
+        n_written = 0
+        while n_written < n_expected:
+            chunk = self._write_fh.write(view[n_written:])
+            if chunk is None:
+                # ``buffering=0`` should never return None per
+                # PEP 3116, but defensive.
+                raise OSError("sidecar write returned None")
+            if chunk == 0:
+                raise OSError(
+                    f"sidecar write made no progress: "
+                    f"wrote {n_written}/{n_expected} bytes "
+                    f"before stalling",
+                )
+            n_written += chunk
         offset = self._offset
-        self._offset += len(data)
-        return (offset, len(data))
+        self._offset += n_expected
+        return (offset, n_expected)
 
     def read(self, offset: int, n_bytes: int) -> np.ndarray:
         """Read packed carriers at ``offset``; return a fresh
@@ -120,18 +170,37 @@ class CarriersSidecar:
         (the no-carriers case, where the original site had no
         non-zero haplotypes).
 
-        Raises ``OSError`` if the read returns fewer bytes than
-        requested — would indicate file corruption or a programmer
-        bug in offset/length tracking.
+        Raises ``ValueError`` if ``n_bytes`` isn't a multiple of
+        the per-row size (8 = 2 × int32). Raises ``OSError`` on
+        a short read (would indicate file corruption or a
+        programmer bug in offset/length tracking).
         """
         if n_bytes == 0:
             return np.zeros((0, 2), dtype=np.int32)
-        data = os.pread(self._read_fd, n_bytes, offset)
-        if len(data) != n_bytes:
-            raise OSError(
-                f"sidecar short read at offset={offset}: "
-                f"requested {n_bytes} bytes, got {len(data)}",
+        if n_bytes % _BYTES_PER_CARRIER_ROW != 0:
+            raise ValueError(
+                f"sidecar read length {n_bytes} is not a multiple "
+                f"of the per-row size ({_BYTES_PER_CARRIER_ROW} "
+                f"bytes) — would corrupt the (N, 2) reshape",
             )
+        # ``os.pread`` on Linux can return fewer bytes than
+        # requested on EINTR / short read; loop until satisfied
+        # or detect a real EOF (zero progress) as corruption.
+        chunks: list = []
+        n_remaining = n_bytes
+        cur_offset = offset
+        while n_remaining > 0:
+            chunk = os.pread(self._read_fd, n_remaining, cur_offset)
+            if not chunk:
+                raise OSError(
+                    f"sidecar short read at offset={offset}: "
+                    f"requested {n_bytes} bytes, got "
+                    f"{n_bytes - n_remaining}",
+                )
+            chunks.append(chunk)
+            n_remaining -= len(chunk)
+            cur_offset += len(chunk)
+        data = chunks[0] if len(chunks) == 1 else b"".join(chunks)
         n_rows = n_bytes // _BYTES_PER_CARRIER_ROW
         # ``frombuffer`` returns a read-only view of the underlying
         # bytes; ``.copy()`` so the caller can mutate (e.g. workers
@@ -144,22 +213,27 @@ class CarriersSidecar:
         """Close both fds and unlink the sidecar file.
 
         Idempotent — safe to call from a ``finally`` block even
-        after an earlier ``close()``. Swallows ``OSError`` from
-        partial cleanup paths; the goal is to leave the filesystem
-        in a clean state, not to fail loudly on a sidecar we were
-        about to discard anyway.
+        after an earlier ``close()`` or after a partial-
+        construction failure (in which case one or both fds may
+        not exist). Swallows ``OSError`` from partial cleanup
+        paths; the goal is to leave the filesystem clean, not to
+        fail loudly on a sidecar we were about to discard anyway.
         """
         if self._closed:
             return
         self._closed = True
-        try:
-            self._write_fh.close()
-        except OSError:
-            pass
-        try:
-            os.close(self._read_fd)
-        except OSError:
-            pass
+        if self._write_fh is not None:
+            try:
+                self._write_fh.close()
+            except OSError:
+                pass
+            self._write_fh = None
+        if self._read_fd != -1:
+            try:
+                os.close(self._read_fd)
+            except OSError:
+                pass
+            self._read_fd = -1
         try:
             self._path.unlink(missing_ok=True)
         except OSError:
