@@ -201,21 +201,47 @@ primary control surface is `--cohort-mode`.
 - **n ≤ ~500 000**, full WGS, streamed cohort generation —
   feasible with reduced overlay density (rsid ≤ 0.05) on a
   64 GB host.
-- **n ≥ ~1 000 000** for streamed cohort generation — needs the
-  carriers-packing fix below.
+- **n ≥ ~1 000 000** — bounded by Fix B.1 (carriers spill-to-disk,
+  see "Fix history" below). Parent peak no longer scales with n.
 
-### Fix sketch (not yet implemented)
+### Fix history
 
-Pack `carriers` as a numpy array of haplotype indices rather than
-a list of `(int, int)` tuples. For biallelic sites (the vast
-majority) the allele field is always 1 and can be elided.
-`np.array(hap_indices, dtype=np.int32)` ≈ 4 B per carrier, vs
-~80 B for the Python tuple representation — a **~20× memory
-reduction** across all carriers-holding code paths (streaming
-heap, Arrow writer batches, materialised sites list). Should
-push the streaming ceiling from ~n=500K to ~n=5M without
-architectural change. Tracked in deferred-guardrails below as
-**carriers packing**.
+**Fix A — carriers packing (PR #71, merged 2026-05-12).**
+Packed `carriers` from `list[tuple[int, int]]` (~80 B per row) to
+a 2-D `np.int32` array (~8 B per row). ~10× per-row reduction
+across every carriers-holding code path. Insufficient on its own:
+the 2026-05-12 user run at n=1M with the post-Fix-A code still
+hit the same 63 GB ceiling because the safe-yield heap depth
+approaches O(N_sites) under realistic overlay-position
+distributions — so 10× per-row × ~1M in-flight sites still
+swamped a 64 GB host.
+
+**Fix B.1 — carriers spill-to-disk (this PR).** Spills each
+site's packed carriers to a per-chromosome sidecar file
+(`syntheticgen/carriers_sidecar.py`) at heap-push time; the heap
+entry holds only a `(offset, n_bytes)` reference. On heap pop the
+carriers are read back and re-attached. Per-site bytes-in-RAM
+falls from ~60 KB to ~200 B; **parent peak RSS no longer scales
+with n at all**. Costs:
+
+- Doubles per-chrom scratch disk budget (sidecar size ≈ packed
+  carriers total for the chrom).
+- Adds one `os.pread` per yielded site — at ~1M sites × ~50 µs
+  per syscall ≈ ~50 s of pure I/O overhead per chrom on SSD.
+  Negligible against the multi-hour msprime simulation phase.
+- The cross-mode byte-parity tests
+  (`CohortModeArrowParityTest`, `CohortModeArrowStreamingParityTest`)
+  lock in that spill is invisible to output content.
+
+### What's still not bounded
+
+- **msprime's own TreeSequence memory.** At n=10M for a 70 Mb
+  chrom the TS itself can be tens of GB. Fix B.1 doesn't touch
+  the TS — that's an msprime-internal concern.
+- **Per-person fan-out wall-clock at n>1M.** ~1M `bcftools query`
+  invocations is its own ceiling; recommended workflow is
+  `--mode cohort` and query the per-chrom BCFs with
+  `bcftools view -s SAMPLE_ID`.
 
 ---
 
@@ -250,7 +276,8 @@ actual regression they would have caught.
 
 | Guardrail / fix | Catches | Why not yet / justification |
 |---|---|---|
-| **Carriers packing** (numpy array, drop allele field for biallelics) | The n=1M scaling ceiling documented above — direct ~20× memory reduction across streaming heap + Arrow writer + materialised sites | We now have a concrete regression case (2026-05-12 user run). Right next move after this doc update. Estimate: 1 day implementation + 1 day touching consumers (Arrow writer, BCF emission). |
+| ~~Carriers packing~~ | ~~Per-row cost~~ | **Shipped** in PR #71 (Fix A). ~10× per-row reduction; insufficient at n=1M against realistic heap depth. |
+| ~~Carriers spill-to-disk (Fix B.1)~~ | ~~Heap-depth × per-site cost at WGS-scale n~~ | **Shipped** in this PR — `carriers_sidecar.py` keeps parent RSS independent of n. Doubles per-chrom scratch disk. |
 | Nightly WGS-scale memprof CI | Subtle O(n) re-materialisation, slow-bleed drift, scaling-ceiling regressions | Needs a dedicated runner with predictable RAM; ongoing cost. The 2026-05-12 incident is exactly the case that justifies this. Worth ~1 day of plumbing now that we have a regression case. |
 | Auto-picker calibration test | Drift between `_estimate_materialised_parent_peak_bytes` and reality | The estimator is itself an approximation; calibration would need a tolerance band that's hard to set without observing real drift first. |
 | pytest-benchmark wall-clock regression | Time-only regressions (no RSS impact) | Variance on shared CI runners makes time-based gates noisy; only worth wiring up if a real time regression hits us. |

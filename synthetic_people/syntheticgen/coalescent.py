@@ -596,7 +596,8 @@ def _stream_cohort_pass2(ts, chrom: str, n_people: int,
                         inject_map: dict,
                         annotation_map: dict,
                         position_offset: int = 0,
-                        keep_below_bp: int | None = None):
+                        keep_below_bp: int | None = None,
+                        carriers_sidecar=None):
     """Pass 2 of the streaming-cohort walk: yield full site dicts in
     pos-sorted order, applying pre-computed overlays.
 
@@ -717,11 +718,11 @@ def _stream_cohort_pass2(ts, chrom: str, n_people: int,
                 "afs": [ac / n_haplotypes],
                 "acs": [ac],
                 "n_haplotypes": n_haplotypes,
-                "carriers": carriers,
             }
             for k in ("clnsig", "clndn", "cosmic_id", "cosmic_gene"):
                 if k in overlay:
                     site[k] = overlay[k]
+            _attach_or_spill_carriers(site, carriers, carriers_sidecar)
             heapq.heappush(buffer, (site["pos"], counter, site))
             counter += 1
             overlay_next_ptr += 1
@@ -735,7 +736,6 @@ def _stream_cohort_pass2(ts, chrom: str, n_people: int,
                 "afs": [ac / n_haplotypes],
                 "acs": [ac],
                 "n_haplotypes": n_haplotypes,
-                "carriers": carriers,
             }
             if accepted_idx in annotation_map:
                 ann = annotation_map[accepted_idx]
@@ -743,6 +743,7 @@ def _stream_cohort_pass2(ts, chrom: str, n_people: int,
                 site["clndn"] = ann["clndn"]
                 if site.get("id") in (None, "", ".") and ann.get("id"):
                     site["id"] = ann["id"]
+            _attach_or_spill_carriers(site, carriers, carriers_sidecar)
             heapq.heappush(buffer, (pos, counter, site))
             counter += 1
 
@@ -755,12 +756,56 @@ def _stream_cohort_pass2(ts, chrom: str, n_people: int,
         )
 
         while buffer and buffer[0][0] < smallest_future_pos:
-            yield heapq.heappop(buffer)[2]
+            popped = heapq.heappop(buffer)[2]
+            _hydrate_carriers(popped, carriers_sidecar)
+            yield popped
 
     # Drain remaining buffer entries (all guaranteed to be in order
     # since no future site can land below their pos at end-of-walk).
     while buffer:
-        yield heapq.heappop(buffer)[2]
+        popped = heapq.heappop(buffer)[2]
+        _hydrate_carriers(popped, carriers_sidecar)
+        yield popped
+
+
+def _attach_or_spill_carriers(site: dict, carriers, sidecar) -> None:
+    """Attach ``carriers`` to ``site`` either inline (no sidecar) or
+    by spilling to disk (sidecar provided).
+
+    When ``sidecar`` is ``None`` the carriers go directly into
+    ``site["carriers"]`` — the existing no-spill path, byte-identical
+    to pre-Fix-B.1 behaviour.
+
+    When ``sidecar`` is a :class:`CarriersSidecar`, the carriers
+    bytes are written to the sidecar and the site dict gets a
+    ``_carriers_spill: (offset, n_bytes)`` reference instead. The
+    heap entry is then ~200 B (dict + small fields + tuple) rather
+    than ~60 KB at WGS-scale n. Hydrated back to ``carriers`` on
+    heap pop via :func:`_hydrate_carriers`.
+    """
+    if sidecar is None:
+        site["carriers"] = carriers
+    else:
+        site["_carriers_spill"] = sidecar.write(carriers)
+
+
+def _hydrate_carriers(site: dict, sidecar) -> None:
+    """Inverse of :func:`_attach_or_spill_carriers`.
+
+    On heap pop: if the site has a ``_carriers_spill`` ref, read it
+    back from the sidecar and replace it with a ``carriers`` field.
+    No-op when the site already has ``carriers`` (no-spill path) or
+    when no sidecar is in play.
+
+    Post-hydration the site dict is structurally identical to the
+    no-spill yield — same keys, same numpy shape — so downstream
+    consumers (Arrow writer, BCF writer, byte-parity tests) see no
+    behavioural change.
+    """
+    spill_ref = site.pop("_carriers_spill", None)
+    if spill_ref is not None:
+        offset, n_bytes = spill_ref
+        site["carriers"] = sidecar.read(offset, n_bytes)
 
 
 def n_haplotypes_total(n_people: int) -> int:

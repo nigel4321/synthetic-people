@@ -544,17 +544,35 @@ def _resolve_cohort_mode(cli_mode: str, n: int,
 def _estimate_arrow_chrom_scratch_bytes(
     n_samples: int, chr_length_mb: float
 ) -> int:
-    """Estimate per-chromosome scratch disk for the Arrow intermediate.
+    """Estimate per-chromosome scratch disk for the Arrow intermediate
+    plus the Fix B.1 carriers sidecar.
 
-    Used only by :func:`_preflight_arrow_disk_check`. Approximation:
-    ``n_haplotypes × variants_per_chrom × 1 byte`` for the genotype
-    matrix dominates; INFO + offsets add ~5 %. Rough accuracy is OK —
-    the check produces a warning when free disk is tight, not a hard
-    refusal.
+    Used by :func:`_preflight_arrow_disk_check`. Two terms:
+
+    1. **Arrow file**: ``n_haplotypes × variants_per_chrom × 1 byte``
+       (dense int8 genotypes; INFO + offsets add ~5 %). This is the
+       on-disk size of the cohort intermediate after compression by
+       Arrow's IPC writer — flat int8 of zeros + a sparse fraction
+       of ones at AF.
+    2. **Carriers sidecar** (Fix B.1 carriers spill-to-disk): packed
+       ``np.int32 × 2`` per non-zero haplotype. Each site averages
+       ``~θ × log(n)`` carriers under coalescent SFS — empirically
+       sums to roughly the same byte total as the Arrow file at
+       canonical AFs. Budget 1× the Arrow term as a conservative
+       sidecar estimate; the kernel page cache makes this less
+       binding than the Arrow IPC scratch in practice but the
+       allocation must still fit on the filesystem.
+
+    Rough accuracy is OK — the check produces a warning when free
+    disk is tight, not a hard refusal.
     """
     variants = max(1, int(chr_length_mb * _VARIANTS_PER_MB))
-    raw = 2 * n_samples * variants
-    return int(raw * 1.05)
+    arrow_raw = 2 * n_samples * variants
+    arrow_with_overhead = int(arrow_raw * 1.05)
+    # Carriers sidecar — same order of magnitude as the Arrow file
+    # for canonical AFs; budget 1× as a conservative estimate.
+    sidecar = arrow_with_overhead
+    return arrow_with_overhead + sidecar
 
 
 def _preflight_arrow_disk_check(
@@ -751,7 +769,17 @@ def _iter_chrom_sites_streaming(
         _plan_cohort_overlays,
         _stream_cohort_pass2,
     )
+    from .carriers_sidecar import CarriersSidecar
     from .titv import DEFAULT_TARGET_TITV
+
+    # The carriers spill sidecar lives next to the per-chrom Arrow
+    # scratch file. Resolving the cohort dir from args mirrors the
+    # cohort BCF path resolution elsewhere in the cli. Spill is
+    # enabled unconditionally for the streaming path because the
+    # disk-IO overhead at small n (~few ms/yield) is dwarfed by the
+    # parent-RSS ceiling it removes at WGS scale — see Fix B.1 in
+    # PERFORMANCE_BUDGETS.md § "Known scaling ceiling".
+    spill_dir = Path(args.output_dir) / "cohort" / "carriers_scratch"
 
     for chrom, ts, chrom_rng in simulate_cohort_ts_iter(
         chromosomes=chromosomes_to_simulate, build=args.build,
@@ -796,20 +824,34 @@ def _iter_chrom_sites_streaming(
         inject_map.update(clinvar_plan)
         inject_map.update(rsid_plan)
         inject_map.update(cosmic_plan)
-        stream = _stream_cohort_pass2(
-            ts, chrom, args.n, chrom_rng, DEFAULT_TARGET_TITV,
-            sites_meta, inject_map, annotation_map,
+
+        # Per-chrom carriers sidecar — spilled to disk so the
+        # safe-yield heap holds (offset, length) refs instead of
+        # full per-site carriers arrays. Cleanup via try/finally so
+        # the sidecar is unlinked even when the downstream Arrow
+        # writer raises mid-chrom; the sidecar's own ``close()`` is
+        # idempotent.
+        sidecar = CarriersSidecar(
+            spill_dir / f"carriers.chr{chrom}.spill",
         )
+        try:
+            stream = _stream_cohort_pass2(
+                ts, chrom, args.n, chrom_rng, DEFAULT_TARGET_TITV,
+                sites_meta, inject_map, annotation_map,
+                carriers_sidecar=sidecar,
+            )
 
-        # Tee the stream so we update sfs_total per site as it
-        # flows through to the Arrow writer.
-        def _tee_sfs(site_iter, sfs_total_ref):
-            for site in site_iter:
-                for ac in site.get("acs") or []:
-                    sfs_total_ref[ac] = sfs_total_ref.get(ac, 0) + 1
-                yield site
+            # Tee the stream so we update sfs_total per site as it
+            # flows through to the Arrow writer.
+            def _tee_sfs(site_iter, sfs_total_ref):
+                for site in site_iter:
+                    for ac in site.get("acs") or []:
+                        sfs_total_ref[ac] = sfs_total_ref.get(ac, 0) + 1
+                    yield site
 
-        yield chrom, _tee_sfs(stream, sfs_total)
+            yield chrom, _tee_sfs(stream, sfs_total)
+        finally:
+            sidecar.close()
 
 
 def parse_chromosomes(spec: str, build: str) -> list[str]:
