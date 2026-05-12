@@ -464,6 +464,10 @@ class StreamingShapeInvariantsTest(unittest.TestCase):
             self.assertIn("chrom", site)
             self.assertIn("pos", site)
 
+    @unittest.skipUnless(
+        _HAVE_MSPRIME and _HAVE_STDPOPSIM,
+        "msprime + stdpopsim not installed",
+    )
     def test_carriers_field_is_packed_int32_array(self):
         # Regression guard for the 2026-05-12 carriers-packing
         # refactor (see PERFORMANCE_BUDGETS.md § "Known scaling
