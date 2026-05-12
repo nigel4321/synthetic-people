@@ -18,6 +18,8 @@ from __future__ import annotations
 import random
 import sys
 
+import numpy as np
+
 from .builds import BUILDS
 from .titv import DEFAULT_TARGET_TITV, choose_alt
 
@@ -441,15 +443,19 @@ def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
         alt = choose_alt(ref, rng, target=titv_target)
         assert alt is not None  # ref is always a standard base
 
-        # Sparse carriers: only emit the non-zero entries. With binary
-        # mutations every non-zero entry is allele index 1, so
-        # ``carriers`` reduces to a list of haplotype indices paired
-        # with the constant 1; we still store the tuple form for shape
-        # parity with the multi-allelic legacy path.
-        carriers = [
-            (int(idx), int(allele))
-            for idx, allele in enumerate(gts_arr) if allele > 0
-        ]
+        # Sparse carriers as packed ``np.ndarray`` of shape
+        # ``(n_carriers, 2)``, dtype ``int32``. See
+        # ``cohort_sites.py`` module docstring for the rationale —
+        # at n=1M this representation cuts per-site cost from
+        # ~50 MB (list-of-tuples) to ~5 MB and keeps the
+        # multi-allelic contract intact for the bcf_writer.
+        nonzero = np.flatnonzero(gts_arr)
+        if nonzero.size:
+            carriers = np.column_stack(
+                (nonzero, gts_arr[nonzero])
+            ).astype(np.int32, copy=False)
+        else:
+            carriers = np.zeros((0, 2), dtype=np.int32)
         sites.append({
             "chrom": chrom,
             "pos": pos,
@@ -559,16 +565,25 @@ def _tree_sequence_to_sites_meta(ts, chrom: str, n_people: int,
     return meta
 
 
-def _build_carriers_from_variant(var):
-    """Extract the sparse ``[(hap_idx, allele_idx), ...]`` carriers
-    list from a tskit :class:`Variant`. Same logic as the inline list
-    comprehension in :func:`_tree_sequence_to_sites`, lifted to a
-    helper so pass 2 of the streaming walk can call it without
-    duplicating the per-haplotype loop.
+def _build_carriers_from_variant(var) -> np.ndarray:
+    """Extract packed sparse carriers from a tskit :class:`Variant`.
+
+    Returns ``np.ndarray`` of shape ``(n_carriers, 2)`` and dtype
+    ``np.int32`` — one row per non-zero haplotype, ``[hap_idx,
+    allele_idx]``. Same shape as :func:`carriers_from_dense_gts`
+    and the inline producer in :func:`_tree_sequence_to_sites`.
+
+    Uses ``np.flatnonzero`` + ``np.column_stack`` rather than a
+    Python loop so the conversion stays linear in the number of
+    carriers (not haplotype-total) at WGS-scale n.
     """
     gts_arr = var.genotypes
-    return [(int(idx), int(allele))
-            for idx, allele in enumerate(gts_arr) if allele > 0]
+    nonzero = np.flatnonzero(gts_arr)
+    if not nonzero.size:
+        return np.zeros((0, 2), dtype=np.int32)
+    return np.column_stack(
+        (nonzero, gts_arr[nonzero])
+    ).astype(np.int32, copy=False)
 
 
 def _stream_cohort_pass2(ts, chrom: str, n_people: int,

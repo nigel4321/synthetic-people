@@ -11,6 +11,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 try:
@@ -85,7 +87,11 @@ class TestSimulateChromosome(unittest.TestCase):
             self.assertEqual(s1["pos"], s2["pos"])
             self.assertEqual(s1["acs"], s2["acs"])
             # Phase 5c: compare carriers (sparse) instead of gts.
-            self.assertEqual(s1["carriers"], s2["carriers"])
+            # Packed carriers are np.ndarray; use np.array_equal so
+            # element-wise comparison returns a single bool.
+            self.assertTrue(
+                np.array_equal(s1["carriers"], s2["carriers"]),
+            )
 
     def test_different_seeds_give_different_output(self):
         a = self._run(seed=1)

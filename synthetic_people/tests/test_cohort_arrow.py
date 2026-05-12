@@ -12,6 +12,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 try:
@@ -351,7 +353,13 @@ class TestDiagnosticCarriers(unittest.TestCase):
         write_arrow_file(self.path, "20", 3, iter([site]))
 
         recovered = read_arrow_carriers(self.path, pos=12345)
-        self.assertEqual(sorted(recovered), sorted(original_carriers))
+        # ``recovered`` is a 2D np.int32 array; sort both sides as
+        # tuple-of-tuples so the comparison is order-independent and
+        # hashable.
+        self.assertEqual(
+            sorted(tuple(row) for row in recovered.tolist()),
+            sorted(original_carriers),
+        )
 
     def test_unknown_pos_returns_empty(self):
         from syntheticgen.cohort_arrow import (
@@ -361,7 +369,10 @@ class TestDiagnosticCarriers(unittest.TestCase):
 
         site = _site_from_gts(100, ["0|0", "0|1"])
         write_arrow_file(self.path, "20", 2, iter([site]))
-        self.assertEqual(read_arrow_carriers(self.path, pos=999), [])
+        # Missing position → empty packed array, shape (0, 2).
+        result = read_arrow_carriers(self.path, pos=999)
+        self.assertEqual(len(result), 0)
+        self.assertEqual(result.shape, (0, 2))
 
     def test_multi_allelic_carriers(self):
         from syntheticgen.cohort_arrow import (
@@ -378,7 +389,12 @@ class TestDiagnosticCarriers(unittest.TestCase):
         }
         write_arrow_file(self.path, "20", 3, iter([site]))
         recovered = read_arrow_carriers(self.path, pos=555)
-        self.assertEqual(sorted(recovered), sorted(original_carriers))
+        # Multi-allelic round-trip: the (3, 2) and (4, 1) carriers
+        # must survive. ``recovered`` is a 2D np.int32 array.
+        self.assertEqual(
+            sorted(tuple(row) for row in recovered.tolist()),
+            sorted(original_carriers),
+        )
 
 
 @unittest.skipUnless(HAS_PYARROW, "pyarrow not installed")

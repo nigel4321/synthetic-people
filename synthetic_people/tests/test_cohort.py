@@ -7,6 +7,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from syntheticgen.cohort import (  # noqa: E402
@@ -148,7 +150,10 @@ class TestDrawCohortBackground(unittest.TestCase):
             self.assertEqual(s1["pos"], s2["pos"])
             self.assertEqual(s1["acs"], s2["acs"])
             # Phase 5c: compare carriers (sparse) instead of dense GTs.
-            self.assertEqual(s1["carriers"], s2["carriers"])
+            # Packed carriers are np.ndarray; use np.array_equal.
+            self.assertTrue(
+                np.array_equal(s1["carriers"], s2["carriers"]),
+            )
 
 
 class TestPersonRecordsFromCohort(unittest.TestCase):

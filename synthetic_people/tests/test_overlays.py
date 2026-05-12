@@ -14,6 +14,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from syntheticgen.clinvar import annotate_clinvar, inject_clinvar
@@ -117,7 +119,9 @@ class TestInjectClinvar(unittest.TestCase):
         # carriers under Phase 5c, but representing the same per-
         # person genotypes.
         for s in sites:
-            self.assertEqual(s["carriers"], expected_carriers)
+            self.assertTrue(
+                np.array_equal(s["carriers"], expected_carriers),
+            )
 
     def test_keeps_sites_sorted(self):
         sites = [_site("22", i * 100, "A", "G") for i in range(1, 21)]
@@ -196,7 +200,9 @@ class TestInjectRsids(unittest.TestCase):
         rng = random.Random(1)
         inject_rsids(sites, self._pool(), density=0.6, rng=rng)
         for s in sites:
-            self.assertEqual(s["carriers"], expected_carriers)
+            self.assertTrue(
+                np.array_equal(s["carriers"], expected_carriers),
+            )
 
     def test_reserve_indices_excluded(self):
         sites = [_site("22", i * 100, "A", "G") for i in range(1, 6)]

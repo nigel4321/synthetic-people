@@ -464,6 +464,58 @@ class StreamingShapeInvariantsTest(unittest.TestCase):
             self.assertIn("chrom", site)
             self.assertIn("pos", site)
 
+    def test_carriers_field_is_packed_int32_array(self):
+        # Regression guard for the 2026-05-12 carriers-packing
+        # refactor (see PERFORMANCE_BUDGETS.md § "Known scaling
+        # ceiling"). Cohort sites' ``carriers`` field must remain
+        # an ``np.ndarray`` of shape ``(n_carriers, 2)`` and dtype
+        # ``np.int32``. Reverting to ``list[tuple[int, int]]``
+        # would silently re-introduce the n=1M OOM by inflating
+        # per-site cost ~10×, and would invalidate the budgets in
+        # ``PEAK_RSS_BUDGET_MB`` above.
+        import random
+        import numpy as np
+        from syntheticgen.coalescent import (
+            simulate_cohort_ts_iter, stream_cohort_sites,
+        )
+        rng = random.Random(CANARY_SEED)
+        ts_iter = simulate_cohort_ts_iter(
+            chromosomes=[CANARY_CHROM],
+            build="GRCh38",
+            n_people=CANARY_N,
+            length_mb=0.1,
+            demo_model=None,
+            population="CEU",
+            rec_rate=1e-8,
+            mu=1.29e-8,
+            rng=rng,
+        )
+        chrom, ts, walk_rng = next(ts_iter)
+        stream = stream_cohort_sites(
+            ts, chrom, CANARY_N, walk_rng,
+            overlay_rng=random.Random(CANARY_SEED),
+        )
+        site = next(stream)
+        carriers = site["carriers"]
+        self.assertIsInstance(
+            carriers, np.ndarray,
+            f"carriers must be np.ndarray; got {type(carriers)!r}",
+        )
+        self.assertEqual(
+            carriers.dtype, np.int32,
+            f"carriers dtype must be int32; got {carriers.dtype!r}",
+        )
+        # Either an empty (0, 2) sentinel or a real (n, 2) shape.
+        self.assertEqual(
+            carriers.ndim, 2,
+            f"carriers must be 2D; got shape {carriers.shape!r}",
+        )
+        self.assertEqual(
+            carriers.shape[1], 2,
+            f"carriers must have 2 columns (hap_idx, allele); "
+            f"got shape {carriers.shape!r}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

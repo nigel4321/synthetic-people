@@ -99,11 +99,15 @@ def _summary(sites: list) -> list:
     """Project a sites list to its serialisable, comparable contents.
 
     Phase 5c: cohort sites carry sparse carriers rather than dense
-    GT lists; sort the carrier tuples for stable comparison.
+    GT lists. Post-packing (2026-05-12) ``carriers`` is a 2D
+    ``np.int32`` array; convert via ``.tolist()`` to get a list of
+    [hap, allele] lists, then a sorted tuple of tuples for hashable
+    set-style comparison.
     """
     return [
         (s["chrom"], s["pos"], s["ref"], tuple(s["alts"]),
-         tuple(s["acs"]), tuple(sorted(s["carriers"])))
+         tuple(s["acs"]),
+         tuple(sorted(tuple(row) for row in s["carriers"].tolist())))
         for s in sites
     ]
 

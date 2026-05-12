@@ -1,19 +1,30 @@
 """Sparse genotype storage for cohort sites (Phase 5c).
 
-Cohort sites carry their per-haplotype allele assignments as a list
-of ``(haplotype_index, allele_index)`` tuples — the *carriers* — for
-non-zero entries only. The dense list-of-GT-strings representation
-that earlier phases used is recovered on demand at write time, but
-never stored on the cohort_sites list itself.
+Cohort sites carry their per-haplotype allele assignments as a
+**packed** ``np.ndarray`` of shape ``(n_carriers, 2)`` and dtype
+``np.int32`` — the *carriers* — with one row per non-zero entry.
+The dense list-of-GT-strings representation that earlier phases
+used is recovered on demand at write time, but never stored on the
+cohort_sites list itself.
 
-Why: at ``n=100 000 × n_sites=100 000`` the dense
-``gts: list[str]`` representation costs roughly 1 TB per chromosome
-(``n × n_sites × ~100 B``). Sparse storage costs ``O(alt
-observations)``, which the SFS makes ``O(n_sites × log(n))`` —
-flat enough that n=100k fits in a few hundred MB and n=1M in a few
-GB. See PERFORMANCE_PLAN §"Phase 5c" for the full memory model.
+Why packed: at n=1M a common-AF site (~30%) carries ~600 K rows;
+as a Python ``list[tuple[int, int]]`` that was ~80 B/row ≈ 48 MB
+per site, dominating parent RSS in the streaming pipeline (see
+``PERFORMANCE_BUDGETS.md`` § "Known scaling ceiling" for the
+2026-05-12 n=1M incident). As a 2D ``np.int32`` array it's 8 B/row
+≈ 4.8 MB per site — ~10x reduction across every carriers-holding
+code path (streaming heap, Arrow writer batches, materialised
+sites list, per-person fan-out).
 
-Cohort site dict shape after 5c:
+Why 2D / keep the allele column: the bcf_writer and Arrow paths
+both already support multi-allelic carriers (e.g.
+``[(0,1),(2,1),(5,2),(7,2)]`` for a tri-allelic site), and the
+M14 mutation-model work is expected to start producing them. The
+packed shape preserves that contract — ``for hap_idx, allele_idx
+in carriers`` unpacks 2D rows naturally, so most consumers needed
+no change when the representation flipped.
+
+Cohort site dict shape:
 
 ::
 
@@ -26,7 +37,7 @@ Cohort site dict shape after 5c:
         "afs":  [0.25],
         "acs":  [10],
         "n_haplotypes": 40,            # 2 × n_people; needed for expansion
-        "carriers": [(2, 1), (5, 1)],  # sparse — only non-zero entries
+        "carriers": np.array([[2, 1], [5, 1]], dtype=np.int32),
     }
 
 The helper module's job is to keep tests, the writer, and the
@@ -40,10 +51,22 @@ person's GT out of a site's carriers.
 
 from __future__ import annotations
 
+import numpy as np
 
-def carriers_from_dense_gts(gts: list) -> list:
-    """Convert dense GT strings ``["0|0", "0|1", "1|1"]`` to sparse
-    carriers ``[(hap_idx, allele_idx), ...]`` for non-zero entries.
+
+# Empty-carriers sentinel returned by producers when a site has no
+# alt observations (theoretically possible for the legacy 1000G
+# path; monomorphic sites are filtered upstream of the coalescent
+# producers). Shape (0, 2) preserves the 2D contract so consumers
+# can iterate without an explicit ``if len(carriers) == 0`` guard.
+_EMPTY_CARRIERS = np.zeros((0, 2), dtype=np.int32)
+
+
+def carriers_from_dense_gts(gts: list) -> np.ndarray:
+    """Convert dense GT strings ``["0|0", "0|1", "1|1"]`` to packed
+    carriers — ``np.ndarray`` of shape ``(n_carriers, 2)``, dtype
+    ``np.int32``. Each row is ``[hap_idx, allele_idx]`` for one
+    non-zero entry.
 
     Phased GT strings ("0|1") and unphased ("0/1") both work — the
     separator is detected. The first allele in each string lands at
@@ -53,7 +76,7 @@ def carriers_from_dense_gts(gts: list) -> list:
     Used by tests that build site fixtures from human-readable dense
     GTs and by callers migrating from the old ``site["gts"]`` shape.
     """
-    carriers: list = []
+    rows: list = []
     for person_idx, gt in enumerate(gts):
         if "|" in gt:
             a1, _, a2 = gt.partition("|")
@@ -71,10 +94,12 @@ def carriers_from_dense_gts(gts: list) -> list:
             # semantics, which keeps "./." as a non-event).
             continue
         if a1_int != 0:
-            carriers.append((2 * person_idx, a1_int))
+            rows.append((2 * person_idx, a1_int))
         if a2_int != 0:
-            carriers.append((2 * person_idx + 1, a2_int))
-    return carriers
+            rows.append((2 * person_idx + 1, a2_int))
+    if not rows:
+        return _EMPTY_CARRIERS
+    return np.array(rows, dtype=np.int32)
 
 
 def dense_gts_from_carriers(carriers, n_people: int) -> list:

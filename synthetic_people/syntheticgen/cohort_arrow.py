@@ -413,8 +413,12 @@ def read_arrow_slice(
                 yield site
 
 
-def read_arrow_carriers(arrow_path: Path, pos: int) -> list:
-    """Diagnostic helper: re-derive sparse carriers for one position.
+def read_arrow_carriers(arrow_path: Path, pos: int) -> np.ndarray:
+    """Diagnostic helper: re-derive packed sparse carriers for one position.
+
+    Returns ``np.ndarray`` of shape ``(n_carriers, 2)``, dtype
+    ``np.int32`` — the same packed shape every other producer in
+    the codebase emits. See ``cohort_sites.py`` module docstring.
 
     Replaces the post-hoc ``pickle.dump(sites_list)`` introspection
     that was possible under the in-memory sites-list path (called out
@@ -423,7 +427,7 @@ def read_arrow_carriers(arrow_path: Path, pos: int) -> list:
 
     Scans batches in order; returns the first match (positions are
     expected to be unique within a chromosome's cohort file). Returns
-    an empty list if the position is not found.
+    an empty ``(0, 2)`` array if the position is not found.
     """
     _require_pyarrow()
     import pyarrow as pa
@@ -448,9 +452,10 @@ def read_arrow_carriers(arrow_path: Path, pos: int) -> list:
             )
             gt_matrix = gt_flat.reshape(batch.num_rows, n_haplotypes)
             row = gt_matrix[row_idx]
-            return [
-                (int(hap_idx), int(allele_idx))
-                for hap_idx, allele_idx in enumerate(row)
-                if allele_idx != 0
-            ]
-    return []
+            nonzero = np.flatnonzero(row)
+            if not nonzero.size:
+                return np.zeros((0, 2), dtype=np.int32)
+            return np.column_stack(
+                (nonzero, row[nonzero])
+            ).astype(np.int32, copy=False)
+    return np.zeros((0, 2), dtype=np.int32)

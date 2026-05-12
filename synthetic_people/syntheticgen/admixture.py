@@ -24,6 +24,8 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
+import numpy as np
+
 from .builds import BUILDS
 from .titv import DEFAULT_TARGET_TITV, choose_alt
 
@@ -173,10 +175,15 @@ def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
         alt = choose_alt(ref, rng, target=titv_target)
         assert alt is not None
 
-        carriers = [
-            (int(idx), int(allele))
-            for idx, allele in enumerate(gts_arr) if allele > 0
-        ]
+        # Packed sparse carriers; see cohort_sites module docstring
+        # for the (n_carriers, 2) int32 layout and rationale.
+        nonzero = np.flatnonzero(gts_arr)
+        if nonzero.size:
+            carriers = np.column_stack(
+                (nonzero, gts_arr[nonzero])
+            ).astype(np.int32, copy=False)
+        else:
+            carriers = np.zeros((0, 2), dtype=np.int32)
         sites.append({
             "chrom": chrom,
             "pos": pos,

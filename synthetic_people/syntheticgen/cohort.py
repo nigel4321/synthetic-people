@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import random
 
+import numpy as np
+
 from .sfs import DEFAULT_SFS_ALPHA, draw_allele_counts
 
 
@@ -57,17 +59,24 @@ def assign_haplotypes(n_haplotypes: int, allele_counts: list,
     return slots
 
 
-def _carriers_from_slots(slots: list) -> list:
-    """Convert a dense slot array to sparse carriers (Phase 5c).
+def _carriers_from_slots(slots: list) -> np.ndarray:
+    """Convert a dense slot array to packed sparse carriers (Phase 5c).
 
     ``slots[i]`` is the allele index assigned to haplotype slot ``i``;
-    we keep only the non-zero entries. The slot array can be released
-    by the caller once carriers are extracted, so RAM is bounded by
-    alt observations rather than ``n_haplotypes``.
+    we keep only the non-zero entries as a 2D ``np.int32`` array of
+    shape ``(n_carriers, 2)`` — same layout the coalescent producers
+    use. See ``cohort_sites.py`` module docstring for the rationale.
+    The slot array can be released by the caller once carriers are
+    extracted, so RAM is bounded by alt observations rather than
+    ``n_haplotypes``.
     """
-    return [
-        (idx, allele) for idx, allele in enumerate(slots) if allele > 0
-    ]
+    arr = np.asarray(slots)
+    nonzero = np.flatnonzero(arr)
+    if not nonzero.size:
+        return np.zeros((0, 2), dtype=np.int32)
+    return np.column_stack(
+        (nonzero, arr[nonzero])
+    ).astype(np.int32, copy=False)
 
 
 def draw_cohort_background(pool: list, n_people: int, n_sites: int,

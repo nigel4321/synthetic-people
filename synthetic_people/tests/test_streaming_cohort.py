@@ -24,9 +24,35 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 _HAVE_MSPRIME = importlib.util.find_spec("msprime") is not None
+
+
+def _assert_site_dicts_equal(test_case, m, s, idx):
+    """Compare two cohort-site dicts that contain a packed-numpy
+    ``carriers`` field. Pop carriers from both, compare them via
+    ``np.array_equal`` (which handles the (n, 2) int32 array shape
+    correctly), then defer to ``assertEqual`` for the rest.
+
+    Standalone helper so the carriers-aware comparison is one
+    place — both ``_assert_byte_identical`` methods in this file
+    use it, plus any future test in this module.
+    """
+    m_carriers = m.get("carriers")
+    s_carriers = s.get("carriers")
+    test_case.assertTrue(
+        np.array_equal(m_carriers, s_carriers),
+        f"site {idx} carriers diverge:\n  m={m_carriers}\n  s={s_carriers}",
+    )
+    m_rest = {k: v for k, v in m.items() if k != "carriers"}
+    s_rest = {k: v for k, v in s.items() if k != "carriers"}
+    test_case.assertEqual(
+        m_rest, s_rest,
+        f"site {idx} diverges (non-carrier fields):\n  m={m_rest}\n  s={s_rest}",
+    )
 
 
 def _build_tree_sequence(*, n_people: int = 4, length_bp: int = 200_000,
@@ -235,10 +261,7 @@ class StreamCohortSitesParityTest(unittest.TestCase):
             f"streamed={len(streamed)}",
         )
         for i, (m, s) in enumerate(zip(materialised, streamed)):
-            self.assertEqual(
-                m, s,
-                f"site {i} diverges:\n  materialised={m}\n  streamed={s}",
-            )
+            _assert_site_dicts_equal(self, m, s, i)
 
     def test_no_overlays(self):
         for seed in (0, 1, 42, 100):
@@ -529,10 +552,7 @@ class StreamCohortChainedOverlayParityAtScaleTest(unittest.TestCase):
             f"length differs: m={len(materialised)} s={len(streamed)}",
         )
         for i, (m, s) in enumerate(zip(materialised, streamed)):
-            self.assertEqual(
-                m, s,
-                f"site {i} diverges:\n  materialised={m}\n  streamed={s}",
-            )
+            _assert_site_dicts_equal(self, m, s, i)
 
     def test_chained_overlays_at_density_10pct(self):
         for seed in range(5):

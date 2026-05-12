@@ -24,6 +24,8 @@ import sys
 import unittest
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from syntheticgen.coalescent import (
@@ -195,7 +197,9 @@ class ChunkedSimulationParityTest(unittest.TestCase):
         for sa, sb in zip(a, b):
             self.assertEqual(sa["pos"], sb["pos"])
             self.assertEqual(sa["acs"], sb["acs"])
-            self.assertEqual(sa["carriers"], sb["carriers"])
+            self.assertTrue(
+                np.array_equal(sa["carriers"], sb["carriers"]),
+            )
 
     def test_overlap_dedup_no_duplicate_positions_at_boundaries(self):
         # Walk a 0.4 Mb chromosome with 0.1 Mb chunks (4 chunks +
