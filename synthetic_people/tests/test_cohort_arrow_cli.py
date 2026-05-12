@@ -171,6 +171,28 @@ class PreflightArrowDiskCheckTest(unittest.TestCase):
             msg = str(ctx.exception)
             self.assertIn("--cohort-mode arrow needs", msg)
             self.assertIn("Free up disk", msg)
+
+    def test_streaming_mode_message_mentions_sidecar(self):
+        # PR #78 review #1: the failure message used to hardcode
+        # ``--cohort-mode arrow`` even when ``arrow-streaming``
+        # triggered the check. Now ``cohort_mode`` is interpolated
+        # AND the streaming variant mentions the sidecar so
+        # operators understand why the budget is ~2× the
+        # materialised-arrow budget.
+        per_chrom = _estimate_arrow_chrom_scratch_bytes(
+            100, 0.05, cohort_mode="arrow-streaming",
+        )
+        with self._patch_free_bytes(per_chrom // 2):
+            with self.assertRaises(SystemExit) as ctx:
+                _preflight_arrow_disk_check(
+                    self.cohort_dir, 100, 0.05,
+                    cohort_mode="arrow-streaming",
+                )
+            msg = str(ctx.exception)
+            self.assertIn("--cohort-mode arrow-streaming needs", msg)
+            # Sidecar is the user-visible reason the streaming
+            # estimate is wider than the materialised one.
+            self.assertIn("sidecar", msg)
             self.assertIn("sites_list", msg)
 
 
