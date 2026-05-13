@@ -464,11 +464,11 @@ def cohort_per_region_density(
 ) -> dict:
     """Aggregate per-Mb variant density across the cohort (Tier 2 #6).
 
-    Returns ``{chrom: [(start_mb, end_mb, count), ...]}`` sorted by
-    chromosome (canonical 1-22, X, Y, MT order) and by bin start
-    within each chrom. Counts are summed across samples; for a
-    cohort of n persons each variant is counted n times (once per
-    per-person VCF).
+    Returns ``{chrom: [{"start_mb": int, "end_mb": int, "count":
+    int}, ...]}`` sorted by chromosome (canonical 1-22, X, Y, MT
+    order) and by bin start within each chrom. Counts are summed
+    across samples; for a cohort of n persons each variant is
+    counted n times (once per per-person VCF).
 
     Today's uniform-μ simulation produces flat density (modulo
     statistical noise); post-M14 with context-aware μ the density
@@ -507,19 +507,34 @@ def cohort_quality_metrics(
     while still exposing whether the empirical distributions
     match ``quality.py``'s claimed model:
 
-    - **DP** ~ Poisson(λ ≈ 30) with per-sample Gaussian jitter,
-      so cohort mean should be ~30 and the distribution roughly
-      bell-shaped around it.
+    - **DP** ~ Poisson(λ ≈ ``DEFAULT_DP_MEAN``) with per-sample
+      Gaussian jitter, so cohort mean should land near the
+      configured DP mean.
     - **GQ** is recomputed from AD vs GT; clean hom-ref / hom-alt
       calls hit the cap, hets are slightly lower; cohort median
       should be high.
-    - **AD-ref-fraction at hets** should cluster around the
-      empirical 0.475 Illumina+BWA-MEM ref-bias target. Drift
-      from that band is the most useful regression signal —
-      it means either the ref-bias constant in ``quality.py``
-      changed or the AD computation regressed.
+    - **AD-ref-fraction at hets** is the ref-allele share of
+      reads at a heterozygous call. ``quality.py`` uses
+      ``HET_ALT_FRAC = 0.475`` (the **alt** share, slightly below
+      0.5 due to reference-allele alignment bias). The ref share
+      we measure here is therefore ``1 - HET_ALT_FRAC = 0.525``.
+      Drift from that band signals either the ``HET_ALT_FRAC``
+      constant changed or the AD computation regressed.
+
+    Targets are imported from ``syntheticgen.quality`` rather
+    than duplicated as magic numbers — the validator and the
+    simulator stay in lockstep automatically when those
+    constants are tuned.
+
+    Percentile/median calculations use ``statistics.median`` and
+    ``numpy.percentile`` so they're true linear-interpolated
+    statistics, not index picks. The old form
+    (``values_sorted[int(0.10 * n)]``) misreported p90 as the
+    max for small n and gave the upper-middle for even-n median.
     """
     import statistics
+    import numpy as np
+    from .quality import DEFAULT_DP_MEAN, HET_ALT_FRAC
 
     dp_all: list = []
     gq_all: list = []
@@ -536,31 +551,33 @@ def cohort_quality_metrics(
                 "stdev": None, "p10": None, "p90": None,
                 "target": target,
             }
-        values_sorted = sorted(values)
-        n = len(values_sorted)
+        n = len(values)
+        arr = np.asarray(values)
         return {
             "n": n,
-            "mean": statistics.fmean(values_sorted),
-            "median": values_sorted[n // 2],
-            "stdev": (statistics.stdev(values_sorted)
+            "mean": statistics.fmean(values),
+            "median": float(statistics.median(values)),
+            "stdev": (statistics.stdev(values)
                       if n >= 2 else 0.0),
-            "p10": values_sorted[max(0, int(0.10 * n))],
-            "p90": values_sorted[min(n - 1, int(0.90 * n))],
+            "p10": float(np.percentile(arr, 10)),
+            "p90": float(np.percentile(arr, 90)),
             "target": target,
         }
 
     return {
-        # Targets pulled from ``syntheticgen/quality.py`` constants
-        # — drift surfaces the moment those change.
-        "dp": _summarise(dp_all, target=30.0),
+        # Targets pulled directly from ``syntheticgen/quality.py``
+        # constants — drift surfaces the moment those change.
+        "dp": _summarise(dp_all, target=DEFAULT_DP_MEAN),
         "gq": _summarise(gq_all, target=None),
-        "ad_het_ref_fraction": _summarise(ad_all, target=0.475),
+        # Ref share = 1 - HET_ALT_FRAC, since we record the ref
+        # fraction at hets (not the alt fraction).
+        "ad_het_ref_fraction": _summarise(
+            ad_all, target=1.0 - HET_ALT_FRAC,
+        ),
     }
 
 
-def cohort_f_statistic(
-    matrix, max_records: int | None = None,
-) -> dict:
+def cohort_f_statistic(matrix) -> dict:
     """Per-sample inbreeding coefficient F from a dosage matrix
     (Tier 2 #8).
 
@@ -711,13 +728,17 @@ def cohort_ancestry_tracts(
     for pop, lengths in sorted(by_pop.items()):
         if not lengths:
             continue
-        lengths_sorted = sorted(lengths)
         out[pop] = {
-            "n": len(lengths_sorted),
-            "mean_bp": statistics.fmean(lengths_sorted),
-            "median_bp": lengths_sorted[len(lengths_sorted) // 2],
+            "n": len(lengths),
+            "mean_bp": statistics.fmean(lengths),
+            # ``statistics.median`` does the right thing for even-n
+            # (interpolates between the two middle values) — the
+            # earlier ``lengths_sorted[len // 2]`` picked the upper
+            # middle, which made the reported median diverge from
+            # ``cohort_f_statistic``'s use of ``statistics.median``.
+            "median_bp": int(statistics.median(lengths)),
         }
-        all_lengths.extend(lengths_sorted)
+        all_lengths.extend(lengths)
     return {
         "by_population": out,
         "mean_bp_across_pops": (

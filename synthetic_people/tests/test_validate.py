@@ -816,10 +816,10 @@ class TestCohortPerRegionDensity(unittest.TestCase):
 class TestCohortQualityMetrics(unittest.TestCase):
     """Tier 2 #7: DP / GQ / AD-ref-fraction distribution sanity.
 
-    Surfaces drift in the empirical targets baked into quality.py
-    (Poisson(30) DP, 0.475 ref-bias at hets). The aggregator returns
-    summary stats only — keeps summary.json compact while still
-    exposing whether the distributions match the claimed model.
+    Surfaces drift in the empirical targets baked into quality.py.
+    Targets are imported from ``quality.py`` (``DEFAULT_DP_MEAN``,
+    ``1 - HET_ALT_FRAC``) so a future re-calibration of those
+    constants automatically updates the validator's expectations.
     """
 
     def _stats(self, name: str, dp: list, gq: list, ad: list) -> SampleStats:
@@ -831,15 +831,24 @@ class TestCohortQualityMetrics(unittest.TestCase):
 
     def test_summary_stats_attached_per_metric(self):
         from syntheticgen.validate import cohort_quality_metrics
+        from syntheticgen.quality import (
+            DEFAULT_DP_MEAN, HET_ALT_FRAC,
+        )
         a = self._stats("a", dp=[28, 30, 32], gq=[99, 99, 95],
                         ad=[0.48, 0.50, 0.45])
         out = cohort_quality_metrics([a])
-        # DP target carried through from quality.py.
-        self.assertEqual(out["dp"]["target"], 30.0)
+        # Targets come directly from quality.py — no magic numbers.
+        self.assertEqual(out["dp"]["target"], DEFAULT_DP_MEAN)
         self.assertAlmostEqual(out["dp"]["mean"], 30.0)
         self.assertEqual(out["dp"]["n"], 3)
-        # AD ref-fraction target carried through.
-        self.assertEqual(out["ad_het_ref_fraction"]["target"], 0.475)
+        # AD ref-fraction target is ``1 - HET_ALT_FRAC`` because
+        # ``HET_ALT_FRAC`` is the ALT share at hets (under reference
+        # bias) and we record the REF share. Off-by-direction in
+        # the original would have given 0.475 instead of 0.525.
+        self.assertAlmostEqual(
+            out["ad_het_ref_fraction"]["target"],
+            1.0 - HET_ALT_FRAC,
+        )
         self.assertAlmostEqual(
             out["ad_het_ref_fraction"]["mean"], 0.4767, places=4,
         )
@@ -849,6 +858,30 @@ class TestCohortQualityMetrics(unittest.TestCase):
         out = cohort_quality_metrics([])
         self.assertEqual(out["dp"]["n"], 0)
         self.assertIsNone(out["dp"]["mean"])
+
+    def test_percentiles_are_true_quantiles_not_index_picks(self):
+        # Regression for PR #80 review #1: the original
+        # ``_summarise`` computed ``p90 = values_sorted[int(0.90 *
+        # n)]`` which for n=10 returned the max (index 9). True p90
+        # via linear interpolation on [1..10] is 9.1. Locking in
+        # that the new implementation uses numpy percentile rather
+        # than an index pick.
+        from syntheticgen.validate import cohort_quality_metrics
+        # 10 values: 1, 2, ..., 10. Old code would have given
+        # p90 = 10 (the max); true p90 ≈ 9.1.
+        a = self._stats(
+            "a", dp=list(range(1, 11)), gq=[], ad=[],
+        )
+        out = cohort_quality_metrics([a])
+        self.assertEqual(out["dp"]["n"], 10)
+        # numpy's default linear interpolation gives 9.1 for p90
+        # of [1..10]. Old index pick would have returned 10.
+        self.assertAlmostEqual(out["dp"]["p90"], 9.1, places=3)
+        # p10 of [1..10] ≈ 1.9; old code gave 2.
+        self.assertAlmostEqual(out["dp"]["p10"], 1.9, places=3)
+        # Median of [1..10] is 5.5; old ``values_sorted[n // 2]``
+        # picked index 5 → 6 (the upper-middle).
+        self.assertAlmostEqual(out["dp"]["median"], 5.5)
 
     def test_aggregates_across_samples(self):
         from syntheticgen.validate import cohort_quality_metrics
@@ -862,29 +895,48 @@ class TestCohortQualityMetrics(unittest.TestCase):
 class TestCohortFStatistic(unittest.TestCase):
     """Tier 2 #8: per-sample inbreeding coefficient F."""
 
-    def test_outbred_cohort_has_f_near_zero(self):
+    def test_balanced_hwe_matrix_gives_per_sample_f_zero(self):
+        # 4 samples × 4 variants. Each column sums to 4 so cohort
+        # AF = 0.5 at every variant (expected_het per variant =
+        # 2·0.5·0.5 = 0.5; expected_het per sample = 4 × 0.5 = 2).
+        # Each row has exactly 2 hets (dosage=1), so observed_het
+        # per sample = 2. F = 1 − 2/2 = 0 for every sample.
+        # This is the property the name asserts.
         from syntheticgen.validate import cohort_f_statistic
         import numpy as np
-        # 4 samples × 4 variants. Construct a dosage matrix where
-        # cohort AF = 0.5 at every variant and each sample has the
-        # observed-het count equal to the expected.
-        # Variant 0: dosages [0, 1, 1, 2] → AF = 0.5, het count = 2.
-        # Variant 1: same. Variant 2: same. Variant 3: same.
+        matrix = np.array([
+            [1, 1, 0, 2],
+            [1, 0, 2, 1],
+            [0, 2, 1, 1],
+            [2, 1, 1, 0],
+        ])
+        out = cohort_f_statistic(matrix)
+        self.assertEqual(len(out["per_sample"]), 4)
+        for entry in out["per_sample"]:
+            self.assertAlmostEqual(entry["f"], 0.0, places=10)
+            self.assertEqual(entry["observed_het"], 2)
+            self.assertAlmostEqual(entry["expected_het"], 2.0)
+        self.assertAlmostEqual(out["cohort_mean"], 0.0)
+        self.assertAlmostEqual(out["cohort_median"], 0.0)
+
+    def test_homozygous_extreme_gives_f_near_one(self):
+        # All hom-ref + all hom-alt samples at variants where the
+        # cohort has intermediate AF. Each sample's observed_het is
+        # 0; expected_het > 0; F = 1.0. Documents the extreme-end
+        # of the F-statistic interpretation table.
+        from syntheticgen.validate import cohort_f_statistic
+        import numpy as np
         matrix = np.array([
             [0, 0, 0, 0],
-            [1, 1, 1, 1],
-            [1, 1, 1, 1],
+            [0, 0, 0, 0],
+            [2, 2, 2, 2],
             [2, 2, 2, 2],
         ])
         out = cohort_f_statistic(matrix)
-        # Sample 0 (all hom-ref): observed_het = 0, expected = 2.0,
-        # F = 1.0 (extreme — typical of inbred lineage).
-        # Sample 1 (all hets): observed_het = 4, expected = 2.0,
-        # F = -1.0. We just check the structure is correct.
-        self.assertEqual(len(out["per_sample"]), 4)
-        self.assertIsNotNone(out["cohort_mean"])
-        self.assertEqual(out["per_sample"][0]["observed_het"], 0)
-        self.assertEqual(out["per_sample"][1]["observed_het"], 4)
+        for entry in out["per_sample"]:
+            self.assertEqual(entry["observed_het"], 0)
+            self.assertAlmostEqual(entry["f"], 1.0)
+        self.assertAlmostEqual(out["cohort_mean"], 1.0)
 
     def test_empty_matrix_returns_empty_result(self):
         from syntheticgen.validate import cohort_f_statistic
