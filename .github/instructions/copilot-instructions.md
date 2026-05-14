@@ -33,7 +33,15 @@ When analyzing a diff, provide feedback in the following priority order:
 1.  Does it follow the project's specific linting and formatting patterns?
 2.  Are there redundant comments that explain *what* the code does instead of *why*?
 
-## 5. Interaction Style
+## 5. GitHub Workflow & CI Analysis
+When a PR has failed status checks or workflow errors, prioritize the following:
+* **Log Correlation:** Analyze the failure logs from GitHub Actions. Do not just report the error; identify the exact line in the PR diff likely causing the regression.
+* **TDD Regression:** If a test-suite workflow fails, determine if the failure is in a new test (incomplete implementation) or an existing test (breaking change).
+* **Flakiness Detection:** Differentiate between infrastructure timeouts (e.g., network blips) and deterministic logic failures. 
+* **Infrastructure-as-Code (IaC):** If the PR includes changes to `.github/workflows/` or Dockerfiles, verify that the failure isn't caused by a misconfigured environment variable or a missing dependency in the build container.
+* **Actionable Fixes:** For every identified failure, provide a "Suggested Fix" code block that addresses the root cause shown in the logs.
+
+## 6. Interaction Style
 *   **Be Specific:** Do not say "This is complex." Say "This nested loop increases complexity to O(n²); consider using a Hash Map for O(n)."
 *   **Be Constructive:** Provide a code snippet for improvements whenever possible.
 *   **The "Why":** Always explain the reasoning behind a suggestion (e.g., "To avoid memory pressure...")
