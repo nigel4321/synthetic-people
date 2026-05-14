@@ -2212,16 +2212,18 @@ def main(argv: list[str] | None = None) -> int:
             )
             _fa = load_fasta(args.reference_fasta)
             try:
-                validate_fasta(
-                    _fa, chromosomes, args.chr_length_mb,
+                try:
+                    validate_fasta(
+                        _fa, chromosomes, args.chr_length_mb,
+                    )
+                except ValueError as exc:
+                    sys.exit(str(exc))
+                print(
+                    f"  reference FASTA OK ({len(_fa.references)} contigs)",
+                    file=sys.stderr,
                 )
-            except ValueError as exc:
-                sys.exit(str(exc))
-            print(
-                f"  reference FASTA OK ({len(_fa.references)} contigs)",
-                file=sys.stderr,
-            )
-            del _fa  # workers will re-open from the path
+            finally:
+                _fa.close()  # workers will re-open from the path
 
         cohort_sites, person_ancestry = simulate_admixed_cohort(
             chromosomes=chromosomes, build=args.build,
