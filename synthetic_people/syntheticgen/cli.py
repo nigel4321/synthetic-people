@@ -803,7 +803,7 @@ def _resolve_reference_fasta(
     # the just-opened handle before sys.exit so test harnesses that
     # invoke main() many times don't leak file descriptors.
     try:
-        validate_fasta(fa, chromosomes, args.chr_length_mb)
+        validate_fasta(fa, chromosomes, args.chr_length_mb, args.build)
     except ValueError as exc:
         fa.close()
         sys.exit(str(exc))

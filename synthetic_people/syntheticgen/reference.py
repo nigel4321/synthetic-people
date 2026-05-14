@@ -287,10 +287,19 @@ def resolve_chrom_name(fasta: Any, chrom: str) -> str | None:
 
 
 def validate_fasta(
-    fasta: Any, chromosomes: list, chr_length_mb: float,
+    fasta: Any, chromosomes: list, chr_length_mb: float, build: str,
 ) -> None:
     """Pre-flight check: every requested chrom exists in the FASTA
-    AND is long enough for the configured ``chr_length_mb``.
+    AND covers the simulator's effective REF-lookup range.
+
+    ``--chr-length-mb`` semantics are a CAP, not a minimum. The
+    simulator uses ``min(natural_chrom_length, chr_length_mb_in_bp)``
+    as the actual simulated length (see ``coalescent.simulate_chromosome``).
+    The FASTA therefore only needs to cover that effective length —
+    requiring ``chr_length_mb`` itself would false-positive on every
+    chromosome naturally shorter than the cap (e.g. chr19/20/21/22
+    at ``--chr-length-mb 70`` on GRCh38, all of which are <70 Mb in
+    nature). Pre-fix this rejected valid genome-wide configs.
 
     Raises ``ValueError`` with a clear message on mismatch so the
     user can spot a "wrong FASTA" error in seconds instead of
@@ -298,6 +307,7 @@ def validate_fasta(
     """
     if fasta is None:
         return
+    contigs = BUILDS.get(build, {}).get("contigs", {})
     missing = []
     too_short = []
     for chrom in chromosomes:
@@ -310,11 +320,17 @@ def validate_fasta(
                 length_bp = fasta.get_reference_length(resolved)
             except (KeyError, ValueError):
                 length_bp = 0
-            if length_bp < chr_length_mb * 1_000_000:
+            required_bp = chr_length_mb * 1_000_000
+            natural_bp = contigs.get(chrom, 0)
+            if natural_bp > 0:
+                # Mirror the simulator's min(natural, cap) so the
+                # check matches what the run will actually request.
+                required_bp = min(natural_bp, required_bp)
+            if length_bp < required_bp:
                 too_short.append(
                     f"{chrom} (FASTA has "
                     f"{length_bp / 1_000_000:.1f} Mb, "
-                    f"need {chr_length_mb} Mb)",
+                    f"need {required_bp / 1_000_000:.1f} Mb)",
                 )
     errors = []
     if missing:
@@ -325,7 +341,7 @@ def validate_fasta(
         )
     if too_short:
         errors.append(
-            "chromosomes shorter than --chr-length-mb: "
+            "FASTA chromosomes shorter than required: "
             + ", ".join(too_short),
         )
     if errors:

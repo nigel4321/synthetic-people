@@ -143,24 +143,28 @@ class ReferenceFastaTest(unittest.TestCase):
         path = _write_fasta(self.dir, {"22": "A" * 1000})
         fa = load_fasta(path)
         # Should not raise.
-        validate_fasta(fa, ["22"], chr_length_mb=0.0)
+        validate_fasta(fa, ["22"], chr_length_mb=0.0, build="GRCh38")
 
     def test_validate_fasta_raises_on_missing_chrom(self):
         from syntheticgen.reference import load_fasta, validate_fasta
         path = _write_fasta(self.dir, {"22": "A" * 100})
         fa = load_fasta(path)
         with self.assertRaises(ValueError) as ctx:
-            validate_fasta(fa, ["22", "99"], chr_length_mb=0.0)
+            validate_fasta(
+                fa, ["22", "99"], chr_length_mb=0.0, build="GRCh38",
+            )
         self.assertIn("99", str(ctx.exception))
         self.assertIn("missing", str(ctx.exception).lower())
 
     def test_validate_fasta_raises_when_chrom_too_short(self):
         from syntheticgen.reference import load_fasta, validate_fasta
-        # 1 kb FASTA but the caller wants 5 Mb of chr22.
+        # 1 kb FASTA but the caller wants 5 Mb of chr22; chr22's
+        # natural length on GRCh38 is ~50.8 Mb, so the effective
+        # required length is min(50.8M, 5M) = 5M — still raises.
         path = _write_fasta(self.dir, {"22": "A" * 1000})
         fa = load_fasta(path)
         with self.assertRaises(ValueError) as ctx:
-            validate_fasta(fa, ["22"], chr_length_mb=5.0)
+            validate_fasta(fa, ["22"], chr_length_mb=5.0, build="GRCh38")
         self.assertIn("shorter than", str(ctx.exception))
 
     def test_validate_fasta_skips_length_check_when_chr_length_zero(self):
@@ -170,12 +174,55 @@ class ReferenceFastaTest(unittest.TestCase):
         from syntheticgen.reference import load_fasta, validate_fasta
         path = _write_fasta(self.dir, {"22": "A" * 100})
         fa = load_fasta(path)
-        validate_fasta(fa, ["22"], chr_length_mb=0.0)
+        validate_fasta(fa, ["22"], chr_length_mb=0.0, build="GRCh38")
 
     def test_validate_fasta_with_none_is_noop(self):
         # No FASTA passed → no validation needed.
         from syntheticgen.reference import validate_fasta
-        validate_fasta(None, ["22"], chr_length_mb=5.0)
+        validate_fasta(None, ["22"], chr_length_mb=5.0, build="GRCh38")
+
+    def test_validate_fasta_passes_when_chr_length_mb_exceeds_natural(self):
+        # Regression: ``--chr-length-mb`` is a CAP, not a minimum.
+        # When the cap exceeds a chromosome's natural length the
+        # simulator uses min(natural, cap) — so the FASTA only
+        # needs to cover the natural length. Pre-fix, validate_fasta
+        # rejected the run with "shorter than --chr-length-mb" for
+        # every chrom <70 Mb at ``--chr-length-mb 70`` on GRCh38
+        # (i.e. chr19/20/21/22 + every sex chrom).
+        from unittest.mock import patch
+        from syntheticgen.reference import load_fasta, validate_fasta
+        path = _write_fasta(self.dir, {"22": "A" * 1000})
+        fa = load_fasta(path)
+        # Stub the BUILDS lookup so we can declare chr22's "natural"
+        # length as exactly 1000 bp without having to ship a
+        # 50-MB-of-A FASTA in test fixtures.
+        synthetic_builds = {"GRCh38": {"contigs": {"22": 1000}}}
+        with patch("syntheticgen.reference.BUILDS", synthetic_builds):
+            # Cap = 5 Mb but natural is only 1 kb. Effective sim
+            # length = min(1000, 5_000_000) = 1000. FASTA covers it.
+            # Should NOT raise.
+            validate_fasta(
+                fa, ["22"], chr_length_mb=5.0, build="GRCh38",
+            )
+
+    def test_validate_fasta_raises_when_below_min_of_natural_and_cap(self):
+        # Companion to the regression test: when the FASTA is
+        # genuinely shorter than min(natural, cap), the validation
+        # still fires. Catches the "wrong FASTA / truncated FASTA"
+        # case the validation was originally written for.
+        from unittest.mock import patch
+        from syntheticgen.reference import load_fasta, validate_fasta
+        path = _write_fasta(self.dir, {"22": "A" * 100})
+        fa = load_fasta(path)
+        # Natural = 5 kb, cap = 5 Mb → required = min(5 kb, 5 Mb) =
+        # 5 kb. FASTA only has 100 bp → too short.
+        synthetic_builds = {"GRCh38": {"contigs": {"22": 5000}}}
+        with patch("syntheticgen.reference.BUILDS", synthetic_builds):
+            with self.assertRaises(ValueError) as ctx:
+                validate_fasta(
+                    fa, ["22"], chr_length_mb=5.0, build="GRCh38",
+                )
+        self.assertIn("shorter than required", str(ctx.exception))
 
 
 @unittest.skipUnless(_HAVE_PYSAM, "pysam not installed")
