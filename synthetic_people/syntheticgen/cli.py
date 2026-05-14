@@ -12,6 +12,7 @@ import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 from .admixture import (
     DEFAULT_AFR_FRAC,
@@ -712,6 +713,74 @@ def _write_cohort_chrom_bcf(
 #     accumulation runs inline (per yielded site).
 
 
+def _resolve_reference_fasta(
+    args, chromosomes: list,
+) -> tuple[Any, "Path | None"]:
+    """Resolve ``--reference-fasta`` / ``--no-reference-fasta`` /
+    auto-fetch into an ``(open_handle, path)`` pair.
+
+    Three modes, in priority order:
+
+    1. ``--no-reference-fasta`` flag set → returns ``(None, None)``;
+       caller falls back to fabricated REF (legacy
+       ``rng.choice("ACGT")`` path).
+    2. ``--reference-fasta <path>`` set → opens that path.
+    3. Otherwise (the default) → auto-discovers / auto-downloads
+       to ``<cache_dir>/reference/<build>.fa`` via
+       :func:`reference.fetch_reference_fasta`. Mirrors the
+       ClinVar caching pattern: first run downloads + indexes,
+       subsequent runs find the cache and return immediately.
+
+    The two-tuple return shape exists because the streaming
+    coalescent path keeps the open handle (in-process use, fastest)
+    while the admixture path needs the path string (its
+    ``ProcessPoolExecutor`` workers re-open from the path because
+    ``FastaFile`` doesn't pickle).
+
+    Pre-flight ``validate_fasta`` runs against the requested
+    chromosomes + ``chr_length_mb`` so a missing chrom / too-short
+    contig fails at startup, not after msprime has been running
+    for hours.
+    """
+    if getattr(args, "no_reference_fasta", False):
+        print(
+            "  --no-reference-fasta: skipping reference FASTA; "
+            "emitted REF will be drawn from rng.choice('ACGT') "
+            "(legacy fabricated-REF path — VCFs will not pass "
+            "`bcftools norm --check-ref`)",
+            file=sys.stderr,
+        )
+        return None, None
+
+    if args.reference_fasta is not None:
+        fasta_path = Path(args.reference_fasta)
+    else:
+        # Auto-discover / auto-fetch. ``fetch_reference_fasta`` is
+        # the cached form: re-runs against the same ``cache_dir``
+        # are a no-op once the FASTA is on disk.
+        print(
+            f"  --reference-fasta unset; resolving cached FASTA "
+            f"at <cache-dir>/reference/{args.build}.fa "
+            f"(pass --no-reference-fasta to skip)",
+            file=sys.stderr,
+        )
+        from .reference import fetch_reference_fasta
+        fasta_path = fetch_reference_fasta(args.cache_dir, args.build)
+
+    from .reference import load_fasta, validate_fasta
+    print(f"  loading reference FASTA: {fasta_path}", file=sys.stderr)
+    fa = load_fasta(fasta_path)
+    try:
+        validate_fasta(fa, chromosomes, args.chr_length_mb)
+    except ValueError as exc:
+        sys.exit(str(exc))
+    print(
+        f"  reference FASTA OK ({len(fa.references)} contigs)",
+        file=sys.stderr,
+    )
+    return fa, fasta_path
+
+
 def _iter_chrom_sites_materialised(
     *, chromosomes_to_simulate, args, demo_model, rng, workers,
     resume, clinvar_index, rsid_pool, cosmic_pool,
@@ -1027,14 +1096,28 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
     p.add_argument("--reference-fasta", type=Path, default=None,
                    help="[M12] Path to the reference FASTA matching "
                         "--build (e.g. GRCh38 primary assembly). When "
-                        "provided, emitted REF bases come from the "
-                        "FASTA instead of `rng.choice('ACGT')`, so the "
-                        "VCFs validate cleanly with `bcftools norm "
+                        "set, REF bases come from this FASTA instead "
+                        "of `rng.choice('ACGT')`, so the emitted VCFs "
+                        "validate cleanly with `bcftools norm "
                         "--check-ref`. The FASTA must have a `.fai` "
                         "index (run `samtools faidx <fasta>` once if "
-                        "missing). Optional — without it the run uses "
-                        "the legacy fabricated-REF path, which will "
-                        "fail the Tier 1 REF-check gate by design.")
+                        "missing). When unset (the default), the cli "
+                        "auto-discovers a cached FASTA at "
+                        "`<cache-dir>/reference/<build>.fa`; if absent "
+                        "it downloads the Ensembl primary assembly "
+                        "(~900 MB compressed → ~3 GB decompressed) "
+                        "into that path on first run. Pass "
+                        "--no-reference-fasta to opt out of both the "
+                        "auto-discover and the auto-download.")
+    p.add_argument("--no-reference-fasta", action="store_true",
+                   help="[M12] Skip the reference-FASTA "
+                        "auto-discover / auto-download. Emitted REF "
+                        "is then drawn from `rng.choice('ACGT')` "
+                        "(legacy fabricated-REF path), so the output "
+                        "won't pass `bcftools norm --check-ref`. "
+                        "Useful for smoke tests / dev runs that "
+                        "don't need real REF and don't want to pay "
+                        "the cache cost.")
     p.add_argument("--seed", type=int, default=None,
                    help="RNG seed for deterministic output. Omit for "
                         "different people each run.")
@@ -1560,31 +1643,16 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
             cohort_bcf_paths.append(
                 cohort_dir / f"cohort.chr{chrom}.bcf")
 
-    # M12: load the reference FASTA once if --reference-fasta is set.
-    # Memory-mapped via pysam, so resident-set is ~50 MB regardless
-    # of FASTA size. Validation up-front so a bad path / missing
-    # chrom in the FASTA fails before msprime starts the multi-hour
-    # simulation. The handle is threaded through the iter wrappers
-    # and into the four REF-picking producers.
-    fasta = None
-    if getattr(args, "reference_fasta", None):
-        from .reference import load_fasta, validate_fasta
-        print(
-            f"  loading reference FASTA: {args.reference_fasta}",
-            file=sys.stderr,
-        )
-        fasta = load_fasta(args.reference_fasta)
-        try:
-            validate_fasta(
-                fasta, chromosomes_to_simulate,
-                args.chr_length_mb,
-            )
-        except ValueError as exc:
-            sys.exit(str(exc))
-        print(
-            f"  reference FASTA OK ({len(fasta.references)} contigs)",
-            file=sys.stderr,
-        )
+    # M12: resolve the reference FASTA. The helper handles three
+    # modes (--no-reference-fasta, --reference-fasta <path>, and
+    # auto-fetch via cache_dir/reference/<build>.fa); see
+    # ``_resolve_reference_fasta`` for the contract. The streaming
+    # path uses the in-process handle directly; ``fasta_path`` is
+    # threaded through to the materialised iterator's fasta arg
+    # for parity but isn't used downstream of the open handle.
+    fasta, _fasta_path = _resolve_reference_fasta(
+        args, chromosomes_to_simulate,
+    )
 
     memprofile_mark(
         f"streaming sim start ({len(chromosomes_to_simulate)} chroms)")
@@ -2195,51 +2263,27 @@ def main(argv: list[str] | None = None) -> int:
             f"AFR={args.afr_frac:.2f}, length={args.chr_length_mb} Mb)",
             file=sys.stderr,
         )
-        # M12: pre-flight validate the FASTA at the parent process
-        # level so a missing file / wrong contigs / too-short
-        # chrom fails in seconds rather than after msprime starts
-        # in each worker. The streamed coalescent path validates
-        # the same way; PR #84 review flagged that the admixture
-        # path was skipping this safety net and silently producing
-        # rng-fabricated REF when the FASTA's contigs didn't match.
-        # The open handle is discarded — workers re-open from the
-        # path inside ``simulate_chromosome``.
-        if args.reference_fasta:
-            from .reference import load_fasta, validate_fasta
-            print(
-                f"  loading reference FASTA: {args.reference_fasta}",
-                file=sys.stderr,
+        # M12: resolve the reference FASTA (handles
+        # ``--no-reference-fasta``, explicit ``--reference-fasta``,
+        # AND auto-fetch from ``cache_dir/reference/<build>.fa``).
+        # The open handle is discarded here — the admixture path
+        # uses a ``ProcessPoolExecutor`` so workers re-open from
+        # the path inside ``simulate_chromosome``; the parent-side
+        # ``load + validate`` still runs to fail fast at startup
+        # on bad FASTA / missing chrom (PR #84 review).
+        _fa_admix, _fa_path = _resolve_reference_fasta(args, chromosomes)
+        try:
+            cohort_sites, person_ancestry = simulate_admixed_cohort(
+                chromosomes=chromosomes, build=args.build,
+                n_people=args.n, length_mb=args.chr_length_mb,
+                proportions=proportions,
+                rec_rate=args.rec_rate, mu=args.mu,
+                rng=rng, verbose=True, workers=workers,
+                fasta_path=(str(_fa_path) if _fa_path else None),
             )
-            _fa = load_fasta(args.reference_fasta)
-            try:
-                try:
-                    validate_fasta(
-                        _fa, chromosomes, args.chr_length_mb,
-                    )
-                except ValueError as exc:
-                    sys.exit(str(exc))
-                print(
-                    f"  reference FASTA OK ({len(_fa.references)} contigs)",
-                    file=sys.stderr,
-                )
-            finally:
-                _fa.close()  # workers will re-open from the path
-
-        cohort_sites, person_ancestry = simulate_admixed_cohort(
-            chromosomes=chromosomes, build=args.build,
-            n_people=args.n, length_mb=args.chr_length_mb,
-            proportions=proportions,
-            rec_rate=args.rec_rate, mu=args.mu,
-            rng=rng, verbose=True, workers=workers,
-            # M12: path (not handle) since the admixture path uses a
-            # ProcessPoolExecutor and ``FastaFile`` doesn't pickle.
-            # Each worker re-opens from the path; kernel mmap is
-            # shared so per-worker open cost is one-time ~50 ms.
-            fasta_path=(
-                str(args.reference_fasta)
-                if args.reference_fasta else None
-            ),
-        )
+        finally:
+            if _fa_admix is not None:
+                _fa_admix.close()
     else:
         demo_model = None if args.demo_model.lower() == "none" \
             else args.demo_model

@@ -28,9 +28,23 @@ BUILDS = {
         "assembly": "GRCh37",
         "clinvar_url": "https://ftp.ncbi.nlm.nih.gov/pub/clinvar/"
                        "vcf_GRCh37/clinvar.vcf.gz",
+        # Annotation URL for the VCF ``##reference=`` header line.
+        # Identifies the assembly to downstream tooling without
+        # implying the file was actually fetched from this URL.
         "reference": "ftp://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/"
                      "GCA_000001405.14_GRCh37.p13/"
                      "GCA_000001405.14_GRCh37.p13_genomic.fna.gz",
+        # M12 reference FASTA. Ensembl primary assembly is the
+        # natural fit because its FASTA records are named ``1``,
+        # ``2``, …, ``22``, ``X``, ``Y``, ``MT`` — matching the
+        # ``contigs`` table above exactly. NCBI's full-assembly
+        # FASTA uses RefSeq accession IDs (``CM000663.2`` etc.)
+        # which would need a separate mapping table.
+        "reference_fasta_url": (
+            "https://ftp.ensembl.org/pub/grch37/release-113/"
+            "fasta/homo_sapiens/dna/"
+            "Homo_sapiens.GRCh37.dna.primary_assembly.fa.gz"
+        ),
         "contigs": GRCH37_CONTIG_LENGTHS,
     },
     "GRCh38": {
@@ -40,6 +54,11 @@ BUILDS = {
         "reference": "ftp://ftp.ncbi.nlm.nih.gov/genomes/all/GCA/000/001/405/"
                      "GCA_000001405.15_GRCh38/"
                      "GCA_000001405.15_GRCh38_genomic.fna.gz",
+        "reference_fasta_url": (
+            "https://ftp.ensembl.org/pub/release-113/"
+            "fasta/homo_sapiens/dna/"
+            "Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz"
+        ),
         "contigs": GRCH38_CONTIG_LENGTHS,
     },
 }

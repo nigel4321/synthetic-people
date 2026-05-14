@@ -220,6 +220,9 @@ def _common_args(
         "--cache-dir", str(out_dir / "cache"),
         "--mode", "cohort",
         "--cohort-mode", cohort_mode,
+        # M12: see test_cohort_streaming._common_args — opt out
+        # of the 3 GB auto-fetch.
+        "--no-reference-fasta",
     ]
 
 

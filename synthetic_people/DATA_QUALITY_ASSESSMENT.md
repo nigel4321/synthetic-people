@@ -34,7 +34,7 @@ gaps below are about the next layer of realism, not the foundation.
 | UK admixture EUR + SAS + AFR (§4) | ⚠ partial | Single-pulse only (`syntheticgen/admixture.py:37`, `PULSE_TIME = 20.0` generations); real UK demography is multi-pulse + continuous post-WWII migration. |
 | Local-ancestry BED truth (§4.2) | ✓ | Per-person ancestry BEDs from msprime `record_migrations`. |
 | Validation suite: PCA vs 1000G, LD decay, Ti/Tv (§6) | ⚠ partial | PCA is computed on the synthetic cohort alone — **no projection against real 1000G reference samples**. LD decay ✓. Ti/Tv ✓. |
-| Reference build aligned to GRCh38 (§2.1) | ✓ (since M12, 2026-05-14) | Pass `--reference-fasta` / `cohort.reference_fasta` and REF bases come from the FASTA via `pysam.FastaFile`. Legacy fabricated-REF path retained without the flag, preserving seed-pinned test behaviour. |
+| Reference build aligned to GRCh38 (§2.1) | ✓ (since M12, default-on 2026-05-14) | Every run looks up REF from a real Ensembl primary FASTA via `pysam.FastaFile`. The cli auto-fetches into `cache_dir/reference/` on first run; subsequent runs hit cache. `--no-reference-fasta` reverts to the legacy fabricated-REF path for smoke runs and seed-pinned tests. |
 | Error modeling via ART / SimNGS (§5) | ⚠ substitute | Lightweight GT-flip + dropout model in `syntheticgen/errors.py` — context-free. ART would produce reads + recall variants — a different (much heavier) workflow. |
 
 ---
@@ -96,13 +96,17 @@ most cleanly absent.
 
 ## 4. Variant content: where the cohort diverges from a real cohort
 
-### 4.1 ~~Reference base is fabricated~~ — closed by M12 (2026-05-14)
+### 4.1 ~~Reference base is fabricated~~ — closed by M12 (2026-05-14, default-on 2026-05-14)
 
-**Resolved** by M12. Pass `--reference-fasta <path>` (or
-`cohort.reference_fasta` in YAML) and the cli looks up REF
-from the FASTA via `pysam.FastaFile`. Without the flag the
-legacy `rng.choice("ACGT")` path still applies — preserves
-seed-pinned tests + lets quick smoke runs skip the FASTA.
+**Resolved** by M12 and on by default. Every run now looks up
+REF from a real FASTA via `pysam.FastaFile`: the cli auto-fetches
+the build's Ensembl primary assembly into `cache_dir/reference/`
+on first run and reuses the cached file on subsequent runs (same
+two-stage `.part` rename + idempotency contract as ClinVar). The
+opt-out is `--no-reference-fasta`, which reverts to the legacy
+`rng.choice("ACGT")` path for quick smoke runs that don't need
+real reference content; `--reference-fasta <path>` still works as
+an explicit override for users who already have a FASTA on disk.
 
 The wiring touches four REF-picking sites (materialised path,
 streaming pass-1 meta, streaming pass-2, admixture inline);
@@ -272,12 +276,18 @@ Today's supported envelope, updated:
 Ordered by **scientific impact per implementation cost**, not
 chronologically.
 
-### ~~M12 — Reference-aware foundation~~ — **shipped 2026-05-14**
+### ~~M12 — Reference-aware foundation~~ — **shipped 2026-05-14 (default-on 2026-05-14)**
 
 - ~~Load GRCh38 primary FASTA via `pysam.FastaFile`~~ — done.
   New `syntheticgen/reference.py` module wraps loading +
-  validation; `--reference-fasta` cli flag added (also exposed
-  as `cohort.reference_fasta` in the YAML config).
+  validation; auto-fetches the build's Ensembl primary FASTA
+  into `cache_dir/reference/` on first run and reuses cache
+  on subsequent runs (same two-stage `.part` rename + idempotent
+  contract as ClinVar). `--no-reference-fasta` is the opt-out
+  for smoke runs / seed-pinned tests that don't need real REF;
+  `--reference-fasta <path>` (also `cohort.reference_fasta`
+  in YAML) is the explicit override for users who already have
+  a FASTA on disk.
 - ~~Replace `rng.choice("ACGT")` with FASTA lookup~~ — done.
   All four REF-picking sites (`_tree_sequence_to_sites`,
   `_tree_sequence_to_sites_meta`, `_stream_cohort_pass2`, and

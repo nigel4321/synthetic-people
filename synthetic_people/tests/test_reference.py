@@ -178,6 +178,140 @@ class ReferenceFastaTest(unittest.TestCase):
         validate_fasta(None, ["22"], chr_length_mb=5.0)
 
 
+@unittest.skipUnless(_HAVE_PYSAM, "pysam not installed")
+class FetchReferenceFastaTest(unittest.TestCase):
+    """``fetch_reference_fasta`` is the M12 auto-download surface.
+
+    The real URL is a 3 GB Ensembl FASTA — far too large to pull in
+    CI on every job. The cli pairs auto-fetch with ``actions/cache``
+    so it lands once per CI image and is reused thereafter. Tests
+    monkey-patch ``urllib.request.urlopen`` to a local ``BytesIO``
+    backed by a hand-built tiny gzipped FASTA, which exercises every
+    branch in the cache contract without hitting the network.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cache = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _install_fake_urlopen(self, payload: bytes):
+        """Replace ``urllib.request.urlopen`` with a ``BytesIO`` stub
+        for the lifetime of one test. Restores on tearDown.
+
+        The stub mirrors ``HTTPResponse`` enough that
+        ``reference._download`` can call ``getheader`` + ``read`` and
+        use the response as a context manager.
+        """
+        import io
+        from syntheticgen import reference as ref_mod
+
+        class _Resp(io.BytesIO):
+            def __enter__(self_inner):
+                return self_inner
+
+            def __exit__(self_inner, *exc):
+                self_inner.close()
+                return False
+
+            def getheader(self_inner, name):
+                if name == "Content-Length":
+                    return str(len(payload))
+                return None
+
+        original = ref_mod.urllib.request.urlopen
+        ref_mod.urllib.request.urlopen = lambda url: _Resp(payload)
+        self.addCleanup(
+            setattr, ref_mod.urllib.request, "urlopen", original,
+        )
+
+    def _tiny_gz_fasta(self) -> bytes:
+        """Return a bgzip-friendly gzipped FASTA whose ungzipped form
+        is a short valid FASTA with one record.
+
+        ``gzip.GzipFile`` output decompresses cleanly with
+        ``gzip.open(...)`` which is what ``fetch_reference_fasta``
+        uses; we don't need a real BGZF block structure here because
+        the production decompress path is plain gzip.
+        """
+        import gzip
+        import io
+        buf = io.BytesIO()
+        with gzip.GzipFile(fileobj=buf, mode="wb") as gz:
+            gz.write(b">22\nACGTACGTACGT\n")
+        return buf.getvalue()
+
+    def test_idempotent_when_fa_and_fai_already_present(self):
+        # Both .fa and .fai already on disk → return path without
+        # touching urlopen. We assert that by NOT installing a stub:
+        # if the function tried to download, the test would either
+        # hang on the real URL or fail offline. ``fa_path`` returned
+        # must be the cached one.
+        from syntheticgen.reference import fetch_reference_fasta
+        import pysam
+        ref_dir = self.cache / "reference"
+        ref_dir.mkdir(parents=True)
+        fa = ref_dir / "GRCh38.fa"
+        fa.write_text(">22\nACGT\n")
+        pysam.faidx(str(fa))
+        # Sanity: .fai now exists.
+        self.assertTrue(fa.with_suffix(".fa.fai").is_file())
+        # Should be a pure cache hit.
+        out = fetch_reference_fasta(self.cache, "GRCh38")
+        self.assertEqual(out, fa)
+
+    def test_reindexes_when_fai_missing_but_fa_present(self):
+        # Cache contract: a present-but-unindexed FASTA is re-indexed
+        # in place instead of redownloaded. Validates that the .fa.gz
+        # download branch is skipped when .fa already exists.
+        from syntheticgen.reference import fetch_reference_fasta
+        ref_dir = self.cache / "reference"
+        ref_dir.mkdir(parents=True)
+        fa = ref_dir / "GRCh38.fa"
+        fa.write_text(">22\nACGT\n")
+        self.assertFalse(fa.with_suffix(".fa.fai").is_file())
+        # No urlopen stub installed — if the download branch fired,
+        # this would hit the real Ensembl URL.
+        out = fetch_reference_fasta(self.cache, "GRCh38")
+        self.assertEqual(out, fa)
+        self.assertTrue(fa.with_suffix(".fa.fai").is_file())
+
+    def test_full_download_decompress_and_index(self):
+        from syntheticgen.reference import fetch_reference_fasta
+        self._install_fake_urlopen(self._tiny_gz_fasta())
+        out = fetch_reference_fasta(self.cache, "GRCh38")
+        self.assertEqual(out, self.cache / "reference" / "GRCh38.fa")
+        self.assertTrue(out.is_file())
+        self.assertTrue(out.with_suffix(".fa.fai").is_file())
+        # The .gz must be cleaned up post-decompress (saves ~900 MB
+        # on the real download).
+        self.assertFalse(
+            (self.cache / "reference" / "GRCh38.fa.gz").exists(),
+        )
+        # And the .part sentinels must not linger.
+        self.assertFalse(
+            (self.cache / "reference" / "GRCh38.fa.gz.part").exists(),
+        )
+        self.assertFalse(
+            (self.cache / "reference" / "GRCh38.fa.part").exists(),
+        )
+        # Smoke-test that the resulting FASTA actually contains what
+        # we shipped through the stub.
+        import pysam
+        fa = pysam.FastaFile(str(out))
+        try:
+            self.assertEqual(fa.fetch("22", 0, 4), "ACGT")
+        finally:
+            fa.close()
+
+    def test_rejects_unknown_build(self):
+        from syntheticgen.reference import fetch_reference_fasta
+        with self.assertRaises(ValueError):
+            fetch_reference_fasta(self.cache, "GRCh99")
+
+
 class ReferenceFastaWithoutPysamTest(unittest.TestCase):
     """When pysam isn't installed, ``load_fasta`` must raise
     ``ImportError`` with an actionable cli hint. The actual import

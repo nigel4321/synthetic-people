@@ -126,6 +126,7 @@ def _canary_args(
     """
     return [
         "--no-config",  # ignore any cwd config that would skew results
+        "--no-reference-fasta",  # don't auto-download 3 GB at every canary
         "--n", str(CANARY_N),
         "--seed", str(CANARY_SEED),
         "--build", "GRCh38",

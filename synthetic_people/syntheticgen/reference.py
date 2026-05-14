@@ -23,8 +23,14 @@ quick development that doesn't need real reference content.
 
 from __future__ import annotations
 
+import gzip
+import shutil
+import sys
+import urllib.request
 from pathlib import Path
 from typing import Any
+
+from .builds import BUILDS
 
 
 def have_pysam() -> bool:
@@ -40,6 +46,122 @@ def have_pysam() -> bool:
         return True
     except ImportError:
         return False
+
+
+def fetch_reference_fasta(cache_dir: Path, build: str) -> Path:
+    """Ensure the reference FASTA + ``.fai`` index are cached on disk.
+
+    Mirrors the ``clinvar.fetch_clinvar`` pattern: first run downloads
+    the FASTA, decompresses it, and runs ``pysam.faidx``; subsequent
+    runs find the cached file and return immediately. Returns the
+    resolved ``.fa`` path.
+
+    Layout under ``cache_dir``:
+
+    - ``reference/<build>.fa``      — uncompressed FASTA
+    - ``reference/<build>.fa.fai``  — pysam index
+
+    Cache contract: a present-and-indexed ``.fa`` is treated as
+    complete and is NOT re-downloaded. Partial downloads land at
+    ``.fa.part`` and are renamed only on completion, so an
+    interrupted run never leaves a half-written FASTA that the
+    next run mistakes for valid. A missing ``.fai`` re-indexes
+    in place without re-downloading.
+
+    Disk footprint at GRCh38: ~900 MB peak during download
+    (``.fa.gz.part`` + decompressing target) → ~3.1 GB steady
+    state (``.fa`` + 50 KB ``.fai``). The ``.gz`` is deleted
+    after decompression so only the indexed FASTA persists.
+
+    Raises ``ImportError`` if pysam isn't installed (the index
+    step needs it). Raises ``ValueError`` if the build isn't in
+    the ``BUILDS`` table.
+    """
+    if build not in BUILDS:
+        raise ValueError(
+            f"unknown build {build!r}; supported: {sorted(BUILDS)}",
+        )
+    url = BUILDS[build].get("reference_fasta_url")
+    if not url:
+        raise ValueError(
+            f"build {build!r} has no reference_fasta_url in BUILDS",
+        )
+
+    ref_dir = Path(cache_dir) / "reference"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    fa_path = ref_dir / f"{build}.fa"
+    fai_path = fa_path.with_suffix(fa_path.suffix + ".fai")
+
+    if fa_path.is_file() and fai_path.is_file():
+        return fa_path
+
+    if not fa_path.is_file():
+        # Download .fa.gz, decompress to .fa.part, atomically rename.
+        # Two-stage rename avoids a half-decompressed file masquerading
+        # as a valid one if the process is killed mid-decompress.
+        if not have_pysam():
+            raise ImportError(
+                "pysam is required to index the downloaded FASTA. "
+                "Install with `pip install pysam` (optional dep).",
+            )
+        gz_part = ref_dir / f"{build}.fa.gz.part"
+        gz_final = ref_dir / f"{build}.fa.gz"
+        fa_part = ref_dir / f"{build}.fa.part"
+        _download(url, gz_part)
+        gz_part.rename(gz_final)
+        print(
+            f"  decompressing {gz_final.name} → {fa_path.name} "
+            f"(~3 GB; ~30 s on a fast SSD)",
+            file=sys.stderr,
+        )
+        with gzip.open(gz_final, "rb") as src, open(fa_part, "wb") as dst:
+            shutil.copyfileobj(src, dst, length=1 << 20)
+        fa_part.rename(fa_path)
+        # Remove the .gz now that the decompressed copy is on disk.
+        gz_final.unlink(missing_ok=True)
+
+    if not fai_path.is_file():
+        print(
+            f"  indexing {fa_path.name} (~60 s)",
+            file=sys.stderr,
+        )
+        if not have_pysam():
+            raise ImportError(
+                "pysam is required for FASTA indexing. Install with "
+                "`pip install pysam`.",
+            )
+        import pysam
+        pysam.faidx(str(fa_path))
+
+    return fa_path
+
+
+def _download(url: str, dest: Path) -> None:
+    """Stream-download ``url`` to ``dest`` with a progress log.
+
+    Mirrors ``clinvar._download`` so the cli's two cache-fetch
+    surfaces (ClinVar + reference FASTA) print consistently.
+    """
+    print(f"  downloading {url}", file=sys.stderr)
+    with urllib.request.urlopen(url) as resp:
+        total = int(resp.getheader("Content-Length") or 0)
+        downloaded = 0
+        last_report = 0
+        with open(dest, "wb") as fh:
+            while True:
+                chunk = resp.read(1 << 20)  # 1 MiB
+                if not chunk:
+                    break
+                fh.write(chunk)
+                downloaded += len(chunk)
+                if total and downloaded - last_report >= 50 * (1 << 20):
+                    pct = downloaded * 100 / total
+                    print(
+                        f"    {downloaded / 1e6:7.1f} / "
+                        f"{total / 1e6:.1f} MB ({pct:.0f}%)",
+                        file=sys.stderr,
+                    )
+                    last_report = downloaded
 
 
 def load_fasta(path: Path) -> Any:

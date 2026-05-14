@@ -67,6 +67,9 @@ def _common_args(out_dir: Path, mode: str, n: int = 3) -> list:
         "--output-dir", str(out_dir),
         "--cache-dir", str(out_dir / "cache"),
         "--mode", mode,
+        # M12: opt out of the auto-fetch (default-on behaviour
+        # would download a 3 GB FASTA into the per-test cache_dir).
+        "--no-reference-fasta",
     ]
 
 

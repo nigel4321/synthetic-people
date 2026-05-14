@@ -87,6 +87,10 @@ def _common_args(out_dir: Path, n: int = 3, chroms: str = "22") -> list:
         "--output-dir", str(out_dir),
         "--cache-dir", str(out_dir / "cache"),
         "--mode", "cohort",
+        # M12: opt out of the auto-download. The default behaviour
+        # (auto-fetch into cache_dir/reference/) would pull a 3 GB
+        # FASTA on every test run; tests don't need real REF.
+        "--no-reference-fasta",
     ]
 
 

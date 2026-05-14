@@ -42,6 +42,34 @@ jobs:
           # trip / parity / cli integration tests.
           pip install pyarrow
 
+      # M12 (default-on FASTA) + ClinVar cache.
+      #
+      # The cli auto-downloads the Ensembl primary FASTA (~900 MB
+      # gzipped → ~3.1 GB on disk) and the build's ClinVar VCF
+      # (~70 MB) into ``--cache-dir`` on first run. Without a
+      # cross-run cache, every CI job would re-pull both — slow
+      # and a real load on Ensembl/NCBI FTP. The unit-test suite
+      # itself opts out via ``--no-reference-fasta`` and uses
+      # per-test temp cache_dirs, so this cache restore is a
+      # no-op for the current tests. It's wired up here so:
+      #
+      # (a) any new smoke / e2e / benchmark job that DOES use real
+      #     REF or ClinVar will get a populated cache for free, and
+      # (b) the pattern is documented in one place — downstream
+      #     users running this cli in their own GitHub Actions
+      #     workflows can copy the block verbatim.
+      #
+      # Cache key versioning: bump the ``-v1`` suffix when the
+      # cli changes either source URL or the on-disk layout. The
+      # cli writes ``cache_dir/reference/<BUILD>.fa[.fai]`` and
+      # ``cache_dir/clinvar/clinvar_<BUILD>.vcf.gz[.tbi]``, both
+      # idempotent — a cache hit is a pure read.
+      - name: Cache reference FASTA + ClinVar
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/synthetic_people
+          key: synth-people-data-${{ runner.os }}-grch38-v1
+
       - name: Run unit tests
         run: python .github/scripts/run_tests.py synthetic_people
 

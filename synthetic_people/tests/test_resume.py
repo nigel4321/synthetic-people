@@ -181,6 +181,9 @@ def _streamed_args(out_dir: Path, no_resume: bool = False) -> list:
         "--output-dir", str(out_dir),
         "--cache-dir", str(out_dir / "cache"),
         "--mode", "cohort",
+        # M12: opt out of the auto-fetch (default-on behaviour
+        # would download a 3 GB FASTA into the per-test cache_dir).
+        "--no-reference-fasta",
     ]
     if no_resume:
         args.append("--no-resume")
