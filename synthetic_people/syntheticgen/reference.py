@@ -80,7 +80,19 @@ def load_fasta(path: Path) -> Any:
 def fetch_ref_base(fasta: Any, chrom: str, pos: int) -> str:
     """Look up the reference base at 1-based ``pos`` on ``chrom``.
 
-    Returns the uppercase base (``A``/``C``/``G``/``T``/``N``).
+    Returns one of ``A``/``C``/``G``/``T``/``N`` — non-canonical
+    bases (IUPAC ambiguity codes ``R``/``Y``/``W``/``S``/``K``/``M``
+    /``B``/``D``/``H``/``V``, masked-region ``N``/``n``, or any
+    other byte the FASTA might contain) are normalised to ``N`` so
+    callers can rely on a 5-character return alphabet.
+
+    Why: ``choose_alt`` in the cli's Ti/Tv calibrator only knows how
+    to weight transitions/transversions for the four canonical
+    bases — any non-canonical input makes it return ``None``, which
+    trips the producer's ``assert alt is not None``. Returning ``N``
+    here funnels every non-canonical base through ``_pick_ref``'s
+    existing rng fallback, preserving the producer's downstream
+    invariants.
 
     Handles the common chr-prefix mismatch between the cli's
     ``BUILDS`` naming (``"22"``) and UCSC/Ensembl FASTA naming
@@ -110,8 +122,14 @@ def fetch_ref_base(fasta: Any, chrom: str, pos: int) -> str:
         except (KeyError, IndexError, ValueError):
             continue
         if base:
-            return base.upper()
+            upper = base.upper()
+            # Canonical-only output; any IUPAC ambiguity or masked
+            # base becomes ``N`` for callers' alphabet contract.
+            return upper if upper in _CANONICAL_BASES else "N"
     return "N"
+
+
+_CANONICAL_BASES = frozenset("ACGT")
 
 
 def resolve_chrom_name(fasta: Any, chrom: str) -> str | None:

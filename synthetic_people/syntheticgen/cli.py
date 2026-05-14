@@ -2201,6 +2201,14 @@ def main(argv: list[str] | None = None) -> int:
             proportions=proportions,
             rec_rate=args.rec_rate, mu=args.mu,
             rng=rng, verbose=True, workers=workers,
+            # M12: path (not handle) since the admixture path uses a
+            # ProcessPoolExecutor and ``FastaFile`` doesn't pickle.
+            # Each worker re-opens from the path; kernel mmap is
+            # shared so per-worker open cost is one-time ~50 ms.
+            fasta_path=(
+                str(args.reference_fasta)
+                if args.reference_fasta else None
+            ),
         )
     else:
         demo_model = None if args.demo_model.lower() == "none" \

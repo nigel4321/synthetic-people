@@ -102,6 +102,28 @@ class ReferenceFastaTest(unittest.TestCase):
         fa = load_fasta(path)
         self.assertEqual(fetch_ref_base(fa, "22", 1), "A")
 
+    def test_fetch_ref_normalises_iupac_ambiguity_to_N(self):
+        # PR #83 review: IUPAC ambiguity codes (R, Y, W, S, K, M,
+        # B, D, H, V) appear in some assemblies. Before the fix
+        # ``fetch_ref_base`` returned them verbatim, then
+        # ``choose_alt`` returned ``None`` for non-ACGT input and
+        # the producer's ``assert alt is not None`` tripped. The
+        # callable contract now: only ``A``/``C``/``G``/``T``/``N``
+        # come out, so ``_pick_ref``'s ``N`` fallback funnels
+        # every non-canonical base into the rng draw cleanly.
+        from syntheticgen.reference import load_fasta, fetch_ref_base
+        # Mix canonical, IUPAC, and explicit N at known positions.
+        path = _write_fasta(self.dir, {"22": "ARYWSKMBDHVN"})
+        fa = load_fasta(path)
+        self.assertEqual(fetch_ref_base(fa, "22", 1), "A")
+        for pos in range(2, 12):  # R Y W S K M B D H V
+            self.assertEqual(
+                fetch_ref_base(fa, "22", pos), "N",
+                f"pos {pos} expected N (IUPAC), got "
+                f"{fetch_ref_base(fa, '22', pos)!r}",
+            )
+        self.assertEqual(fetch_ref_base(fa, "22", 12), "N")
+
     def test_fetch_ref_none_fasta_returns_N(self):
         from syntheticgen.reference import fetch_ref_base
         self.assertEqual(fetch_ref_base(None, "22", 1), "N")
@@ -330,6 +352,64 @@ class ReferenceEndToEndTest(unittest.TestCase):
                 mismatches, [],
                 f"REF mismatch in {len(mismatches)} of {len(records)} "
                 f"records (first 5: {mismatches[:5]})",
+            )
+
+
+@unittest.skipUnless(
+    _HAVE_PYSAM and _HAVE_MSPRIME and _HAVE_STDPOPSIM,
+    "needs pysam + msprime + stdpopsim",
+)
+class AdmixtureReferenceTest(unittest.TestCase):
+    """PR #83 review #2: the admixture path has its own
+    ``simulate_chromosome`` / ``_simulate_chromosome_from_seed`` /
+    ``simulate_cohort`` chain that wasn't threaded with the FASTA
+    in the original M12 PR. This test exercises the threading.
+
+    The admixture chain uses ``ProcessPoolExecutor`` for parallel
+    chromosomes (when ``workers > 1`` and ``len(chromosomes) > 1``),
+    so the FASTA must be passed as a path (string) rather than a
+    ``FastaFile`` handle — handles don't pickle. Each worker
+    re-opens from the path; kernel mmap is shared.
+    """
+
+    def _build_fasta(self, tmp: Path) -> Path:
+        import pysam
+        path = tmp / "admix_chr22.fa"
+        seq = ("CGCG" * 250_000)  # 1 Mb of CG repeats — distinct
+        # bytes per pos so the test catches an "all-rng-fallback"
+        # bug (which would produce a uniform distribution, not all C/G).
+        path.write_text(f">22\n{seq}\n")
+        pysam.faidx(str(path))
+        return path
+
+    def test_admixture_serial_chain_uses_fasta(self):
+        # workers=1 path → serial, no ProcessPoolExecutor.
+        # Verifies the path-threading works end-to-end through
+        # simulate_cohort → _simulate_chromosome_from_seed →
+        # simulate_chromosome → _tree_sequence_to_sites.
+        import random
+        from syntheticgen.admixture import simulate_cohort
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            fasta_path = self._build_fasta(tmp)
+            rng = random.Random(42)
+            sites, ancestry = simulate_cohort(
+                chromosomes=["22"], build="GRCh38",
+                n_people=3, length_mb=0.5,
+                proportions=(0.6, 0.25, 0.15),
+                rec_rate=1e-8, mu=1.29e-8,
+                rng=rng, verbose=False, workers=1,
+                fasta_path=str(fasta_path),
+            )
+            self.assertGreater(len(sites), 0)
+            # Every site's REF must be C or G (since FASTA is CGCG…)
+            # — if the fasta_path threading is broken, REF would be
+            # rng.choice('ACGT'), giving roughly 50% A/T.
+            non_cg = [s["ref"] for s in sites if s["ref"] not in "CG"]
+            self.assertEqual(
+                non_cg, [],
+                f"{len(non_cg)}/{len(sites)} REFs were not C/G — "
+                f"FASTA path not threaded into the admixture chain",
             )
 
 

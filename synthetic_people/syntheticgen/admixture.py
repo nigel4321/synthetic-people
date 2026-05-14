@@ -104,7 +104,8 @@ def simulate_chromosome(chrom: str, build: str, n_people: int,
                         rec_rate: float, mu: float,
                         rng: random.Random,
                         titv_target: float = DEFAULT_TARGET_TITV,
-                        pulse_time: float = PULSE_TIME) -> tuple:
+                        pulse_time: float = PULSE_TIME,
+                        fasta_path: str | None = None) -> tuple:
     """Simulate one chromosome of UK admixture.
 
     Returns ``(sites, person_segments)`` where ``person_segments[i]`` is
@@ -141,7 +142,18 @@ def simulate_chromosome(chrom: str, build: str, n_people: int,
         model=msprime.BinaryMutationModel(),
     )
 
-    sites = _tree_sequence_to_sites(ts, chrom, n_people, rng, titv_target)
+    # M12: open the FASTA inside the worker — paths pickle across
+    # the ProcessPoolExecutor boundary cleanly, ``FastaFile``
+    # handles don't. The kernel-level mmap is shared across
+    # processes, so per-worker open cost is one-time ~50 ms
+    # and the resident-set stays single-instance.
+    fasta = None
+    if fasta_path is not None:
+        from .reference import load_fasta
+        fasta = load_fasta(Path(fasta_path))
+    sites = _tree_sequence_to_sites(
+        ts, chrom, n_people, rng, titv_target, fasta=fasta,
+    )
     person_segs = _local_ancestry(ts, n_people, pulse_time)
     return sites, person_segs
 
@@ -289,12 +301,23 @@ def _simulate_chromosome_from_seed(chrom: str, build: str, n_people: int,
                                    length_mb: float, proportions: tuple,
                                    rec_rate: float, mu: float, seed: int,
                                    titv_target: float,
-                                   pulse_time: float) -> tuple:
-    """Worker entry point — builds its own rng from the given seed."""
+                                   pulse_time: float,
+                                   fasta_path: str | None = None,
+                                   ) -> tuple:
+    """Worker entry point — builds its own rng from the given seed.
+
+    ``fasta_path`` is the path (string) rather than an open
+    ``FastaFile`` handle so the function pickles across the
+    ``ProcessPoolExecutor`` boundary cleanly. Each worker opens
+    its own handle from the path inside :func:`simulate_chromosome`;
+    the kernel mmap is shared across processes so resident-set
+    stays single-instance regardless of worker count.
+    """
     rng = random.Random(seed)
     return simulate_chromosome(
         chrom, build, n_people, length_mb, proportions,
         rec_rate, mu, rng, titv_target, pulse_time=pulse_time,
+        fasta_path=fasta_path,
     )
 
 
@@ -304,7 +327,8 @@ def simulate_cohort(chromosomes: list, build: str, n_people: int,
                     titv_target: float = DEFAULT_TARGET_TITV,
                     pulse_time: float = PULSE_TIME,
                     verbose: bool = False,
-                    workers: int = 1) -> tuple:
+                    workers: int = 1,
+                    fasta_path: str | None = None) -> tuple:
     """Simulate the UK admixed cohort across one or more chromosomes.
 
     Returns ``(sites, ancestry)`` where ``ancestry[i]`` is a list of
@@ -342,6 +366,7 @@ def simulate_cohort(chromosomes: list, build: str, n_people: int,
             sites, person_segs = _simulate_chromosome_from_seed(
                 chrom, build, n_people, length_mb, proportions,
                 rec_rate, mu, seed, titv_target, pulse_time,
+                fasta_path=fasta_path,
             )
             if verbose:
                 print(f"    {len(sites)} variable sites on chrom "
@@ -362,6 +387,7 @@ def simulate_cohort(chromosomes: list, build: str, n_people: int,
                 _simulate_chromosome_from_seed,
                 chrom, build, n_people, length_mb, proportions,
                 rec_rate, mu, seed, titv_target, pulse_time,
+                fasta_path,
             )))
         for chrom, fut in futures:
             sites, person_segs = fut.result()
