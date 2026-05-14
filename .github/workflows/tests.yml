@@ -48,15 +48,35 @@ jobs:
   synthetic-people-m12-smoke:
     name: synthetic_people M12 smoke (default-on FASTA + cache)
     runs-on: ubuntu-latest
+    # PR #88 review (Copilot): cap the job at 15 min so a stalled
+    # Ensembl/NCBI download (the cli's ``urllib`` calls have no
+    # explicit timeout) can't hold a runner for the 6-hour default.
+    # Cache-miss budget: ~5 min download + ~90 s decompress/index +
+    # ~30 s simulate ≈ 7 min; 15 min gives a 2× headroom.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
+      # PR #88 review (Copilot): use a smoke-specific pip cache key
+      # to avoid colliding with the synthetic-people unit job, which
+      # uses the same OS/python/dependency-path and would otherwise
+      # derive the same setup-python pip cache key. The unit job
+      # installs pyarrow on top of requirements.txt; the smoke job
+      # doesn't. GHA caches are write-once per key, so whichever job
+      # finishes first wins, and a smoke-job-seeded cache without
+      # pyarrow forces the unit job to re-fetch pyarrow on every
+      # subsequent run. Separate key → no race, both jobs get a
+      # useful pip cache.
       - name: Set up Python 3.12
         uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: synthetic_people/requirements.txt
+
+      - name: Cache pip downloads (smoke-specific key)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-smoke-${{ runner.os }}-py3.12-${{ hashFiles('synthetic_people/requirements.txt') }}
 
       - name: Install htslib binaries
         run: |
@@ -113,10 +133,23 @@ jobs:
       # means the cli takes the default-on auto-fetch path — the
       # path the rest of the test suite opts OUT of, so this is
       # the only end-to-end CI coverage for that path.
+      #
+      # PR #88 review (Copilot):
+      # - ``--build GRCh38`` pinned explicitly to match the cache
+      #   key suffix (``-grch38-v1``). Without this, if the cli's
+      #   default ``--build`` ever flips, the smoke job would
+      #   silently populate a non-GRCh38 cache under the GRCh38 key.
+      # - ``--no-config`` disables auto-discovery of
+      #   ``generate_people_config.yaml``. Any repo-level config
+      #   committed to the working directory would otherwise
+      #   override the smoke args (e.g. flip the build) without
+      #   surfacing in the workflow file.
       - name: Smoke run (default-on REF FASTA + ClinVar)
         run: |
           mkdir -p smoke-out
           python3 synthetic_people/generate_people.py \
+            --no-config \
+            --build GRCh38 \
             --n 2 \
             --chromosomes 22 \
             --chr-length-mb 0.5 \
@@ -129,6 +162,18 @@ jobs:
           ls -la smoke-out/
           test -s smoke-out/person_0001.vcf.gz
           test -s smoke-out/person_0002.vcf.gz
+          # PR #88 review (Copilot): also assert the cache was
+          # actually populated. Without this, a future refactor
+          # that points the auto-fetch at a different path would
+          # leave the smoke green (VCFs still emit, drawn from
+          # the new path) while the GHA cache stays empty and
+          # every CI run re-pays the 900 MB download.
+          echo "--- cache contents ---"
+          ls -la ~/.cache/synthetic-people-data/
+          ls -la ~/.cache/synthetic-people-data/reference/
+          test -s ~/.cache/synthetic-people-data/reference/GRCh38.fa
+          test -s ~/.cache/synthetic-people-data/reference/GRCh38.fa.fai
+          test -s ~/.cache/synthetic-people-data/clinvar_GRCh38.vcf.gz
 
   nextflow-pipeline:
     name: nextflow_pipeline bin scripts
