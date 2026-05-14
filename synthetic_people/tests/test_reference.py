@@ -811,7 +811,7 @@ class ResolveReferenceFastaActionableErrorsTest(unittest.TestCase):
         self.assertIn("--no-reference-fasta", msg)
 
     def test_validate_failure_closes_handle_before_exit(self):
-        # The fastq below is a valid FASTA but only contains chr22
+        # The FASTA below is a valid FASTA but only contains chr22
         # at 8 bp; ask for a chromosome that isn't there so
         # validate_fasta raises. The just-opened pysam handle must
         # be closed before sys.exit() rather than relying on GC.
@@ -852,6 +852,64 @@ class ResolveReferenceFastaActionableErrorsTest(unittest.TestCase):
         handle = captured[0]
         # pysam.FastaFile exposes ``.is_open`` (False after close).
         self.assertFalse(handle.is_open())
+
+    def test_auto_fetch_import_error_exits_with_install_hint(self):
+        # PR #87 review (Copilot): ``fetch_reference_fasta`` runs
+        # BEFORE ``load_fasta`` on the auto-fetch path and can raise
+        # its own ImportError (pysam needed for ``pysam.faidx``).
+        # That must surface the same actionable hint, not a bare
+        # traceback.
+        from syntheticgen.cli import _resolve_reference_fasta
+        from syntheticgen import reference as ref_mod
+        from unittest.mock import patch
+        import argparse
+        args = argparse.Namespace(
+            no_reference_fasta=False,
+            reference_fasta=None,  # forces auto-fetch path
+            cache_dir=self.dir,
+            build="GRCh38",
+            chr_length_mb=0.0,
+        )
+
+        def _raise_import_error(cache_dir, build):
+            raise ImportError("pysam is required to index the downloaded FASTA")
+
+        with patch.object(ref_mod, "fetch_reference_fasta", _raise_import_error):
+            with self.assertRaises(SystemExit) as ctx:
+                _resolve_reference_fasta(args, ["22"])
+        msg = str(ctx.exception)
+        self.assertIn("--no-reference-fasta", msg)
+        self.assertIn("pip install pysam", msg)
+
+    def test_load_fasta_value_error_exits_with_hint(self):
+        # PR #87 review (Copilot): ``load_fasta`` raises ValueError
+        # when the FASTA is unreadable or unindexed (e.g. .fai
+        # missing on a read-only filesystem). That path must also
+        # surface the actionable hint and not escape as a traceback.
+        from syntheticgen.cli import _resolve_reference_fasta
+        from syntheticgen import reference as ref_mod
+        from unittest.mock import patch
+        import argparse
+        fa_path = self.dir / "broken.fa"
+        fa_path.write_text(">22\nACGT\n")
+        args = argparse.Namespace(
+            no_reference_fasta=False,
+            reference_fasta=fa_path,
+            cache_dir=self.dir,
+            build="GRCh38",
+            chr_length_mb=0.0,
+        )
+
+        def _raise_value_error(path):
+            raise ValueError(
+                f"--reference-fasta: could not open {path} — index missing."
+            )
+
+        with patch.object(ref_mod, "load_fasta", _raise_value_error):
+            with self.assertRaises(SystemExit) as ctx:
+                _resolve_reference_fasta(args, ["22"])
+        msg = str(ctx.exception)
+        self.assertIn("--no-reference-fasta", msg)
 
 
 if __name__ == "__main__":

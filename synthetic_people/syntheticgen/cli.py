@@ -766,30 +766,33 @@ def _resolve_reference_fasta(
         )
         return None, None
 
-    if args.reference_fasta is not None:
-        fasta_path = Path(args.reference_fasta)
-    else:
-        # Auto-discover / auto-fetch. ``fetch_reference_fasta`` is
-        # the cached form: re-runs against the same ``cache_dir``
-        # are a no-op once the FASTA is on disk.
-        print(
-            f"  --reference-fasta unset; resolving cached FASTA "
-            f"at <cache-dir>/reference/{args.build}.fa "
-            f"(pass --no-reference-fasta to skip)",
-            file=sys.stderr,
-        )
-        from .reference import fetch_reference_fasta
-        fasta_path = fetch_reference_fasta(args.cache_dir, args.build)
-
-    from .reference import load_fasta, validate_fasta
-    print(f"  loading reference FASTA: {fasta_path}", file=sys.stderr)
-    # PR #86 review (Copilot): default-on means non-bioinformatician
-    # users hit this path too. ImportError (no pysam) and
-    # FileNotFoundError (stale --reference-fasta) need actionable
-    # messages, not bare stack traces.
+    # PR #86 + #87 review (Copilot): default-on means non-bioinformatician
+    # users hit this path too. Every reference-resolution failure mode —
+    # auto-fetch (``fetch_reference_fasta``) AND open (``load_fasta``) —
+    # needs an actionable message, not a bare stack trace. Covers:
+    #   - ImportError (no pysam; raised by both fetch and load)
+    #   - FileNotFoundError (stale --reference-fasta path)
+    #   - ValueError (unknown build, missing reference_fasta_url,
+    #     unindexed/unreadable FASTA from load_fasta)
     try:
+        if args.reference_fasta is not None:
+            fasta_path = Path(args.reference_fasta)
+        else:
+            # Auto-discover / auto-fetch. ``fetch_reference_fasta`` is
+            # the cached form: re-runs against the same ``cache_dir``
+            # are a no-op once the FASTA is on disk.
+            print(
+                f"  --reference-fasta unset; resolving cached FASTA "
+                f"at <cache-dir>/reference/{args.build}.fa "
+                f"(pass --no-reference-fasta to skip)",
+                file=sys.stderr,
+            )
+            from .reference import fetch_reference_fasta
+            fasta_path = fetch_reference_fasta(args.cache_dir, args.build)
+        from .reference import load_fasta, validate_fasta
+        print(f"  loading reference FASTA: {fasta_path}", file=sys.stderr)
         fa = load_fasta(fasta_path)
-    except (ImportError, FileNotFoundError) as exc:
+    except (ImportError, FileNotFoundError, ValueError) as exc:
         sys.exit(
             f"--reference-fasta: {exc}\n"
             "Hint: install pysam (`pip install pysam`) or rerun with "
