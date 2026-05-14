@@ -54,20 +54,29 @@ jobs:
       # no-op for the current tests. It's wired up here so:
       #
       # (a) any new smoke / e2e / benchmark job that DOES use real
-      #     REF or ClinVar will get a populated cache for free, and
+      #     REF or ClinVar will get a populated cache for free
+      #     (provided it points ``--cache-dir`` at the cached path
+      #     below — the cli default ``synthetic_people/cache`` is
+      #     repo-local and clobbered each job, so the cached path
+      #     must be passed explicitly), and
       # (b) the pattern is documented in one place — downstream
       #     users running this cli in their own GitHub Actions
       #     workflows can copy the block verbatim.
       #
-      # Cache key versioning: bump the ``-v1`` suffix when the
-      # cli changes either source URL or the on-disk layout. The
-      # cli writes ``cache_dir/reference/<BUILD>.fa[.fai]`` and
-      # ``cache_dir/clinvar/clinvar_<BUILD>.vcf.gz[.tbi]``, both
-      # idempotent — a cache hit is a pure read.
+      # On-disk layout (matches ``reference.fetch_reference_fasta``
+      # + ``clinvar.fetch_clinvar``):
+      #
+      #   <cache-dir>/reference/<BUILD>.fa[.fai]    — Ensembl FASTA
+      #   <cache-dir>/clinvar_<BUILD>.vcf.gz[.tbi]  — ClinVar VCF
+      #
+      # Both fetchers are idempotent; a cache hit is a pure read.
+      #
+      # Cache key versioning: bump the ``-v1`` suffix when either
+      # source URL or the on-disk layout changes.
       - name: Cache reference FASTA + ClinVar
         uses: actions/cache@v4
         with:
-          path: ~/.cache/synthetic_people
+          path: ~/.cache/synthetic-people-data
           key: synth-people-data-${{ runner.os }}-grch38-v1
 
       - name: Run unit tests

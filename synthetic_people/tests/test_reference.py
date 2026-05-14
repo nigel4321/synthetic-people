@@ -243,12 +243,33 @@ class FetchReferenceFastaTest(unittest.TestCase):
             gz.write(b">22\nACGTACGTACGT\n")
         return buf.getvalue()
 
+    def _install_failing_urlopen(self):
+        """Replace ``urlopen`` with one that asserts it's never called.
+
+        PR #86 review (Copilot): the prior tests relied on the absence
+        of a stub to prove the download branch wasn't entered, which
+        means a future refactor that reorders the cache check would
+        silently hit the real Ensembl URL on CI runners with network
+        access. Install an explicit fail-if-called stub instead so
+        the test fails loudly on any regression.
+        """
+        from syntheticgen import reference as ref_mod
+        original = ref_mod.urllib.request.urlopen
+
+        def _fail(url):
+            self.fail(
+                f"download branch fired (urlopen called with {url!r}) — "
+                "this test should be a pure cache hit",
+            )
+
+        ref_mod.urllib.request.urlopen = _fail
+        self.addCleanup(
+            setattr, ref_mod.urllib.request, "urlopen", original,
+        )
+
     def test_idempotent_when_fa_and_fai_already_present(self):
         # Both .fa and .fai already on disk → return path without
-        # touching urlopen. We assert that by NOT installing a stub:
-        # if the function tried to download, the test would either
-        # hang on the real URL or fail offline. ``fa_path`` returned
-        # must be the cached one.
+        # touching urlopen.
         from syntheticgen.reference import fetch_reference_fasta
         import pysam
         ref_dir = self.cache / "reference"
@@ -258,25 +279,40 @@ class FetchReferenceFastaTest(unittest.TestCase):
         pysam.faidx(str(fa))
         # Sanity: .fai now exists.
         self.assertTrue(fa.with_suffix(".fa.fai").is_file())
-        # Should be a pure cache hit.
+        self._install_failing_urlopen()
         out = fetch_reference_fasta(self.cache, "GRCh38")
         self.assertEqual(out, fa)
 
     def test_reindexes_when_fai_missing_but_fa_present(self):
         # Cache contract: a present-but-unindexed FASTA is re-indexed
-        # in place instead of redownloaded. Validates that the .fa.gz
-        # download branch is skipped when .fa already exists.
+        # in place instead of redownloaded.
         from syntheticgen.reference import fetch_reference_fasta
         ref_dir = self.cache / "reference"
         ref_dir.mkdir(parents=True)
         fa = ref_dir / "GRCh38.fa"
         fa.write_text(">22\nACGT\n")
         self.assertFalse(fa.with_suffix(".fa.fai").is_file())
-        # No urlopen stub installed — if the download branch fired,
-        # this would hit the real Ensembl URL.
+        self._install_failing_urlopen()
         out = fetch_reference_fasta(self.cache, "GRCh38")
         self.assertEqual(out, fa)
         self.assertTrue(fa.with_suffix(".fa.fai").is_file())
+
+    def test_overwrites_stale_gz_from_prior_partial_run(self):
+        # PR #86 review (Copilot): if a previous run died after the
+        # .gz landed but before decompress finished, the next run
+        # used to ``rename`` the new download over the stale .gz —
+        # which fails on Windows. ``Path.replace`` + pre-emptive
+        # unlink of stale sidecars handles this.
+        from syntheticgen.reference import fetch_reference_fasta
+        ref_dir = self.cache / "reference"
+        ref_dir.mkdir(parents=True)
+        # Seed a stale .gz that a prior run would have left behind.
+        (ref_dir / "GRCh38.fa.gz").write_bytes(b"junk-from-prior-run")
+        self._install_fake_urlopen(self._tiny_gz_fasta())
+        out = fetch_reference_fasta(self.cache, "GRCh38")
+        self.assertTrue(out.is_file())
+        # Stale .gz must have been overwritten then cleaned up.
+        self.assertFalse((ref_dir / "GRCh38.fa.gz").exists())
 
     def test_full_download_decompress_and_index(self):
         from syntheticgen.reference import fetch_reference_fasta
@@ -664,6 +700,12 @@ class AdmixtureCliFastaTest(unittest.TestCase):
         # validates at startup; this test ensures the admixture
         # path now does too (PR #84 added the validate-then-discard
         # block to the admixture branch in cli.main).
+        #
+        # PR #86 review (Copilot): the cli now surfaces the
+        # ``FileNotFoundError`` as a ``SystemExit`` with an
+        # actionable hint mentioning the ``--no-reference-fasta``
+        # opt-out, rather than letting the bare stack trace
+        # bubble up.
         from syntheticgen import cli as cli_module
         with tempfile.TemporaryDirectory() as tmp_str:
             tmp = Path(tmp_str)
@@ -687,8 +729,187 @@ class AdmixtureCliFastaTest(unittest.TestCase):
                 "--cache-dir", str(out_dir / "cache"),
                 "--reference-fasta", "/nonexistent/path.fa",
             ]
-            with self.assertRaises(FileNotFoundError):
+            with self.assertRaises(SystemExit) as ctx:
                 cli_module.main(argv)
+            self.assertIn("--no-reference-fasta", str(ctx.exception))
+
+
+class ResolveReferenceFastaFlagConflictTest(unittest.TestCase):
+    """PR #86 review (Copilot): ``--no-reference-fasta`` and an
+    explicit ``--reference-fasta <path>`` are contradictory. The
+    resolver must reject the combination loudly so users don't
+    silently get the legacy fabricated-REF path while wondering
+    why their FASTA path was ignored.
+    """
+
+    def test_both_flags_set_exits_with_clear_message(self):
+        from syntheticgen.cli import _resolve_reference_fasta
+        import argparse
+        args = argparse.Namespace(
+            no_reference_fasta=True,
+            reference_fasta=Path("/tmp/whatever.fa"),
+            cache_dir=Path("/tmp/cache"),
+            build="GRCh38",
+            chr_length_mb=0.0,
+        )
+        with self.assertRaises(SystemExit) as ctx:
+            _resolve_reference_fasta(args, ["22"])
+        msg = str(ctx.exception)
+        # Message must name both flags so the user knows which one
+        # to drop.
+        self.assertIn("--no-reference-fasta", msg)
+        self.assertIn("--reference-fasta", msg)
+        self.assertIn("mutually exclusive", msg)
+
+    def test_only_no_reference_fasta_returns_none_pair(self):
+        # Sanity: with just --no-reference-fasta (and no
+        # --reference-fasta), the resolver returns the (None, None)
+        # opt-out tuple — i.e. the flag-conflict check doesn't
+        # mis-fire on the common opt-out path.
+        from syntheticgen.cli import _resolve_reference_fasta
+        import argparse
+        args = argparse.Namespace(
+            no_reference_fasta=True,
+            reference_fasta=None,
+            cache_dir=Path("/tmp/cache"),
+            build="GRCh38",
+            chr_length_mb=0.0,
+        )
+        fa, path = _resolve_reference_fasta(args, ["22"])
+        self.assertIsNone(fa)
+        self.assertIsNone(path)
+
+
+@unittest.skipUnless(_HAVE_PYSAM, "pysam not installed")
+class ResolveReferenceFastaActionableErrorsTest(unittest.TestCase):
+    """PR #86 review (Copilot + claude review): when ``load_fasta``
+    or ``validate_fasta`` raises, the cli must surface an actionable
+    message (mentioning ``--no-reference-fasta``) and not leak the
+    open ``pysam.FastaFile`` handle through ``sys.exit``.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_missing_fasta_path_exits_with_install_hint(self):
+        from syntheticgen.cli import _resolve_reference_fasta
+        import argparse
+        args = argparse.Namespace(
+            no_reference_fasta=False,
+            reference_fasta=Path("/definitely/does/not/exist.fa"),
+            cache_dir=self.dir,
+            build="GRCh38",
+            chr_length_mb=0.0,
+        )
+        with self.assertRaises(SystemExit) as ctx:
+            _resolve_reference_fasta(args, ["22"])
+        msg = str(ctx.exception)
+        self.assertIn("--no-reference-fasta", msg)
+
+    def test_validate_failure_closes_handle_before_exit(self):
+        # The FASTA below is a valid FASTA but only contains chr22
+        # at 8 bp; ask for a chromosome that isn't there so
+        # validate_fasta raises. The just-opened pysam handle must
+        # be closed before sys.exit() rather than relying on GC.
+        from syntheticgen.cli import _resolve_reference_fasta
+        import argparse
+        import pysam
+        fa_path = self.dir / "tiny.fa"
+        fa_path.write_text(">22\nACGTACGT\n")
+        pysam.faidx(str(fa_path))
+        args = argparse.Namespace(
+            no_reference_fasta=False,
+            reference_fasta=fa_path,
+            cache_dir=self.dir,
+            build="GRCh38",
+            chr_length_mb=0.0,
+        )
+        # Capture the FastaFile instance via the reference module's
+        # ``load_fasta`` so we can interrogate it after sys.exit.
+        # ``cli._resolve_reference_fasta`` does ``from .reference
+        # import load_fasta`` inside the function body, so it
+        # re-fetches the module attribute at call time — patching
+        # the reference module is sufficient.
+        from unittest.mock import patch
+        captured: list = []
+        from syntheticgen import reference as ref_mod
+        original_load = ref_mod.load_fasta
+
+        def _wrapped(path):
+            handle = original_load(path)
+            captured.append(handle)
+            return handle
+
+        with patch.object(ref_mod, "load_fasta", _wrapped):
+            with self.assertRaises(SystemExit):
+                _resolve_reference_fasta(args, ["99"])
+        # validate raised → handle must have been closed before exit.
+        self.assertEqual(len(captured), 1)
+        handle = captured[0]
+        # pysam.FastaFile exposes ``.is_open`` (False after close).
+        self.assertFalse(handle.is_open())
+
+    def test_auto_fetch_import_error_exits_with_install_hint(self):
+        # PR #87 review (Copilot): ``fetch_reference_fasta`` runs
+        # BEFORE ``load_fasta`` on the auto-fetch path and can raise
+        # its own ImportError (pysam needed for ``pysam.faidx``).
+        # That must surface the same actionable hint, not a bare
+        # traceback.
+        from syntheticgen.cli import _resolve_reference_fasta
+        from syntheticgen import reference as ref_mod
+        from unittest.mock import patch
+        import argparse
+        args = argparse.Namespace(
+            no_reference_fasta=False,
+            reference_fasta=None,  # forces auto-fetch path
+            cache_dir=self.dir,
+            build="GRCh38",
+            chr_length_mb=0.0,
+        )
+
+        def _raise_import_error(cache_dir, build):
+            raise ImportError("pysam is required to index the downloaded FASTA")
+
+        with patch.object(ref_mod, "fetch_reference_fasta", _raise_import_error):
+            with self.assertRaises(SystemExit) as ctx:
+                _resolve_reference_fasta(args, ["22"])
+        msg = str(ctx.exception)
+        self.assertIn("--no-reference-fasta", msg)
+        self.assertIn("pip install pysam", msg)
+
+    def test_load_fasta_value_error_exits_with_hint(self):
+        # PR #87 review (Copilot): ``load_fasta`` raises ValueError
+        # when the FASTA is unreadable or unindexed (e.g. .fai
+        # missing on a read-only filesystem). That path must also
+        # surface the actionable hint and not escape as a traceback.
+        from syntheticgen.cli import _resolve_reference_fasta
+        from syntheticgen import reference as ref_mod
+        from unittest.mock import patch
+        import argparse
+        fa_path = self.dir / "broken.fa"
+        fa_path.write_text(">22\nACGT\n")
+        args = argparse.Namespace(
+            no_reference_fasta=False,
+            reference_fasta=fa_path,
+            cache_dir=self.dir,
+            build="GRCh38",
+            chr_length_mb=0.0,
+        )
+
+        def _raise_value_error(path):
+            raise ValueError(
+                f"--reference-fasta: could not open {path} — index missing."
+            )
+
+        with patch.object(ref_mod, "load_fasta", _raise_value_error):
+            with self.assertRaises(SystemExit) as ctx:
+                _resolve_reference_fasta(args, ["22"])
+        msg = str(ctx.exception)
+        self.assertIn("--no-reference-fasta", msg)
 
 
 if __name__ == "__main__":

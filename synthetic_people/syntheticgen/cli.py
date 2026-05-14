@@ -742,6 +742,20 @@ def _resolve_reference_fasta(
     contig fails at startup, not after msprime has been running
     for hours.
     """
+    # PR #86 review (Copilot): --no-reference-fasta + an explicit
+    # --reference-fasta path is contradictory. Reject loudly rather
+    # than silently letting the opt-out win.
+    if (
+        getattr(args, "no_reference_fasta", False)
+        and args.reference_fasta is not None
+    ):
+        sys.exit(
+            "--no-reference-fasta and --reference-fasta are mutually "
+            "exclusive: --no-reference-fasta opts out of real REF "
+            "entirely, --reference-fasta <path> opts in to a specific "
+            "FASTA. Pick one.",
+        )
+
     if getattr(args, "no_reference_fasta", False):
         print(
             "  --no-reference-fasta: skipping reference FASTA; "
@@ -752,27 +766,46 @@ def _resolve_reference_fasta(
         )
         return None, None
 
-    if args.reference_fasta is not None:
-        fasta_path = Path(args.reference_fasta)
-    else:
-        # Auto-discover / auto-fetch. ``fetch_reference_fasta`` is
-        # the cached form: re-runs against the same ``cache_dir``
-        # are a no-op once the FASTA is on disk.
-        print(
-            f"  --reference-fasta unset; resolving cached FASTA "
-            f"at <cache-dir>/reference/{args.build}.fa "
-            f"(pass --no-reference-fasta to skip)",
-            file=sys.stderr,
+    # PR #86 + #87 review (Copilot): default-on means non-bioinformatician
+    # users hit this path too. Every reference-resolution failure mode —
+    # auto-fetch (``fetch_reference_fasta``) AND open (``load_fasta``) —
+    # needs an actionable message, not a bare stack trace. Covers:
+    #   - ImportError (no pysam; raised by both fetch and load)
+    #   - FileNotFoundError (stale --reference-fasta path)
+    #   - ValueError (unknown build, missing reference_fasta_url,
+    #     unindexed/unreadable FASTA from load_fasta)
+    try:
+        if args.reference_fasta is not None:
+            fasta_path = Path(args.reference_fasta)
+        else:
+            # Auto-discover / auto-fetch. ``fetch_reference_fasta`` is
+            # the cached form: re-runs against the same ``cache_dir``
+            # are a no-op once the FASTA is on disk.
+            print(
+                f"  --reference-fasta unset; resolving cached FASTA "
+                f"at <cache-dir>/reference/{args.build}.fa "
+                f"(pass --no-reference-fasta to skip)",
+                file=sys.stderr,
+            )
+            from .reference import fetch_reference_fasta
+            fasta_path = fetch_reference_fasta(args.cache_dir, args.build)
+        from .reference import load_fasta, validate_fasta
+        print(f"  loading reference FASTA: {fasta_path}", file=sys.stderr)
+        fa = load_fasta(fasta_path)
+    except (ImportError, FileNotFoundError, ValueError) as exc:
+        sys.exit(
+            f"--reference-fasta: {exc}\n"
+            "Hint: install pysam (`pip install pysam`) or rerun with "
+            "`--no-reference-fasta` to fall back to the legacy "
+            "fabricated-REF path.",
         )
-        from .reference import fetch_reference_fasta
-        fasta_path = fetch_reference_fasta(args.cache_dir, args.build)
-
-    from .reference import load_fasta, validate_fasta
-    print(f"  loading reference FASTA: {fasta_path}", file=sys.stderr)
-    fa = load_fasta(fasta_path)
+    # PR #86 review (claude review): validate_fasta raise must close
+    # the just-opened handle before sys.exit so test harnesses that
+    # invoke main() many times don't leak file descriptors.
     try:
         validate_fasta(fa, chromosomes, args.chr_length_mb)
     except ValueError as exc:
+        fa.close()
         sys.exit(str(exc))
     print(
         f"  reference FASTA OK ({len(fa.references)} contigs)",
@@ -1656,71 +1689,86 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
 
     memprofile_mark(
         f"streaming sim start ({len(chromosomes_to_simulate)} chroms)")
-    if cohort_mode == "arrow-streaming":
-        chrom_iter = _iter_chrom_sites_streaming(
-            chromosomes_to_simulate=chromosomes_to_simulate,
-            args=args, demo_model=demo_model, rng=rng,
-            resume=resume,
-            clinvar_index=clinvar_index, rsid_pool=rsid_pool,
-            cosmic_pool=cosmic_pool,
-            overlay_stats=overlay_stats, sfs_total=sfs_total,
-            chunk_size_mb=chunk_size_mb,
-            fasta=fasta,
-        )
-    else:
-        chrom_iter = _iter_chrom_sites_materialised(
-            chromosomes_to_simulate=chromosomes_to_simulate,
-            args=args, demo_model=demo_model, rng=rng,
-            workers=workers,
-            resume=resume,
-            clinvar_index=clinvar_index, rsid_pool=rsid_pool,
-            cosmic_pool=cosmic_pool,
-            overlay_stats=overlay_stats, sfs_total=sfs_total,
-            chunk_size_mb=chunk_size_mb,
-            fasta=fasta,
-        )
-
-    for chrom, sites in chrom_iter:
-        # Per-chrom BCF — `cohort.chr<N>.bcf`. The relative path goes
-        # straight into the manifest's cohort_bcfs list.
-        chrom_bcf = cohort_dir / f"cohort.chr{chrom}.bcf"
-        _write_cohort_chrom_bcf(
-            mode=cohort_mode,
-            chrom=chrom,
-            chrom_bcf=chrom_bcf,
-            sites=sites,
-            sample_ids=sample_ids,
-            build=args.build,
-            workers=workers,
-            cohort_dir=cohort_dir,
-            arrow_batch_size=args.cohort_arrow_batch_size,
-        )
-        # Record the BCF in the path list and persist completion to
-        # the resume record. From this point a re-run with the same
-        # params will skip this chromosome.
-        if chrom_bcf not in cohort_bcf_paths:
-            cohort_bcf_paths.append(chrom_bcf)
-        resume.mark_chromosome_done(chrom)
-        memprofile_mark(f"chrom {chrom} BCF written")
-
-        # Drop the chunk's reference so the next chromosome's
-        # simulation has the previous chunk's RAM available.
-        del sites
-
-        now = time.monotonic()
-        if now - last_progress_log > 20.0:
-            elapsed = now - bcf_t0
-            done = len(cohort_bcf_paths)
-            remaining = len(chromosomes) - done
-            rate_chr = done / elapsed if elapsed > 0 else 0.0
-            eta = (remaining / rate_chr) if rate_chr > 0 else float("inf")
-            print(
-                f"  cohort BCFs: {done}/{len(chromosomes)} chromosomes "
-                f"written (elapsed {_format_duration(elapsed)}, "
-                f"eta {_format_duration(eta)})",
-                file=sys.stderr,
+    # PR #86 review (Copilot + claude review): close the FASTA handle
+    # on every exit path. The iterator helpers below pass ``fasta``
+    # into generators that hold a reference until they're exhausted,
+    # so it's only safe to close after the loop completes (or unwinds
+    # via exception). Tests run ``main()`` repeatedly in-process —
+    # without this finally an n-run test would accumulate one open fd
+    # per run.
+    try:
+        if cohort_mode == "arrow-streaming":
+            chrom_iter = _iter_chrom_sites_streaming(
+                chromosomes_to_simulate=chromosomes_to_simulate,
+                args=args, demo_model=demo_model, rng=rng,
+                resume=resume,
+                clinvar_index=clinvar_index, rsid_pool=rsid_pool,
+                cosmic_pool=cosmic_pool,
+                overlay_stats=overlay_stats, sfs_total=sfs_total,
+                chunk_size_mb=chunk_size_mb,
+                fasta=fasta,
             )
-            last_progress_log = now
+        else:
+            chrom_iter = _iter_chrom_sites_materialised(
+                chromosomes_to_simulate=chromosomes_to_simulate,
+                args=args, demo_model=demo_model, rng=rng,
+                workers=workers,
+                resume=resume,
+                clinvar_index=clinvar_index, rsid_pool=rsid_pool,
+                cosmic_pool=cosmic_pool,
+                overlay_stats=overlay_stats, sfs_total=sfs_total,
+                chunk_size_mb=chunk_size_mb,
+                fasta=fasta,
+            )
+
+        for chrom, sites in chrom_iter:
+            # Per-chrom BCF — `cohort.chr<N>.bcf`. The relative path
+            # goes straight into the manifest's cohort_bcfs list.
+            chrom_bcf = cohort_dir / f"cohort.chr{chrom}.bcf"
+            _write_cohort_chrom_bcf(
+                mode=cohort_mode,
+                chrom=chrom,
+                chrom_bcf=chrom_bcf,
+                sites=sites,
+                sample_ids=sample_ids,
+                build=args.build,
+                workers=workers,
+                cohort_dir=cohort_dir,
+                arrow_batch_size=args.cohort_arrow_batch_size,
+            )
+            # Record the BCF in the path list and persist completion to
+            # the resume record. From this point a re-run with the same
+            # params will skip this chromosome.
+            if chrom_bcf not in cohort_bcf_paths:
+                cohort_bcf_paths.append(chrom_bcf)
+            resume.mark_chromosome_done(chrom)
+            memprofile_mark(f"chrom {chrom} BCF written")
+
+            # Drop the chunk's reference so the next chromosome's
+            # simulation has the previous chunk's RAM available.
+            del sites
+
+            now = time.monotonic()
+            if now - last_progress_log > 20.0:
+                elapsed = now - bcf_t0
+                done = len(cohort_bcf_paths)
+                remaining = len(chromosomes) - done
+                rate_chr = done / elapsed if elapsed > 0 else 0.0
+                eta = (
+                    (remaining / rate_chr)
+                    if rate_chr > 0 else float("inf")
+                )
+                print(
+                    f"  cohort BCFs: {done}/{len(chromosomes)} "
+                    f"chromosomes written (elapsed "
+                    f"{_format_duration(elapsed)}, "
+                    f"eta {_format_duration(eta)})",
+                    file=sys.stderr,
+                )
+                last_progress_log = now
+    finally:
+        if fasta is not None:
+            fasta.close()
 
     print(
         f"  cohort sites: {sum(sfs_total.values())} alt observations "

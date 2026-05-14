@@ -39,8 +39,7 @@ pydantic>=2.0
 PyYAML>=6.0
 
 # M12 (real REF FASTA): pysam.FastaFile for memory-mapped reference
-# lookup. Optional — required only when --reference-fasta is passed.
-# Without it the cli falls back to the legacy fabricated-REF path
-# (rng.choice("ACGT")), which produces structurally-valid VCFs that
-# won't pass bcftools norm --check-ref. Install with:
-#     .venv/bin/pip install pysam
+# lookup. Default-on as of PR #86 — every run uses real REF unless
+# explicitly opted out with --no-reference-fasta, so pysam is a hard
+# requirement, not optional.
+pysam>=0.22

@@ -107,8 +107,17 @@ def fetch_reference_fasta(cache_dir: Path, build: str) -> Path:
         gz_part = ref_dir / f"{build}.fa.gz.part"
         gz_final = ref_dir / f"{build}.fa.gz"
         fa_part = ref_dir / f"{build}.fa.part"
+        # PR #86 review (Copilot): if a previous run died mid-
+        # decompress we may have a stale ``.gz`` on disk that
+        # ``Path.rename`` won't overwrite on Windows. Clear stale
+        # sidecars before the download starts so the rename below
+        # is unambiguous on every platform.
+        gz_final.unlink(missing_ok=True)
+        fa_part.unlink(missing_ok=True)
         _download(url, gz_part)
-        gz_part.rename(gz_final)
+        # Use ``.replace`` rather than ``.rename`` for atomic-publish
+        # semantics on Windows + a race-safe overwrite on POSIX.
+        gz_part.replace(gz_final)
         print(
             f"  decompressing {gz_final.name} → {fa_path.name} "
             f"(~3 GB; ~30 s on a fast SSD)",
@@ -116,7 +125,7 @@ def fetch_reference_fasta(cache_dir: Path, build: str) -> Path:
         )
         with gzip.open(gz_final, "rb") as src, open(fa_part, "wb") as dst:
             shutil.copyfileobj(src, dst, length=1 << 20)
-        fa_part.rename(fa_path)
+        fa_part.replace(fa_path)
         # Remove the .gz now that the decompressed copy is on disk.
         gz_final.unlink(missing_ok=True)
 
