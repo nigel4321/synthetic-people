@@ -108,6 +108,17 @@ def _models():
             description="Simulated prefix per chromosome in Mb; 0 = full length.",
             json_schema_extra={"argparse_dest": "chr_length_mb"},
         )
+        reference_fasta: Optional[str] = Field(
+            default=None,
+            description=(
+                "[M12] Path to the reference FASTA matching ``build``. "
+                "When provided, REF bases are looked up from the FASTA "
+                "instead of fabricated via ``rng.choice('ACGT')``, so "
+                "emitted VCFs pass ``bcftools norm --check-ref``. "
+                "Requires a ``.fai`` index next to the FASTA."
+            ),
+            json_schema_extra={"argparse_dest": "reference_fasta"},
+        )
 
     class SimulationConfig(_Strict):
         demo_model: str = Field(

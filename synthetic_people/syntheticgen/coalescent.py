@@ -207,7 +207,8 @@ def simulate_chromosome(chrom: str, build: str, n_people: int,
                         population: str, rec_rate: float, mu: float,
                         rng: random.Random,
                         titv_target: float = DEFAULT_TARGET_TITV,
-                        chunk_size_mb: float = 0.0) -> list:
+                        chunk_size_mb: float = 0.0,
+                        fasta=None) -> list:
     """Simulate one chromosome and return a list of cohort site dicts.
 
     With `demo_model` set, we drive the simulation through stdpopsim so
@@ -250,11 +251,14 @@ def simulate_chromosome(chrom: str, build: str, n_people: int,
         ts = _simulate_one(chrom, build, n_people, sim_length_bp,
                            demo_model, population, rec_rate, mu, seed)
         return _tree_sequence_to_sites(
-            ts, chrom, n_people, rng, titv_target, position_offset=0)
+            ts, chrom, n_people, rng, titv_target,
+            position_offset=0, fasta=fasta,
+        )
 
     return _simulate_chromosome_chunked(
         chrom, build, n_people, sim_length_bp, chunk_size_bp,
         demo_model, population, rec_rate, mu, rng, titv_target,
+        fasta=fasta,
     )
 
 
@@ -314,6 +318,7 @@ def _simulate_chromosome_chunked(
     demo_model: str | None, population: str,
     rec_rate: float, mu: float,
     rng: random.Random, titv_target: float,
+    fasta=None,
 ) -> list:
     """Drive the per-chrom simulation as a sequence of independent
     sub-chunks. Each chunk's tree sequence is built, iterated, and
@@ -360,6 +365,7 @@ def _simulate_chromosome_chunked(
             ts, chrom, n_people, chunk_rng, titv_target,
             position_offset=cursor_bp,
             keep_below_bp=keep_below,
+            fasta=fasta,
         )
         # Drop the tree sequence reference so its msprime working
         # memory can be reclaimed before the next chunk's sim.
@@ -370,11 +376,38 @@ def _simulate_chromosome_chunked(
     return sites
 
 
+def _pick_ref(rng: random.Random, fasta, chrom: str, pos: int) -> str:
+    """Resolve the REF base for a variant — FASTA lookup if a
+    reference is provided, fabricated draw otherwise.
+
+    Always consumes one rng draw regardless of the FASTA path, so
+    the rng state advances identically with or without
+    ``--reference-fasta``. That keeps every downstream rng consumer
+    (overlay sampling, error model, AC/AN-driven calls) in lockstep
+    across the two paths — only the REF/ALT content of the emitted
+    variant differs, not the simulation's overall rng trajectory.
+
+    Falls back to the rng draw if the FASTA returns ``N`` (ambiguous
+    or out-of-range base). Pre-flight ``validate_fasta`` should
+    surface the typical "wrong FASTA" case at startup before this
+    fallback ever fires per-variant.
+    """
+    _rng_ref = rng.choice(("A", "C", "G", "T"))
+    if fasta is None:
+        return _rng_ref
+    from .reference import fetch_ref_base
+    base = fetch_ref_base(fasta, chrom, pos)
+    if base == "N":
+        return _rng_ref
+    return base
+
+
 def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
                             rng: random.Random,
                             titv_target: float,
                             position_offset: int = 0,
-                            keep_below_bp: int | None = None) -> list:
+                            keep_below_bp: int | None = None,
+                            fasta=None) -> list:
     """Convert an msprime TreeSequence to cohort site dicts.
 
     Phase 5c: emits sparse ``carriers`` rather than dense
@@ -439,7 +472,7 @@ def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
             # defend anyway so the output stays well-formed.
             continue
 
-        ref = rng.choice(("A", "C", "G", "T"))
+        ref = _pick_ref(rng, fasta, chrom, pos)
         alt = choose_alt(ref, rng, target=titv_target)
         assert alt is not None  # ref is always a standard base
 
@@ -511,8 +544,8 @@ def _tree_sequence_to_sites_meta(ts, chrom: str, n_people: int,
                                  rng: random.Random,
                                  titv_target: float,
                                  position_offset: int = 0,
-                                 keep_below_bp: int | None = None
-                                 ) -> list:
+                                 keep_below_bp: int | None = None,
+                                 fasta=None) -> list:
     """Pass 1 of the streaming-cohort walk: produce one
     ``(chrom, pos, ref, alt, n_alt_haplotypes, n_haplotypes)`` tuple
     per accepted variant *without* building carriers.
@@ -556,7 +589,7 @@ def _tree_sequence_to_sites_meta(ts, chrom: str, n_people: int,
         if n_alt_haplotypes == 0 or n_alt_haplotypes == n_haplotypes:
             continue
 
-        ref = rng.choice(("A", "C", "G", "T"))
+        ref = _pick_ref(rng, fasta, chrom, pos)
         alt = choose_alt(ref, rng, target=titv_target)
         assert alt is not None
 
@@ -597,7 +630,8 @@ def _stream_cohort_pass2(ts, chrom: str, n_people: int,
                         annotation_map: dict,
                         position_offset: int = 0,
                         keep_below_bp: int | None = None,
-                        carriers_sidecar=None):
+                        carriers_sidecar=None,
+                        fasta=None):
     """Pass 2 of the streaming-cohort walk: yield full site dicts in
     pos-sorted order, applying pre-computed overlays.
 
@@ -694,7 +728,7 @@ def _stream_cohort_pass2(ts, chrom: str, n_people: int,
                 or n_alt_haplotypes == n_haplotypes_total_cohort):
             continue
 
-        ref = rng.choice(("A", "C", "G", "T"))
+        ref = _pick_ref(rng, fasta, chrom, pos)
         alt = choose_alt(ref, rng, target=titv_target)
         assert alt is not None
 
@@ -1134,19 +1168,26 @@ def _simulate_chromosome_from_seed(chrom: str, build: str, n_people: int,
                                    population: str, rec_rate: float,
                                    mu: float, seed: int,
                                    titv_target: float,
-                                   chunk_size_mb: float = 0.0) -> list:
+                                   chunk_size_mb: float = 0.0,
+                                   fasta=None) -> list:
     """Worker entry point — builds its own rng from the given seed.
 
     Module-level so it's picklable across the ProcessPoolExecutor task
     boundary. ``chunk_size_mb`` is forwarded to
     :func:`simulate_chromosome`; ``0`` (the default) means single-pass
     full-chromosome simulation, ``> 0`` means split into chunks.
+
+    Phase 5e Phase A removed the cross-process parallel-sim path
+    that pickled this function, so passing the in-process FASTA
+    handle here is safe — the function is always called from the
+    cli's serial chrom loop today.
     """
     rng = random.Random(seed)
     return simulate_chromosome(
         chrom, build, n_people, length_mb, demo_model, population,
         rec_rate, mu, rng, titv_target,
         chunk_size_mb=chunk_size_mb,
+        fasta=fasta,
     )
 
 
@@ -1157,7 +1198,8 @@ def simulate_cohort_iter(chromosomes: list, build: str, n_people: int,
                          titv_target: float = DEFAULT_TARGET_TITV,
                          verbose: bool = False,
                          workers: int = 1,
-                         chunk_size_mb: float = 0.0):
+                         chunk_size_mb: float = 0.0,
+                         fasta=None):
     """Yield ``(chrom, sites)`` pairs one chromosome at a time.
 
     The streaming counterpart of :func:`simulate_cohort` — used by the
@@ -1195,6 +1237,7 @@ def simulate_cohort_iter(chromosomes: list, build: str, n_people: int,
             chrom, build, n_people, length_mb, demo_model,
             population, rec_rate, mu, seed, titv_target,
             chunk_size_mb,
+            fasta=fasta,
         )
         if verbose:
             print(f"    {len(sites)} variable sites on chrom "

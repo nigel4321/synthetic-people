@@ -715,10 +715,15 @@ def _write_cohort_chrom_bcf(
 def _iter_chrom_sites_materialised(
     *, chromosomes_to_simulate, args, demo_model, rng, workers,
     resume, clinvar_index, rsid_pool, cosmic_pool,
-    overlay_stats, sfs_total, chunk_size_mb,
+    overlay_stats, sfs_total, chunk_size_mb, fasta=None,
 ):
     """Legacy materialised per-chromosome iterator. Yields
     ``(chrom, sites_list)`` after applying overlays + sorting in place.
+
+    ``fasta`` (an open ``pysam.FastaFile`` handle, or ``None``)
+    forwards M12's reference-aware REF picking to the inner
+    producers — when present, REF bases come from the FASTA;
+    when ``None`` the legacy ``rng.choice('ACGT')`` path applies.
     """
     from .coalescent import simulate_cohort_iter
     for chrom, sites in simulate_cohort_iter(
@@ -728,6 +733,7 @@ def _iter_chrom_sites_materialised(
         rec_rate=args.rec_rate, mu=args.mu,
         rng=rng, verbose=True, workers=workers,
         chunk_size_mb=chunk_size_mb,
+        fasta=fasta,
     ):
         memprofile_mark(f"chrom {chrom} sites yielded ({len(sites)})")
         chrom_overlay_rng = random.Random(resume.overlay_seeds[chrom])
@@ -765,7 +771,7 @@ def _iter_chrom_sites_materialised(
 def _iter_chrom_sites_streaming(
     *, chromosomes_to_simulate, args, demo_model, rng,
     resume, clinvar_index, rsid_pool, cosmic_pool,
-    overlay_stats, sfs_total, chunk_size_mb,
+    overlay_stats, sfs_total, chunk_size_mb, fasta=None,
 ):
     """Streaming per-chromosome iterator (Phase 5d.1 PR 3). Yields
     ``(chrom, sites_generator)`` where ``sites_generator`` is the
@@ -823,6 +829,7 @@ def _iter_chrom_sites_streaming(
         state_before = chrom_rng.getstate()
         sites_meta = _tree_sequence_to_sites_meta(
             ts, chrom, args.n, chrom_rng, DEFAULT_TARGET_TITV,
+            fasta=fasta,
         )
         annotation_map = _build_annotation_map(
             sites_meta, clinvar_index,
@@ -861,6 +868,7 @@ def _iter_chrom_sites_streaming(
                 ts, chrom, args.n, chrom_rng, DEFAULT_TARGET_TITV,
                 sites_meta, inject_map, annotation_map,
                 carriers_sidecar=sidecar,
+                fasta=fasta,
             )
 
             # Tee the stream so we update sfs_total per site as it
@@ -1016,6 +1024,17 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                    help="Where ClinVar is downloaded and cached")
     p.add_argument("--build", choices=list(BUILDS), default="GRCh38",
                    help="Reference build; must match background VCFs")
+    p.add_argument("--reference-fasta", type=Path, default=None,
+                   help="[M12] Path to the reference FASTA matching "
+                        "--build (e.g. GRCh38 primary assembly). When "
+                        "provided, emitted REF bases come from the "
+                        "FASTA instead of `rng.choice('ACGT')`, so the "
+                        "VCFs validate cleanly with `bcftools norm "
+                        "--check-ref`. The FASTA must have a `.fai` "
+                        "index (run `samtools faidx <fasta>` once if "
+                        "missing). Optional — without it the run uses "
+                        "the legacy fabricated-REF path, which will "
+                        "fail the Tier 1 REF-check gate by design.")
     p.add_argument("--seed", type=int, default=None,
                    help="RNG seed for deterministic output. Omit for "
                         "different people each run.")
@@ -1541,6 +1560,32 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
             cohort_bcf_paths.append(
                 cohort_dir / f"cohort.chr{chrom}.bcf")
 
+    # M12: load the reference FASTA once if --reference-fasta is set.
+    # Memory-mapped via pysam, so resident-set is ~50 MB regardless
+    # of FASTA size. Validation up-front so a bad path / missing
+    # chrom in the FASTA fails before msprime starts the multi-hour
+    # simulation. The handle is threaded through the iter wrappers
+    # and into the four REF-picking producers.
+    fasta = None
+    if getattr(args, "reference_fasta", None):
+        from .reference import load_fasta, validate_fasta
+        print(
+            f"  loading reference FASTA: {args.reference_fasta}",
+            file=sys.stderr,
+        )
+        fasta = load_fasta(args.reference_fasta)
+        try:
+            validate_fasta(
+                fasta, chromosomes_to_simulate,
+                args.chr_length_mb,
+            )
+        except ValueError as exc:
+            sys.exit(str(exc))
+        print(
+            f"  reference FASTA OK ({len(fasta.references)} contigs)",
+            file=sys.stderr,
+        )
+
     memprofile_mark(
         f"streaming sim start ({len(chromosomes_to_simulate)} chroms)")
     if cohort_mode == "arrow-streaming":
@@ -1552,6 +1597,7 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
             cosmic_pool=cosmic_pool,
             overlay_stats=overlay_stats, sfs_total=sfs_total,
             chunk_size_mb=chunk_size_mb,
+            fasta=fasta,
         )
     else:
         chrom_iter = _iter_chrom_sites_materialised(
@@ -1563,6 +1609,7 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
             cosmic_pool=cosmic_pool,
             overlay_stats=overlay_stats, sfs_total=sfs_total,
             chunk_size_mb=chunk_size_mb,
+            fasta=fasta,
         )
 
     for chrom, sites in chrom_iter:

@@ -34,7 +34,7 @@ gaps below are about the next layer of realism, not the foundation.
 | UK admixture EUR + SAS + AFR (§4) | ⚠ partial | Single-pulse only (`syntheticgen/admixture.py:37`, `PULSE_TIME = 20.0` generations); real UK demography is multi-pulse + continuous post-WWII migration. |
 | Local-ancestry BED truth (§4.2) | ✓ | Per-person ancestry BEDs from msprime `record_migrations`. |
 | Validation suite: PCA vs 1000G, LD decay, Ti/Tv (§6) | ⚠ partial | PCA is computed on the synthetic cohort alone — **no projection against real 1000G reference samples**. LD decay ✓. Ti/Tv ✓. |
-| Reference build aligned to GRCh38 (§2.1) | ⚠ broken | Coordinates are GRCh38, but **`REF` bases are fabricated** uniformly from `{A,C,G,T}` (`syntheticgen/coalescent.py:440`). A real tool ingesting these VCFs cannot re-align them. |
+| Reference build aligned to GRCh38 (§2.1) | ✓ (since M12, 2026-05-14) | Pass `--reference-fasta` / `cohort.reference_fasta` and REF bases come from the FASTA via `pysam.FastaFile`. Legacy fabricated-REF path retained without the flag, preserving seed-pinned test behaviour. |
 | Error modeling via ART / SimNGS (§5) | ⚠ substitute | Lightweight GT-flip + dropout model in `syntheticgen/errors.py` — context-free. ART would produce reads + recall variants — a different (much heavier) workflow. |
 
 ---
@@ -47,17 +47,19 @@ validated SFS and Ti/Tv, admixture truth tracks. **It is not yet
 what a scientist reviewing it for benchmarking or population
 genetics research would call high-fidelity**, primarily because of:
 
-1. fabricated `REF` bases (no FASTA loaded);
+1. ~~fabricated `REF` bases (no FASTA loaded)~~ — **closed by M12
+   (2026-05-14)**;
 2. sex-chromosome ploidy unmodeled (X/Y/MT treated as autosomes);
 3. overlay genotype/AF inconsistency (ClinVar variants land at
    arbitrary cohort AF);
 4. uniform genome-wide recombination and mutation rates (no
    hotspots, no CpG enrichment).
 
-All four are tractable now that Phase 5d.1 has removed the memory
-ceiling that motivated them. M12 (reference-aware foundation) and
-M13 (sex chromosomes) would close the largest perception gap with
-real WGS on their own.
+M12 closes #1; the remaining three are tractable now that Phase
+5d.1 has removed the memory ceiling that motivated them. **M13
+(sex chromosomes)** is the next-largest perception gap with real
+WGS, followed by M14 (context-aware μ) which is now unblocked by
+M12's real REF.
 
 ---
 
@@ -94,20 +96,25 @@ most cleanly absent.
 
 ## 4. Variant content: where the cohort diverges from a real cohort
 
-### 4.1 Reference base is fabricated
+### 4.1 ~~Reference base is fabricated~~ — closed by M12 (2026-05-14)
 
-`syntheticgen/coalescent.py:440-442` does `ref = rng.choice("ACGT")`.
-The VCF is structurally valid but **its `REF` field does not match
-GRCh38 at that position**. Anything that re-validates against the
-reference — `bcftools norm --check-ref`, `vcfvalidator`, any aligner
-— will fail. This is acknowledged in the `README.md` as "M11 will
-wire in the FASTA" but is the current state of `main`.
+**Resolved** by M12. Pass `--reference-fasta <path>` (or
+`cohort.reference_fasta` in YAML) and the cli looks up REF
+from the FASTA via `pysam.FastaFile`. Without the flag the
+legacy `rng.choice("ACGT")` path still applies — preserves
+seed-pinned tests + lets quick smoke runs skip the FASTA.
 
-The original memory rationale for skipping FASTA loading (~3 GB for
-GRCh38 primary) no longer applies post-Phase-5d.1: `pysam.FastaFile`
-mmaps the reference, adding ~50 MB resident regardless of cohort
-size — orders of magnitude below the cohort-intermediate we already
-build.
+The wiring touches four REF-picking sites (materialised path,
+streaming pass-1 meta, streaming pass-2, admixture inline);
+all share a `_pick_ref` helper that consumes one rng draw
+unconditionally so the seed stream is invariant between
+fasta-on and fasta-off paths (only the REF/ALT content of
+the variant differs, not the overall rng trajectory).
+
+Tier 1's REF-check gate (which previously failed on every
+record by design) now passes end-to-end on a real run with
+`--reference-fasta`. Empirical proof point captured in
+`tests/test_reference.py::ReferenceEndToEndTest`.
 
 ### 4.2 Overlay AF inconsistency
 
@@ -265,15 +272,36 @@ Today's supported envelope, updated:
 Ordered by **scientific impact per implementation cost**, not
 chronologically.
 
-### M12 — Reference-aware foundation *(unblocks several others)*
+### ~~M12 — Reference-aware foundation~~ — **shipped 2026-05-14**
 
-- Load GRCh38 primary FASTA via `pysam.FastaFile` (cached alongside
-  ClinVar in `cache/`).
-- Replace `rng.choice("ACGT")` with `fasta.fetch(chrom, pos-1, pos)`.
-  ALT picking unchanged.
-- Validation gate: round-trip every emitted VCF through
-  `bcftools norm --check-ref e -f reference.fa` in CI on a small
-  batch. Currently this would fail at 100%.
+- ~~Load GRCh38 primary FASTA via `pysam.FastaFile`~~ — done.
+  New `syntheticgen/reference.py` module wraps loading +
+  validation; `--reference-fasta` cli flag added (also exposed
+  as `cohort.reference_fasta` in the YAML config).
+- ~~Replace `rng.choice("ACGT")` with FASTA lookup~~ — done.
+  All four REF-picking sites (`_tree_sequence_to_sites`,
+  `_tree_sequence_to_sites_meta`, `_stream_cohort_pass2`, and
+  the admixture inline producer) now go through a shared
+  `_pick_ref` helper that prefers the FASTA when provided,
+  falls back to `rng.choice` otherwise. The fallback path
+  preserves the legacy seed-stream behaviour for tests and
+  development runs that don't have a real FASTA.
+- ~~Validation gate~~ — Tier 1's REF-check passes end-to-end
+  when M12 wiring is correct. New
+  `tests/test_reference.py::ReferenceEndToEndTest` runs the
+  cli with a tiny synthetic FASTA and verifies every emitted
+  REF matches the FASTA at that POS.
+- **Rng-stream invariance**: `_pick_ref` always consumes one
+  `rng.choice("ACGT")` draw regardless of whether the FASTA
+  is used — so downstream rng consumers (overlay sampling,
+  error model, AC/AN-driven calls) see the same rng state in
+  both paths. Only the REF/ALT *content* of the variant changes
+  between the two paths; the simulation's overall rng
+  trajectory is identical.
+- **What this unblocks**: M14 (CpG-aware μ — needs real
+  trinucleotide context) and Tier 2 #5 (mutation spectrum —
+  needs real REF to bin into the 96 context channels). Both
+  are now mechanically actionable.
 
 ### M13 — Sex chromosomes & MT
 

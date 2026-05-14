@@ -37,3 +37,10 @@ psutil>=5.9
 # opt-in like pyarrow), so both are unconditional dependencies.
 pydantic>=2.0
 PyYAML>=6.0
+
+# M12 (real REF FASTA): pysam.FastaFile for memory-mapped reference
+# lookup. Optional — required only when --reference-fasta is passed.
+# Without it the cli falls back to the legacy fabricated-REF path
+# (rng.choice("ACGT")), which produces structurally-valid VCFs that
+# won't pass bcftools norm --check-ref. Install with:
+#     .venv/bin/pip install pysam

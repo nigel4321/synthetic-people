@@ -101,6 +101,20 @@
           "title": "N",
           "type": "integer"
         },
+        "reference_fasta": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "argparse_dest": "reference_fasta",
+          "default": null,
+          "description": "[M12] Path to the reference FASTA matching ``build``. When provided, REF bases are looked up from the FASTA instead of fabricated via ``rng.choice('ACGT')``, so emitted VCFs pass ``bcftools norm --check-ref``. Requires a ``.fai`` index next to the FASTA.",
+          "title": "Reference Fasta"
+        },
         "seed": {
           "anyOf": [
             {
@@ -488,6 +502,7 @@
         "chr_length_mb": 5.0,
         "chromosomes": "22",
         "n": 10,
+        "reference_fasta": null,
         "seed": null
       }
     },

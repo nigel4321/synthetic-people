@@ -148,7 +148,8 @@ def simulate_chromosome(chrom: str, build: str, n_people: int,
 
 def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
                             rng: random.Random,
-                            titv_target: float) -> list:
+                            titv_target: float,
+                            fasta=None) -> list:
     """Phase 5c: emits sparse carriers, matching coalescent.py.
 
     The admixture path uses BinaryMutationModel (only allele indices
@@ -171,7 +172,11 @@ def _tree_sequence_to_sites(ts, chrom: str, n_people: int,
         if nalt == 0 or nalt == n_haplotypes:
             continue
 
-        ref = rng.choice(("A", "C", "G", "T"))
+        # M12: real REF from FASTA when provided, else fabricated.
+        # ``_pick_ref`` from coalescent.py is shared so both
+        # producers use the same rng-consumption semantics.
+        from .coalescent import _pick_ref
+        ref = _pick_ref(rng, fasta, chrom, pos)
         alt = choose_alt(ref, rng, target=titv_target)
         assert alt is not None
 
