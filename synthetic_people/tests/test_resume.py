@@ -125,6 +125,28 @@ class ResumeFreshStartTest(unittest.TestCase):
         )
         self.assertEqual(r.sexes, ["m", "m", "m"])
 
+    def test_draw_sexes_unseeded_is_fresh_each_call(self):
+        # PR #96 review (Copilot): when seed is None the documented
+        # contract is "omit seed → fresh randomness each run". The
+        # prior implementation used ``(seed or 0) ^ salt`` which
+        # produced the SAME constant rng state for every unseeded
+        # run, so two unseeded runs would have identical sexes even
+        # though their samples + person_seeds (drawn from
+        # ``Random(None)``) would be fresh. Two unseeded calls must
+        # produce different sex lists.
+        #
+        # With n=20 and male_fraction=0.5, the false-positive rate
+        # for "two unseeded runs happen to give identical lists" is
+        # (1/2)**20 ≈ 1e-6 — not flaky in practice.
+        from syntheticgen.resume import _draw_sexes
+        a = _draw_sexes(None, 20, 0.5)
+        b = _draw_sexes(None, 20, 0.5)
+        self.assertNotEqual(a, b)
+        # And a sanity check: explicit int seeds still reproduce.
+        c = _draw_sexes(42, 20, 0.5)
+        d = _draw_sexes(42, 20, 0.5)
+        self.assertEqual(c, d)
+
     def test_sex_draws_do_not_advance_master_rng(self):
         # PR #95 review (Copilot): M13.1's load-bearing claim is that
         # adding sex assignment doesn't change the simulator's output

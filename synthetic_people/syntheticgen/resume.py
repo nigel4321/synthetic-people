@@ -84,19 +84,25 @@ def _draw_sexes(seed, n: int, male_fraction: float) -> list[str]:
     error model, etc.) and a fixed-seed run would no longer reproduce
     pre-M13.1 output.
 
-    We seed a dedicated ``random.Random`` deterministically from the
-    master seed (and a fixed salt so the sex rng never collides with
-    any other derived rng in this codebase). The master rng is
-    untouched.
+    Two paths, mirroring the master-rng's ``Random(seed)`` semantics
+    so the existing ``--seed`` contract is preserved:
 
-    Returns a list of ``"m"`` / ``"f"`` strings, deterministic given
-    ``(seed, n, male_fraction)``. When ``seed`` is None we fall back
-    to ``0`` so the sex draws stay reproducible across runs that omit
-    ``--seed`` (matching the existing "no-seed → constant rng state"
-    behaviour for those debug-only runs).
+    * **Integer seed**: dedicated ``random.Random(seed ^ salt)`` —
+      reproducible across runs at fixed seed; salted so the sex rng
+      never collides with the master rng or any other derived rng.
+    * **``seed=None``** (the documented "omit seed → fresh randomness
+      each run" path): unseeded ``random.Random()`` reading OS
+      entropy, matching what ``random.Random(None)`` does for samples
+      and person_seeds. A constant fallback here would force every
+      unseeded run to produce IDENTICAL sex assignments while samples
+      and person_seeds stayed fresh — an inconsistency PR #96 review
+      surfaced.
     """
     salt = 0x5E_5E_5E_5E  # arbitrary fixed salt — "SE" for "sex"
-    sex_rng = random.Random((seed or 0) ^ salt)
+    if seed is None:
+        sex_rng = random.Random()
+    else:
+        sex_rng = random.Random(seed ^ salt)
     return [
         "m" if sex_rng.random() < male_fraction else "f"
         for _ in range(n)
