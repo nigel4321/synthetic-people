@@ -34,9 +34,11 @@ GRCH38_CONTIG_LENGTHS = {
 # Coordinates are 1-based, inclusive of both endpoints. Sources:
 #   - GRCh37 / GRCh38: UCSC Table Browser ``par`` track + GRC
 #     authoritative coordinates published with each assembly.
-#   - GRCh38 PAR1 / PAR2 on chrX and chrY use IDENTICAL bp ranges
-#     because the Y-side PAR coordinates were aligned to the X-side
-#     in the GRCh38 assembly; this is a published feature of GRCh38.
+#   - On GRCh38, only PAR1 has matching bp ranges between chrX and
+#     chrY (both 10,001-2,781,479). PAR2 sits near the telomere of
+#     each chromosome and therefore lands at different bp on chrX
+#     (~155.7-156.0 Mb, near the end of the ~156 Mb chrX) vs chrY
+#     (~56.9-57.2 Mb, near the end of the ~57 Mb chrY).
 
 GRCH37_PAR_REGIONS = {
     "X": [(60_001, 2_699_520), (154_931_044, 155_260_560)],
@@ -120,18 +122,19 @@ def ploidy_for(
     """Return the ploidy of ``chrom`` for a person of the given sex.
 
     Sex must be ``"m"`` or ``"f"``. ``pos`` is only consulted for
-    chrX / chrY where PAR positions are diploid in both sexes but
-    non-PAR is haploid in males.
+    chrX (in males, to distinguish PAR from non-PAR) and chrY (in
+    males, same reason — chrY is absent in females regardless of
+    position).
 
     Return values:
 
-      * **2** — diploid (autosomes always; chrX in females; chrX/chrY
-        PAR positions in males when ``pos`` is supplied AND lands in
-        a PAR).
-      * **1** — haploid (chrX non-PAR in males; chrY non-PAR in males;
-        MT in everyone; chrX in males when ``pos`` is None because
-        the non-PAR is the dominant case).
-      * **0** — chromosome absent (chrY in females).
+      * **2** — diploid (autosomes always; chrX in females always;
+        chrX or chrY PAR positions in males when ``pos`` lands in
+        a PAR range).
+      * **1** — haploid (chrX non-PAR in males; chrY non-PAR in
+        males; MT in everyone; chrX in males when ``pos`` is None
+        because the non-PAR is the dominant case).
+      * **0** — chromosome absent (chrY in females, at any position).
 
     Unknown chroms default to **2** (defensive — a user-supplied
     custom contig shouldn't crash the simulator).

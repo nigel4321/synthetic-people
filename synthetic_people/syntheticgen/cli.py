@@ -2465,16 +2465,14 @@ def main(argv: list[str] | None = None) -> int:
     # depends only on its seed, and the seeds are sampled from the
     # master rng in a fixed order.
     person_seeds = [rng.randint(1, 2**31 - 1) for _ in range(args.n)]
-    # M13.1: per-person sex assignment, seed-driven Bernoulli on
-    # ``args.male_fraction``. Drawn here (not in workers) so it's
-    # deterministic regardless of --workers, same shape as
-    # person_seeds. M13.1 records sex in the manifest but doesn't
-    # yet change simulation behaviour — M13.3+ wires it through
-    # ploidy / PAR / MT clonality.
-    person_sexes = [
-        "m" if rng.random() < args.male_fraction else "f"
-        for _ in range(args.n)
-    ]
+    # M13.1: per-person sex assignment from a SEPARATE rng so the
+    # master rng state is unchanged. Drawing sex from ``rng`` here
+    # would shift every downstream consumer (overlay seeds, error
+    # model, etc.) and a fixed-seed run would no longer reproduce
+    # pre-M13.1 output. ``_draw_sexes`` is deterministic given
+    # ``(args.seed, args.n, args.male_fraction)``.
+    from .resume import _draw_sexes
+    person_sexes = _draw_sexes(args.seed, args.n, args.male_fraction)
 
     # Phase 5a: write the cohort BCF when --mode is `cohort` or `both`.
     # The BCF carries the truth-state cohort GTs (no per-call DP/GQ/AD

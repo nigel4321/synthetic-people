@@ -96,7 +96,7 @@
         "male_fraction": {
           "argparse_dest": "male_fraction",
           "default": 0.5,
-          "description": "[M13] Probability each person is drawn as male. ``0.5`` (default) = balanced cohort; ``0.2`` = ~20%% male, ~80%% female; ``0.8`` = ~80%% male. Real human births are ~0.51 male \u2014 close enough to 0.5 that the test-data tool defaults to exact balance. Config-only (no CLI flag): per-person sex assignment is recorded in ``manifest.json[people][i].sex`` (``\"m\"`` / ``\"f\"``).",
+          "description": "[M13] Probability each person is drawn as male. ``0.5`` (default) = balanced cohort; ``0.2`` = ~20% male, ~80% female; ``0.8`` = ~80% male. Real human births are ~0.51 male \u2014 close enough to 0.5 that the test-data tool defaults to exact balance. Config-only (no CLI flag): per-person sex assignment is recorded at the top level of ``manifest.json`` as ``sex: [\"m\", \"f\", ...]``, parallel-indexed to ``samples`` (works in all modes including cohort-only, where ``people`` is empty).",
           "maximum": 1.0,
           "minimum": 0.0,
           "title": "Male Fraction",

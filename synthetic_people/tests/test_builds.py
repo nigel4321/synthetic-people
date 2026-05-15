@@ -52,9 +52,12 @@ class IsInParTest(unittest.TestCase):
         self.assertFalse(is_in_par("X", 155_701_382, "GRCh38"))
 
     def test_chry_par_endpoints_grch38(self):
-        # GRCh38 has the special property that chrY PAR coordinates
-        # match chrX PAR coordinates exactly. Lock both ends of both
-        # PARs.
+        # On GRCh38, chrY PAR1 shares bp coordinates with chrX PAR1
+        # (both 10_001-2_781_479) — the PAR1 sequence is identical
+        # between the two chromosomes in the assembly. PAR2 sits at
+        # the end of each chromosome and therefore lands at
+        # different bp on the (shorter) chrY: 56_887_903-57_217_415,
+        # versus chrX's ~155.7-156.0 Mb. Lock both ends of both PARs.
         self.assertTrue(is_in_par("Y", 10_001, "GRCh38"))
         self.assertTrue(is_in_par("Y", 2_781_479, "GRCh38"))
         self.assertTrue(is_in_par("Y", 56_887_903, "GRCh38"))

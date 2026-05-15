@@ -125,6 +125,35 @@ class ResumeFreshStartTest(unittest.TestCase):
         )
         self.assertEqual(r.sexes, ["m", "m", "m"])
 
+    def test_sex_draws_do_not_advance_master_rng(self):
+        # PR #95 review (Copilot): M13.1's load-bearing claim is that
+        # adding sex assignment doesn't change the simulator's output
+        # at a fixed seed. That contract holds iff sex draws DON'T
+        # consume the master rng — otherwise overlay_seeds and every
+        # downstream rng consumer would shift relative to pre-M13.1.
+        #
+        # This test fingerprints the master rng's state after a
+        # load_or_create_meta call. The state must be byte-identical
+        # to drawing only samples + person_seeds + overlay_seeds
+        # (i.e. NOT advanced by the sex draws).
+        rng_with_sex = random.Random(42)
+        load_or_create_meta(
+            _args_ns(male_fraction=0.5), ["22"],
+            self.tmp / "a", rng_with_sex,
+        )
+
+        # Replay the exact same rng draws that load_or_create_meta
+        # makes from the master rng, EXCLUDING sex draws.
+        from syntheticgen.background import draw_sample_ids
+        rng_no_sex = random.Random(42)
+        _ = draw_sample_ids(3, rng_no_sex)
+        _ = [rng_no_sex.randint(1, 2**31 - 1) for _ in range(3)]
+        _ = rng_no_sex.randint(1, 2**31 - 1)  # overlay_seeds["22"]
+
+        # Both rngs must now produce the same next value — proves the
+        # sex draws didn't consume from the master rng.
+        self.assertEqual(rng_with_sex.random(), rng_no_sex.random())
+
 
 class ResumeMatchingParamsTest(unittest.TestCase):
     """An existing meta.json whose params match should be re-used and
@@ -181,6 +210,17 @@ class ResumeMismatchedParamsTest(unittest.TestCase):
         with self.assertRaises(ResumeMismatch):
             load_or_create_meta(
                 _args_ns(seed=42), ["22", "21"],
+                self.tmp, random.Random(0))
+
+    def test_male_fraction_mismatch_raises(self):
+        # PR #95 review (Copilot): male_fraction is now part of the
+        # resume identity. Changing it between runs must trigger
+        # ResumeMismatch — without this, the persisted ``sexes`` would
+        # silently be reused even though the new run intends a
+        # different sex composition.
+        with self.assertRaises(ResumeMismatch):
+            load_or_create_meta(
+                _args_ns(seed=42, male_fraction=0.8), ["22"],
                 self.tmp, random.Random(0))
 
     def test_force_fresh_wipes_existing_state(self):
