@@ -1078,6 +1078,30 @@ def _check_deps(verbose: bool = True) -> int:
     return 1 if missing_bins else 0
 
 
+def _male_fraction_arg(value: str) -> float:
+    """Argparse ``type=`` for ``--male-fraction``.
+
+    Mirrors the Pydantic ``CohortConfig.male_fraction`` constraint
+    (``ge=0.0, le=1.0``) so the CLI rejects out-of-range and non-
+    finite inputs (``-1``, ``2``, ``nan``, ``inf``) instead of
+    funnelling them into ``_draw_sexes`` and silently producing
+    all-male / all-female / NaN-degenerate cohorts.
+    """
+    try:
+        f = float(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"--male-fraction must be a float in [0.0, 1.0]; "
+            f"got {value!r}"
+        ) from exc
+    if not math.isfinite(f) or not 0.0 <= f <= 1.0:
+        raise argparse.ArgumentTypeError(
+            f"--male-fraction must be a finite float in [0.0, 1.0]; "
+            f"got {value!r}"
+        )
+    return f
+
+
 def _parser(script_dir: Path) -> argparse.ArgumentParser:
     default_bg = str(script_dir.parent / "ALL.chr*.phase3_*.genotypes.vcf.gz")
 
@@ -1154,10 +1178,12 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=None,
                    help="RNG seed for deterministic output. Omit for "
                         "different people each run.")
-    p.add_argument("--male-fraction", type=float, default=0.5,
+    p.add_argument("--male-fraction", type=_male_fraction_arg,
+                   default=0.5,
                    help="[M13] Probability each person is drawn as "
                         "male. 0.5 (default) = balanced cohort; 0.2 = "
                         "~20%% male, ~80%% female; 0.8 = ~80%% male. "
+                        "Must be a finite float in [0.0, 1.0]. "
                         "Mirrors the YAML field `cohort.male_fraction`. "
                         "Per-person sex assignment is recorded at the "
                         "top level of `manifest.json` as `sex: [\"m\", "
