@@ -345,11 +345,18 @@ emission) is the load-bearing simulator change.
   `cli.py` gains the matching `--male-fraction` flag; the two stay
   on par per the cli > config > defaults precedence the rest of
   the codebase already uses.
-- Per-person sex drawn once from the master rng in
-  `resume.load_or_create_meta`, persisted in `cohort.meta.json`
-  alongside `samples` / `person_seeds` (schema bumped to v2;
-  pre-existing meta files surface as `ResumeMismatch` and the
-  user runs `--no-resume` once to migrate).
+- Per-person sex drawn from a **dedicated** rng (`resume._draw_sexes`,
+  seeded from the master seed XOR'd with a fixed salt for integer
+  seeds; falls back to OS entropy when `--seed` is omitted). The
+  master rng is intentionally NOT advanced by the sex draw, so a
+  fixed `--seed` reproduces pre-M13.1 simulator output bit-for-bit
+  — only `manifest.json[sex]` is new. The drawn sexes are
+  persisted in `cohort.meta.json` alongside `samples` /
+  `person_seeds` (schema bumped to v2; pre-existing meta files
+  surface as `ResumeMismatch` and the user runs `--no-resume` once
+  to migrate). `male_fraction` is part of the resume-identity
+  param set so changing it between runs triggers `ResumeMismatch`
+  rather than silently reusing the persisted sexes.
 - Manifest carries a top-level `sex: ["m", "f", ...]` list
   parallel-indexed to `samples` in every mode (per-person,
   cohort, both, admixture).

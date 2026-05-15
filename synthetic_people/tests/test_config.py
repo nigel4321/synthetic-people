@@ -343,6 +343,25 @@ class MergePrecedenceTest(unittest.TestCase):
         merged, _ = self._run([])
         self.assertAlmostEqual(merged.male_fraction, 0.8)
 
+    def test_male_fraction_cli_rejects_out_of_range(self):
+        # PR #98 review (Copilot): Pydantic enforces ge=0.0/le=1.0
+        # on the YAML field, but the CLI's bare ``type=float`` was
+        # accepting nonsense values that flow into _draw_sexes and
+        # produce degenerate all-male / all-female / NaN cohorts.
+        # The custom ``type=_male_fraction_arg`` callable mirrors
+        # the Pydantic constraint.
+        for bad in ("-0.1", "1.5", "2", "-1", "nan", "inf", "-inf"):
+            with self.subTest(value=bad):
+                with self.assertRaises(SystemExit):
+                    self._run(["--male-fraction", bad])
+
+    def test_male_fraction_cli_accepts_boundary_values(self):
+        # Endpoints 0.0 and 1.0 are valid (ge / le, not gt / lt).
+        for ok in ("0.0", "0", "1.0", "1", "0.5"):
+            with self.subTest(value=ok):
+                merged, _ = self._run(["--male-fraction", ok])
+                self.assertAlmostEqual(merged.male_fraction, float(ok))
+
     def test_no_config_path_leaves_args_unchanged(self):
         # merge with config=None must be a no-op.
         from syntheticgen.config import merge_config_into_args
