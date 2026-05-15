@@ -1385,7 +1385,11 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
     p.add_argument("--check-deps", action="store_true",
                    help="Check htslib binaries and optional Python deps, "
                         "then exit")
-    p.set_defaults(_default_bg=default_bg)
+    # M13: ``cohort.male_fraction`` is config-only (no CLI flag) but
+    # the merge_config_into_args layer requires args.male_fraction to
+    # exist as a hook for the YAML value to write into. set_defaults
+    # populates it without adding a flag visible in --help.
+    p.set_defaults(_default_bg=default_bg, male_fraction=0.5)
     return p
 
 
@@ -1835,6 +1839,8 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
             "chromosomes": chromosomes,
             "seed": args.seed,
             "samples": sample_ids,
+            # M13.1: per-person sex, parallel-indexed to ``samples``.
+            "sex": resume.sexes,
             "cohort_bcfs": cohort_bcf_rels,
         }
         if overlay_block is not None:
@@ -2039,6 +2045,8 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
         "chromosomes": chromosomes,
         "seed": args.seed,
         "samples": sample_ids,
+        # M13.1: per-person sex, parallel-indexed to ``samples``.
+        "sex": resume.sexes,
         "people": manifest_people,
     }
     # cohort BCFs always present in the streamed path (5b2 derives
@@ -2457,6 +2465,16 @@ def main(argv: list[str] | None = None) -> int:
     # depends only on its seed, and the seeds are sampled from the
     # master rng in a fixed order.
     person_seeds = [rng.randint(1, 2**31 - 1) for _ in range(args.n)]
+    # M13.1: per-person sex assignment, seed-driven Bernoulli on
+    # ``args.male_fraction``. Drawn here (not in workers) so it's
+    # deterministic regardless of --workers, same shape as
+    # person_seeds. M13.1 records sex in the manifest but doesn't
+    # yet change simulation behaviour — M13.3+ wires it through
+    # ploidy / PAR / MT clonality.
+    person_sexes = [
+        "m" if rng.random() < args.male_fraction else "f"
+        for _ in range(args.n)
+    ]
 
     # Phase 5a: write the cohort BCF when --mode is `cohort` or `both`.
     # The BCF carries the truth-state cohort GTs (no per-call DP/GQ/AD
@@ -2533,6 +2551,8 @@ def main(argv: list[str] | None = None) -> int:
             "chromosomes": chromosomes,
             "seed": args.seed,
             "samples": sample_ids,
+            # M13.1: per-person sex, parallel-indexed to ``samples``.
+            "sex": person_sexes,
             "cohort_bcfs": [
                 str(cohort_bcf_path.relative_to(args.output_dir))
             ],
@@ -2691,6 +2711,15 @@ def main(argv: list[str] | None = None) -> int:
         # `samples`; per-person/both used to require iterating
         # `people[*].sample_id`).
         "samples": sample_ids,
+        # M13.1: per-person sex assignment, parallel-indexed to
+        # ``samples`` (i.e. ``sex[i]`` is the sex of ``samples[i]``).
+        # Top-level rather than per-person so the field is available
+        # in cohort-only mode where ``people`` is empty. Each entry
+        # is ``"m"`` or ``"f"``. The simulation itself doesn't yet
+        # use this (M13.3+ wires ploidy / PAR / MT clonality through)
+        # — but it's recorded now so consumers can already reason
+        # about the cohort's sex composition.
+        "sex": person_sexes,
         "people": manifest_people,
     }
     if cohort_bcf_path is not None:

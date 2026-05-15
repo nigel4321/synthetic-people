@@ -119,6 +119,20 @@ def _models():
             ),
             json_schema_extra={"argparse_dest": "reference_fasta"},
         )
+        male_fraction: float = Field(
+            default=0.5, ge=0.0, le=1.0,
+            description=(
+                "[M13] Probability each person is drawn as male. "
+                "``0.5`` (default) = balanced cohort; ``0.2`` = ~20%% "
+                "male, ~80%% female; ``0.8`` = ~80%% male. Real human "
+                "births are ~0.51 male — close enough to 0.5 that the "
+                "test-data tool defaults to exact balance. "
+                "Config-only (no CLI flag): per-person sex assignment "
+                "is recorded in ``manifest.json[people][i].sex`` "
+                "(``\"m\"`` / ``\"f\"``)."
+            ),
+            json_schema_extra={"argparse_dest": "male_fraction"},
+        )
 
     class SimulationConfig(_Strict):
         demo_model: str = Field(

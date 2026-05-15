@@ -55,6 +55,10 @@ def _args_ns(**overrides):
         seed=42, n=3, build="GRCh38",
         chr_length_mb=0.2, demo_model="none", population="CEU",
         rec_rate=1e-8, mu=1.29e-8,
+        # M13.1: load_or_create_meta uses ``args.male_fraction`` to
+        # draw per-person sexes alongside person_seeds. Match the
+        # production default so the fixture stays representative.
+        male_fraction=0.5,
     )
     base.update(overrides)
     return types.SimpleNamespace(**base)
@@ -82,9 +86,13 @@ class ResumeFreshStartTest(unittest.TestCase):
         self.assertEqual(payload["completed_chromosomes"], [])
         self.assertEqual(len(payload["samples"]), 3)
         self.assertEqual(len(payload["person_seeds"]), 3)
+        # M13.1: sexes persisted alongside samples, same cardinality.
+        self.assertEqual(len(payload["sexes"]), 3)
+        self.assertTrue(all(s in ("m", "f") for s in payload["sexes"]))
         self.assertEqual(set(payload["overlay_seeds"]), {"22"})
         # Returned object reflects the persisted state.
         self.assertEqual(r.samples, payload["samples"])
+        self.assertEqual(r.sexes, payload["sexes"])
 
     def test_seeds_are_deterministic_at_fixed_seed(self):
         a = load_or_create_meta(_args_ns(), ["22"],
@@ -93,7 +101,29 @@ class ResumeFreshStartTest(unittest.TestCase):
                                 self.tmp / "b", random.Random(42))
         self.assertEqual(a.samples, b.samples)
         self.assertEqual(a.person_seeds, b.person_seeds)
+        # M13.1: sexes must also be deterministic at fixed seed —
+        # they come from the same master rng as samples/person_seeds.
+        self.assertEqual(a.sexes, b.sexes)
         self.assertEqual(a.overlay_seeds, b.overlay_seeds)
+
+    def test_male_fraction_zero_yields_all_female(self):
+        # M13.1 sanity: male_fraction=0.0 must produce all "f".
+        # Defends against a polarity flip (e.g. someone interpreting
+        # the field as P(female) instead of P(male)) — a real risk
+        # because "sex ratio" is ambiguous in nature; the field name
+        # `male_fraction` and these tests pin the convention.
+        r = load_or_create_meta(
+            _args_ns(male_fraction=0.0), ["22"],
+            self.tmp, random.Random(42),
+        )
+        self.assertEqual(r.sexes, ["f", "f", "f"])
+
+    def test_male_fraction_one_yields_all_male(self):
+        r = load_or_create_meta(
+            _args_ns(male_fraction=1.0), ["22"],
+            self.tmp, random.Random(42),
+        )
+        self.assertEqual(r.sexes, ["m", "m", "m"])
 
 
 class ResumeMatchingParamsTest(unittest.TestCase):
@@ -122,6 +152,8 @@ class ResumeMatchingParamsTest(unittest.TestCase):
             _args_ns(), ["22", "21"], self.tmp, ExplodingRng())
         self.assertEqual(second.samples, first.samples)
         self.assertEqual(second.person_seeds, first.person_seeds)
+        # M13.1: sexes also round-trip via the persisted meta.
+        self.assertEqual(second.sexes, first.sexes)
         self.assertEqual(second.overlay_seeds, first.overlay_seeds)
         self.assertEqual(second.completed_chromosomes, ["22"])
 

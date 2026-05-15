@@ -37,7 +37,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-_SCHEMA_VERSION = 1
+# Schema version 2 (2026-05-15): added ``sexes`` for M13.1 per-person
+# sex assignment. Schema-version 1 meta files surface as
+# ResumeMismatch — the user runs once with --no-resume to migrate.
+_SCHEMA_VERSION = 2
 
 
 def _params_for(args, chromosomes: list) -> dict:
@@ -73,6 +76,10 @@ class Resume:
     samples: list
     person_seeds: list
     overlay_seeds: dict       # chrom -> int
+    # M13.1: per-person sex assignment, parallel-indexed to ``samples``.
+    # Persisted so a resumed run sees the same sexes the original run
+    # drew, same contract as person_seeds.
+    sexes: list = field(default_factory=list)
     completed_chromosomes: list = field(default_factory=list)
 
     def is_chromosome_done(self, chrom: str) -> bool:
@@ -90,6 +97,7 @@ class Resume:
             "params": self.params,
             "samples": self.samples,
             "person_seeds": self.person_seeds,
+            "sexes": self.sexes,
             "overlay_seeds": self.overlay_seeds,
             "completed_chromosomes": self.completed_chromosomes,
         }
@@ -171,6 +179,7 @@ def load_or_create_meta(args, chromosomes: list, cohort_dir: Path,
             params=payload["params"],
             samples=payload["samples"],
             person_seeds=payload["person_seeds"],
+            sexes=payload["sexes"],
             overlay_seeds=payload["overlay_seeds"],
             completed_chromosomes=payload.get(
                 "completed_chromosomes", []),
@@ -180,6 +189,14 @@ def load_or_create_meta(args, chromosomes: list, cohort_dir: Path,
     from .background import draw_sample_ids   # local import; avoids cycle
     samples = draw_sample_ids(args.n, rng)
     person_seeds = [rng.randint(1, 2**31 - 1) for _ in range(args.n)]
+    # M13.1: draw sex per person. ``args.male_fraction`` is populated
+    # via the config-only ``cohort.male_fraction`` field (default 0.5).
+    # Drawn from the master rng at the same depth as person_seeds so
+    # the consumption order is stable across resumes.
+    sexes = [
+        "m" if rng.random() < args.male_fraction else "f"
+        for _ in range(args.n)
+    ]
     overlay_seeds = {
         chrom: rng.randint(1, 2**31 - 1)
         for chrom in chromosomes
@@ -189,6 +206,7 @@ def load_or_create_meta(args, chromosomes: list, cohort_dir: Path,
         params=_params_for(args, chromosomes),
         samples=samples,
         person_seeds=person_seeds,
+        sexes=sexes,
         overlay_seeds=overlay_seeds,
         completed_chromosomes=[],
     )

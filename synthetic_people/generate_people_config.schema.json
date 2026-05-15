@@ -93,6 +93,15 @@
           "title": "Chromosomes",
           "type": "string"
         },
+        "male_fraction": {
+          "argparse_dest": "male_fraction",
+          "default": 0.5,
+          "description": "[M13] Probability each person is drawn as male. ``0.5`` (default) = balanced cohort; ``0.2`` = ~20%% male, ~80%% female; ``0.8`` = ~80%% male. Real human births are ~0.51 male \u2014 close enough to 0.5 that the test-data tool defaults to exact balance. Config-only (no CLI flag): per-person sex assignment is recorded in ``manifest.json[people][i].sex`` (``\"m\"`` / ``\"f\"``).",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Male Fraction",
+          "type": "number"
+        },
         "n": {
           "argparse_dest": "n",
           "default": 10,
@@ -501,6 +510,7 @@
         "build": "GRCh38",
         "chr_length_mb": 5.0,
         "chromosomes": "22",
+        "male_fraction": 0.5,
         "n": 10,
         "reference_fasta": null,
         "seed": null

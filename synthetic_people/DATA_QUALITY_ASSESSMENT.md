@@ -315,14 +315,76 @@ chronologically.
 
 ### M13 — Sex chromosomes & MT
 
-- New `--sex` flag (`m`, `f`, or per-person draws).
-- Per-person ploidy table; X non-PAR is haploid in males, Y is
-  haploid in males and absent in females, MT is haploid and
-  clonally inherited from a maternal-line sample.
-- PAR1 / PAR2 simulated as a single template and copied to both X
-  and Y in males.
-- New validation gates: Y heterozygosity ≈ 0 in males, female Y
-  absence, MT GT homogeneity.
+Decomposed into sub-milestones M13.1 – M13.5 so each lands as a
+focused PR. M13.1 (foundation) is the first; M13.3 (haploid
+emission) is the load-bearing simulator change.
+
+**Design decisions recorded here:**
+
+- **No CLI flag for sex.** Earlier drafts proposed `--sex` (`m`,
+  `f`, or per-person draws); dropped in favour of config-only
+  `cohort.male_fraction` (default 0.5). Rationale: less
+  configuration surface area; sex assignment is purely seed-
+  driven and inspectable in `manifest.json`. A CLI flag can be
+  added later if a real use case needs deterministic per-cohort
+  sex composition.
+- **Field name `male_fraction`** rather than the ambiguous
+  `sex_ratio`. `0.2` unambiguously means "20 % male, 80 % female".
+  Pinned by tests in `test_resume.py` so a future polarity flip
+  would surface as a test failure.
+
+#### M13.1 — Foundation **shipped 2026-05-15**
+
+- `builds.py` gains PAR1/PAR2 coordinate tables (GRCh37 + GRCh38)
+  and the `ploidy_for(chrom, sex, build, pos)` /
+  `is_in_par(chrom, pos, build)` helpers — the lookups M13.3+
+  will use at every chrX/chrY variant.
+- `config.py` gains `cohort.male_fraction` (config-only field,
+  no CLI flag; default 0.5).
+- Per-person sex drawn once from the master rng in
+  `resume.load_or_create_meta`, persisted in `cohort.meta.json`
+  alongside `samples` / `person_seeds` (schema bumped to v2;
+  pre-existing meta files surface as `ResumeMismatch` and the
+  user runs `--no-resume` once to migrate).
+- Manifest carries a top-level `sex: ["m", "f", ...]` list
+  parallel-indexed to `samples` in every mode (per-person,
+  cohort, both, admixture).
+- **No behaviour change in simulation yet.** Sex is recorded
+  but the simulator continues to treat every chromosome as
+  diploid. M13.3 wires the ploidy lookup into the producers.
+
+#### M13.2 — Validation gates ⏳
+
+Tier-1-first pattern: ship the validators before the simulator
+change so they're the empirical gate when M13.3+ lands.
+
+- Y heterozygosity ≈ 0 in males (any non-PAR Y position with a
+  heterozygous GT in a male is a regression).
+- Female Y absence (no chrY records in female VCFs).
+- MT GT homogeneity (every MT call should be `0` / `1` — never
+  `0|1`-style heterozygous).
+
+#### M13.3 — Haploid emission ⏳
+
+- Producers (materialised + streamed + admixture) read ploidy
+  via `ploidy_for(chrom, sex, build, pos)` and emit single-
+  allele GTs (`"0"` / `"1"`) on haploid positions.
+- Cohort site shape carries ploidy; writers emit haploid GT in
+  BCF + VCF formats.
+
+#### M13.4 — PAR1/PAR2 copy mechanism ⏳
+
+- Simulate PAR regions on chrX coordinates only; materialize
+  identical variants on chrY at the matching coordinates in
+  males. Ensures PAR positions stay consistent between the
+  two chromosomes the way they would in real meiosis.
+
+#### M13.5 — MT clonal inheritance ⏳
+
+- Maternal-lineage concept (every person has a `mt_lineage_id`
+  drawn at cohort setup time); MT sequence is shared within a
+  lineage. Today's coalescent simulates MT independently per
+  sample, which is wrong.
 
 ### M14 — Realistic mutation & recombination
 

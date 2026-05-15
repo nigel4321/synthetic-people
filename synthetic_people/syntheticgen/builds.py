@@ -23,6 +23,31 @@ GRCH38_CONTIG_LENGTHS = {
     "MT": 16569,
 }
 
+# M13: pseudoautosomal region (PAR) coordinates per build. The two
+# PARs (PAR1 at the chr telomere, PAR2 at the opposite end) are
+# regions where chrX and chrY share IDENTICAL sequence and recombine
+# in male meiosis just like autosomes — hence "pseudo-autosomal".
+# Outside the PARs, chrX non-PAR is X-only haploid in males and
+# diploid in females; chrY non-PAR is Y-only haploid in males and
+# absent in females.
+#
+# Coordinates are 1-based, inclusive of both endpoints. Sources:
+#   - GRCh37 / GRCh38: UCSC Table Browser ``par`` track + GRC
+#     authoritative coordinates published with each assembly.
+#   - GRCh38 PAR1 / PAR2 on chrX and chrY use IDENTICAL bp ranges
+#     because the Y-side PAR coordinates were aligned to the X-side
+#     in the GRCh38 assembly; this is a published feature of GRCh38.
+
+GRCH37_PAR_REGIONS = {
+    "X": [(60_001, 2_699_520), (154_931_044, 155_260_560)],
+    "Y": [(10_001, 2_649_520), (59_034_050, 59_363_566)],
+}
+
+GRCH38_PAR_REGIONS = {
+    "X": [(10_001, 2_781_479), (155_701_383, 156_030_895)],
+    "Y": [(10_001, 2_781_479), (56_887_903, 57_217_415)],
+}
+
 BUILDS = {
     "GRCh37": {
         "assembly": "GRCh37",
@@ -46,6 +71,7 @@ BUILDS = {
             "Homo_sapiens.GRCh37.dna.primary_assembly.fa.gz"
         ),
         "contigs": GRCH37_CONTIG_LENGTHS,
+        "par_regions": GRCH37_PAR_REGIONS,
     },
     "GRCh38": {
         "assembly": "GRCh38",
@@ -60,5 +86,83 @@ BUILDS = {
             "Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz"
         ),
         "contigs": GRCH38_CONTIG_LENGTHS,
+        "par_regions": GRCH38_PAR_REGIONS,
     },
 }
+
+
+# M13: per-chromosome ploidy lookup. Reads PAR regions from BUILDS
+# so a future build addition (e.g. CHM13) only needs the data; the
+# logic here doesn't change.
+
+_AUTOSOMES = frozenset({str(i) for i in range(1, 23)})
+
+
+def is_in_par(chrom: str, pos: int, build: str) -> bool:
+    """True iff ``pos`` (1-based) on ``chrom`` falls inside a PAR.
+
+    Only chrX / chrY have PARs; returns False for any other chrom.
+    The PAR ranges in BUILDS are inclusive of both endpoints.
+    """
+    if chrom not in ("X", "Y"):
+        return False
+    par_regions = BUILDS.get(build, {}).get("par_regions", {})
+    for lo, hi in par_regions.get(chrom, []):
+        if lo <= pos <= hi:
+            return True
+    return False
+
+
+def ploidy_for(
+    chrom: str, sex: str, build: str = "GRCh38",
+    pos: int | None = None,
+) -> int:
+    """Return the ploidy of ``chrom`` for a person of the given sex.
+
+    Sex must be ``"m"`` or ``"f"``. ``pos`` is only consulted for
+    chrX / chrY where PAR positions are diploid in both sexes but
+    non-PAR is haploid in males.
+
+    Return values:
+
+      * **2** — diploid (autosomes always; chrX in females; chrX/chrY
+        PAR positions in males when ``pos`` is supplied AND lands in
+        a PAR).
+      * **1** — haploid (chrX non-PAR in males; chrY non-PAR in males;
+        MT in everyone; chrX in males when ``pos`` is None because
+        the non-PAR is the dominant case).
+      * **0** — chromosome absent (chrY in females).
+
+    Unknown chroms default to **2** (defensive — a user-supplied
+    custom contig shouldn't crash the simulator).
+
+    When ``pos`` is None for chrX/chrY, returns the **non-PAR**
+    ploidy. Callers that care about PAR semantics MUST pass ``pos``.
+    """
+    if sex not in ("m", "f"):
+        raise ValueError(
+            f"ploidy_for: sex must be 'm' or 'f', got {sex!r}",
+        )
+    if chrom in _AUTOSOMES:
+        return 2
+    if chrom == "MT":
+        return 1
+    if chrom == "X":
+        if sex == "f":
+            return 2
+        # Male X: PAR diploid, non-PAR haploid. Without a position
+        # we conservatively return the non-PAR answer (1) — callers
+        # that need PAR semantics MUST pass pos.
+        if pos is not None and is_in_par("X", pos, build):
+            return 2
+        return 1
+    if chrom == "Y":
+        if sex == "f":
+            return 0
+        # Male Y: same PAR / non-PAR split as X.
+        if pos is not None and is_in_par("Y", pos, build):
+            return 2
+        return 1
+    # Unknown chrom — default to autosomal diploid to avoid breaking
+    # the simulator on custom contigs.
+    return 2
