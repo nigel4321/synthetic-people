@@ -126,12 +126,14 @@ def _models():
                 "``0.5`` (default) = balanced cohort; ``0.2`` = ~20% "
                 "male, ~80% female; ``0.8`` = ~80% male. Real human "
                 "births are ~0.51 male — close enough to 0.5 that the "
-                "test-data tool defaults to exact balance. "
-                "Config-only (no CLI flag): per-person sex assignment "
-                "is recorded at the top level of ``manifest.json`` as "
-                "``sex: [\"m\", \"f\", ...]``, parallel-indexed to "
-                "``samples`` (works in all modes including cohort-only, "
-                "where ``people`` is empty)."
+                "test-data tool defaults to exact balance. Equivalent "
+                "to the ``--male-fraction`` CLI flag; CLI wins on "
+                "conflict per the standard cli > config > defaults "
+                "precedence. Per-person sex assignment is recorded at "
+                "the top level of ``manifest.json`` as ``sex: [\"m\", "
+                "\"f\", ...]``, parallel-indexed to ``samples`` (works "
+                "in all modes including cohort-only, where ``people`` "
+                "is empty)."
             ),
             json_schema_extra={"argparse_dest": "male_fraction"},
         )

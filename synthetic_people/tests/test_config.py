@@ -312,6 +312,37 @@ class MergePrecedenceTest(unittest.TestCase):
         merged, _ = self._run([])
         self.assertEqual(merged.build, "GRCh38")
 
+    def test_male_fraction_default_when_neither_cli_nor_config(self):
+        # M13.1: --male-fraction defaults to 0.5 when absent from
+        # both the CLI and the config. Pins the cli > config >
+        # defaults precedence for this field.
+        merged, _ = self._run([])
+        self.assertEqual(merged.male_fraction, 0.5)
+
+    def test_male_fraction_cli_flag_sets_args(self):
+        # The CLI flag should land in args.male_fraction as a float.
+        merged, explicit = self._run(["--male-fraction", "0.2"])
+        self.assertAlmostEqual(merged.male_fraction, 0.2)
+        self.assertIn("male_fraction", explicit)
+
+    def test_male_fraction_cli_overrides_config(self):
+        # Write a config that sets male_fraction, then pass a
+        # different value on the CLI — CLI wins.
+        self.path.write_text(
+            "schema_version: 1\n"
+            "cohort:\n  n: 3000\n  seed: 42\n  male_fraction: 0.8\n"
+        )
+        merged, _ = self._run(["--male-fraction", "0.2"])
+        self.assertAlmostEqual(merged.male_fraction, 0.2)
+
+    def test_male_fraction_config_used_when_no_cli(self):
+        self.path.write_text(
+            "schema_version: 1\n"
+            "cohort:\n  n: 3000\n  seed: 42\n  male_fraction: 0.8\n"
+        )
+        merged, _ = self._run([])
+        self.assertAlmostEqual(merged.male_fraction, 0.8)
+
     def test_no_config_path_leaves_args_unchanged(self):
         # merge with config=None must be a no-op.
         from syntheticgen.config import merge_config_into_args

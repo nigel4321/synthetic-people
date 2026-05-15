@@ -1154,6 +1154,14 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
     p.add_argument("--seed", type=int, default=None,
                    help="RNG seed for deterministic output. Omit for "
                         "different people each run.")
+    p.add_argument("--male-fraction", type=float, default=0.5,
+                   help="[M13] Probability each person is drawn as "
+                        "male. 0.5 (default) = balanced cohort; 0.2 = "
+                        "~20%% male, ~80%% female; 0.8 = ~80%% male. "
+                        "Mirrors the YAML field `cohort.male_fraction`. "
+                        "Per-person sex assignment is recorded at the "
+                        "top level of `manifest.json` as `sex: [\"m\", "
+                        "\"f\", ...]`, parallel-indexed to `samples`.")
     p.add_argument("--background-glob", action="append", default=None,
                    help="[legacy] Glob(s) for common-variant source VCFs. "
                         "Pass multiple times to combine sources. "
@@ -1385,11 +1393,7 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
     p.add_argument("--check-deps", action="store_true",
                    help="Check htslib binaries and optional Python deps, "
                         "then exit")
-    # M13: ``cohort.male_fraction`` is config-only (no CLI flag) but
-    # the merge_config_into_args layer requires args.male_fraction to
-    # exist as a hook for the YAML value to write into. set_defaults
-    # populates it without adding a flag visible in --help.
-    p.set_defaults(_default_bg=default_bg, male_fraction=0.5)
+    p.set_defaults(_default_bg=default_bg)
     return p
 
 

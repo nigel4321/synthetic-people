@@ -321,17 +321,19 @@ emission) is the load-bearing simulator change.
 
 **Design decisions recorded here:**
 
-- **No CLI flag for sex.** Earlier drafts proposed `--sex` (`m`,
-  `f`, or per-person draws); dropped in favour of config-only
-  `cohort.male_fraction` (default 0.5). Rationale: less
-  configuration surface area; sex assignment is purely seed-
-  driven and inspectable in `manifest.json`. A CLI flag can be
-  added later if a real use case needs deterministic per-cohort
-  sex composition.
 - **Field name `male_fraction`** rather than the ambiguous
   `sex_ratio`. `0.2` unambiguously means "20 % male, 80 % female".
   Pinned by tests in `test_resume.py` so a future polarity flip
   would surface as a test failure.
+- **`--sex` flag rejected** in favour of `--male-fraction` (and the
+  matching YAML field `cohort.male_fraction`, default 0.5). The
+  CLI + config stay on par with every other cohort setup parameter
+  in the codebase, so users can switch between YAML-driven and
+  flag-driven workflows without surprises. Rationale for not
+  exposing per-person sex assignment via the CLI: sex is purely
+  seed-driven and inspectable in `manifest.json`, so a "set this
+  specific person to male" knob isn't needed today; if a use case
+  surfaces (e.g. M18 trios), it can be added then.
 
 #### M13.1 — Foundation **shipped 2026-05-15**
 
@@ -339,8 +341,10 @@ emission) is the load-bearing simulator change.
   and the `ploidy_for(chrom, sex, build, pos)` /
   `is_in_par(chrom, pos, build)` helpers — the lookups M13.3+
   will use at every chrX/chrY variant.
-- `config.py` gains `cohort.male_fraction` (config-only field,
-  no CLI flag; default 0.5).
+- `config.py` gains `cohort.male_fraction` (default 0.5) and
+  `cli.py` gains the matching `--male-fraction` flag; the two stay
+  on par per the cli > config > defaults precedence the rest of
+  the codebase already uses.
 - Per-person sex drawn once from the master rng in
   `resume.load_or_create_meta`, persisted in `cohort.meta.json`
   alongside `samples` / `person_seeds` (schema bumped to v2;
