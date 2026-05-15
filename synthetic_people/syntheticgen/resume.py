@@ -64,7 +64,43 @@ def _params_for(args, chromosomes: list) -> dict:
         "population": args.population,
         "rec_rate": args.rec_rate,
         "mu": args.mu,
+        # M13.1: male_fraction is part of the cohort identity — changing
+        # it between runs would silently reuse the old sex assignments
+        # from the persisted meta. Surfacing it here triggers
+        # ResumeMismatch when it changes, forcing the user to consciously
+        # choose --no-resume.
+        "male_fraction": args.male_fraction,
     }
+
+
+def _draw_sexes(seed, n: int, male_fraction: float) -> list[str]:
+    """Draw ``n`` per-person sex assignments without consuming the
+    master rng.
+
+    M13.1 contract: M13.1 records per-person sex but does not change
+    any simulation behaviour at the same ``--seed``. To honour that,
+    sex draws must NOT advance the master rng — doing so would shift
+    every downstream rng consumer (overlay seeds, per-chrom seeds,
+    error model, etc.) and a fixed-seed run would no longer reproduce
+    pre-M13.1 output.
+
+    We seed a dedicated ``random.Random`` deterministically from the
+    master seed (and a fixed salt so the sex rng never collides with
+    any other derived rng in this codebase). The master rng is
+    untouched.
+
+    Returns a list of ``"m"`` / ``"f"`` strings, deterministic given
+    ``(seed, n, male_fraction)``. When ``seed`` is None we fall back
+    to ``0`` so the sex draws stay reproducible across runs that omit
+    ``--seed`` (matching the existing "no-seed → constant rng state"
+    behaviour for those debug-only runs).
+    """
+    salt = 0x5E_5E_5E_5E  # arbitrary fixed salt — "SE" for "sex"
+    sex_rng = random.Random((seed or 0) ^ salt)
+    return [
+        "m" if sex_rng.random() < male_fraction else "f"
+        for _ in range(n)
+    ]
 
 
 @dataclass
@@ -189,14 +225,11 @@ def load_or_create_meta(args, chromosomes: list, cohort_dir: Path,
     from .background import draw_sample_ids   # local import; avoids cycle
     samples = draw_sample_ids(args.n, rng)
     person_seeds = [rng.randint(1, 2**31 - 1) for _ in range(args.n)]
-    # M13.1: draw sex per person. ``args.male_fraction`` is populated
-    # via the config-only ``cohort.male_fraction`` field (default 0.5).
-    # Drawn from the master rng at the same depth as person_seeds so
-    # the consumption order is stable across resumes.
-    sexes = [
-        "m" if rng.random() < args.male_fraction else "f"
-        for _ in range(args.n)
-    ]
+    # M13.1: sexes are drawn from a SEPARATE rng (see ``_draw_sexes``).
+    # Drawing from ``rng`` here would advance the master rng state and
+    # shift every downstream consumer, breaking the "no simulation
+    # change at fixed seed" contract.
+    sexes = _draw_sexes(args.seed, args.n, args.male_fraction)
     overlay_seeds = {
         chrom: rng.randint(1, 2**31 - 1)
         for chrom in chromosomes
