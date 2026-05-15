@@ -26,6 +26,7 @@ vector can be sourced carefully (see
 
 from __future__ import annotations
 
+import collections
 import subprocess
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -33,6 +34,11 @@ from pathlib import Path
 from typing import Any
 
 from .reference import fetch_ref_base
+
+
+# Bounded stderr tail kept from ``bcftools query`` for diagnostics on
+# non-zero exit. Same convention as ``validate.py``'s ref-check gate.
+_BCFTOOLS_STDERR_TAIL_LINES = 200
 
 
 # ---------------------------------------------------------------------------
@@ -138,42 +144,39 @@ def _iter_snv_loci(
 ) -> Iterator[tuple[str, int, str, str]]:
     """Yield ``(chrom, pos, ref, alt)`` for every biallelic SNV.
 
-    Filters at the bcftools layer: ``-v snps`` keeps SNVs, ``-m2 -M2``
-    restricts to biallelic. Multi-allelic SNVs are dropped because the
-    spectrum is defined per (ref, alt) pair and a biallelic-only view
-    is what every published signature vector uses.
+    Filters at the bcftools-query layer with an include expression:
+    ``-i 'TYPE="snp" && N_ALT=1'`` keeps only biallelic SNVs. A single
+    subprocess (rather than a ``bcftools view | bcftools query`` pipe)
+    means one stderr stream + one return code to manage — eliminates
+    the deadlock risk of a two-process pipeline where the upstream
+    proc blocks on a full stderr buffer while we're consuming
+    downstream stdout.
 
-    Indels and SVs are filtered by bcftools too, but we also defensively
-    skip any row whose REF or ALT isn't a single base (e.g. a passed-
-    through deletion that bcftools' SNV filter let slip).
+    Indels, SVs, and multi-allelic SNVs are filtered by bcftools, but
+    we also defensively skip any row whose REF or ALT isn't a single
+    base (e.g. a passed-through deletion that the filter let slip).
+
+    Raises ``RuntimeError`` if ``bcftools query`` exits non-zero
+    (e.g. corrupt BCF, missing index, bad input format) with a
+    bounded stderr tail in the message — fail-fast rather than
+    silently producing an empty spectrum.
     """
     cmd = [
-        "bcftools", "view",
-        "-v", "snps",
-        "-m2", "-M2",
+        "bcftools", "query",
+        "-i", 'TYPE="snp" && N_ALT=1',
+        "-f", "%CHROM\t%POS\t%REF\t%ALT\n",
         str(vcf_path),
     ]
-    query_cmd = [
-        "bcftools", "query",
-        "-f", "%CHROM\t%POS\t%REF\t%ALT\n",
-    ]
-    # Pipeline: bcftools view → bcftools query, so we never materialise
-    # the full filtered VCF in Python. stderr is suppressed because
-    # bcftools view prints an informational header line on success that
-    # we don't need to relay.
-    view_proc = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-    )
-    query_proc = subprocess.Popen(
-        query_cmd, stdin=view_proc.stdout,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True,
     )
-    assert view_proc.stdout is not None
-    view_proc.stdout.close()  # let view receive SIGPIPE if query exits early
+    stderr_tail: collections.deque[str] = collections.deque(
+        maxlen=_BCFTOOLS_STDERR_TAIL_LINES,
+    )
     try:
-        assert query_proc.stdout is not None
-        for line in query_proc.stdout:
+        assert proc.stdout is not None
+        for line in proc.stdout:
             parts = line.rstrip("\n").split("\t")
             if len(parts) != 4:
                 continue
@@ -189,8 +192,21 @@ def _iter_snv_loci(
                 continue
             yield chrom, pos, ref, alt
     finally:
-        query_proc.wait()
-        view_proc.wait()
+        # Drain stderr after stdout is exhausted (or the iterator was
+        # abandoned). Under normal operation bcftools query writes
+        # nothing to stderr, so this loop is empty and no buffer-
+        # fill deadlock is possible in practice. On error, stderr
+        # holds the diagnostic message that became the RuntimeError
+        # below.
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            stderr_tail.append(line)
+        proc.wait()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"bcftools query exited {proc.returncode} on {vcf_path}: "
+            f"{''.join(stderr_tail).strip()[-1500:] or '(no stderr)'}"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -39,6 +39,13 @@ from syntheticgen.mutation_spectrum import (  # noqa: E402
 
 _HAVE_PYSAM = importlib.util.find_spec("pysam") is not None
 _HAVE_BCFTOOLS = shutil.which("bcftools") is not None
+# ``_write_vcf`` shells out to bgzip + tabix in addition to bcftools
+# downstream of compute_spectrum. Gate the end-to-end tests on all
+# four so a host with bcftools-only (or pysam-only) skips cleanly
+# instead of hitting CalledProcessError mid-fixture. Same gating
+# pattern as ``tests/test_cli_modes.py``.
+_HAVE_BGZIP = shutil.which("bgzip") is not None
+_HAVE_TABIX = shutil.which("tabix") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -101,8 +108,9 @@ class PyrimidineNormalizeTest(unittest.TestCase):
     """Folding purine-context calls to pyrimidine-context is what makes
     the spectrum a 96-channel space (not a 192-channel one). The
     reverse-complement must also reverse the flank order — a G>A in
-    context A[G>A]C is the same mutation as C[C>T]T on the opposite
-    strand, NOT C[C>T]G (which would be the wrong reversal).
+    context A[G>A]C is the same mutation as G[C>T]T on the opposite
+    strand, NOT T[C>T]G (which would be the result of complementing
+    each base in place without swapping flank sides).
     """
 
     def test_pyrimidine_context_passthrough(self):
@@ -238,8 +246,10 @@ def _write_vcf(dir_: Path, chrom: str, records: list[tuple]) -> Path:
     return Path(str(vcf_path) + ".gz")
 
 
-@unittest.skipUnless(_HAVE_PYSAM and _HAVE_BCFTOOLS,
-                     "pysam + bcftools needed for end-to-end test")
+@unittest.skipUnless(
+    _HAVE_PYSAM and _HAVE_BCFTOOLS and _HAVE_BGZIP and _HAVE_TABIX,
+    "pysam + bcftools + bgzip + tabix needed for end-to-end test",
+)
 class ComputeSpectrumEndToEndTest(unittest.TestCase):
     """End-to-end: build a tiny FASTA + VCF, hand-compute the expected
     channel counts, run ``compute_spectrum``, and assert."""
@@ -301,9 +311,9 @@ class ComputeSpectrumEndToEndTest(unittest.TestCase):
         self.assertEqual(sum(spec.counts), 0)
 
     def test_indels_excluded_at_iter_layer(self):
-        # bcftools view -v snps drops indels at the source — they
-        # never reach the channel-binning logic, so n_total counts
-        # only SNVs.
+        # bcftools query's TYPE="snp" && N_ALT=1 filter drops indels
+        # and multi-allelics at the source — they never reach the
+        # channel-binning logic, so n_total counts only SNVs.
         from syntheticgen.reference import load_fasta
         vcf = _write_vcf(self.dir, "22", [
             (2, "C", "T"),     # SNV
@@ -317,6 +327,26 @@ class ComputeSpectrumEndToEndTest(unittest.TestCase):
             fa.close()
         self.assertEqual(spec.n_total, 1)
         self.assertEqual(spec.n_excluded, 0)
+
+    def test_bcftools_failure_raises_with_stderr_tail(self):
+        # PR #92 review (Copilot): a corrupt / missing input must
+        # surface as a RuntimeError with the bcftools stderr tail,
+        # not silently produce an empty spectrum. Point at a path
+        # that doesn't exist — bcftools query exits non-zero with
+        # a clear error message.
+        from syntheticgen.reference import load_fasta
+        # Build a valid FASTA handle so the failure can only come
+        # from the bcftools subprocess, not from fasta loading.
+        fa = load_fasta(self.fasta)
+        try:
+            missing = self.dir / "does_not_exist.vcf.gz"
+            with self.assertRaises(RuntimeError) as ctx:
+                compute_spectrum(missing, fa)
+            msg = str(ctx.exception)
+            self.assertIn("bcftools query exited", msg)
+            self.assertIn(str(missing), msg)
+        finally:
+            fa.close()
 
 
 if __name__ == "__main__":
