@@ -46,17 +46,22 @@ def _mt_lineage_carrier(mt_lineage_id: int, pos: int,
     realised MT AF approximates the simulator's intent: a site
     with AF ~ 0.1 will have ~10 % of lineages carrying it.
 
-    ``hashlib.md5`` is used (not Python's built-in ``hash``)
+    ``hashlib.blake2b`` is used (not Python's built-in ``hash``)
     because the latter is salted per-process by default and would
-    produce non-reproducible results across runs.
+    produce non-reproducible results across runs. blake2b is
+    deterministic, non-broken (CodeQL ignores it), and runs at
+    roughly md5's speed for short inputs.
     """
-    seed = int(
-        hashlib.md5(
-            f"mt:{mt_lineage_id}:{pos}".encode("utf-8")
-        ).hexdigest()[:8],
-        16,
-    )
-    return (seed / 0xFFFFFFFF) < site_af
+    h = hashlib.blake2b(
+        f"mt:{mt_lineage_id}:{pos}".encode("utf-8"),
+        digest_size=4,
+    ).digest()
+    seed = int.from_bytes(h, "big")
+    # PR #112 review (Copilot): divide by 2**32 not 0xFFFFFFFF so the
+    # AF=1 endpoint is inclusive — at the old denominator, a hash of
+    # exactly 0xFFFFFFFF gave ``seed/denom == 1.0`` and ``< 1.0``
+    # returned False, so AF=1.0 wasn't a guaranteed carrier.
+    return (seed / (2 ** 32)) < site_af
 
 
 def write_person_vcf(out_path: Path, person: dict, build: str,
@@ -235,8 +240,22 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
                     else variant["chrom"]
                 )
                 if mt_lineage_id is not None and chrom_norm in ("MT", "M"):
-                    site_afs = variant.get("afs") or [0.0]
-                    site_af = site_afs[0] if site_afs[0] is not None else 0.0
+                    # PR #112 review (Copilot): on the streamed
+                    # coalescent path, ``cohort_derivation`` returns
+                    # per-person records with ``afs=[None]`` (the
+                    # cohort AF is in INFO but isn't threaded
+                    # through per-record). Without a fallback, every
+                    # MT site would land ``site_af=0.0`` and the
+                    # whole lineage would be hom-ref. Use the median
+                    # of common-population MT polymorphism rates
+                    # (~0.1) as the fallback so the override still
+                    # produces a realistic mix when the simulator's
+                    # actual AF isn't available.
+                    _MT_AF_FALLBACK = 0.1
+                    site_afs = variant.get("afs") or [None]
+                    site_af = site_afs[0]
+                    if site_af is None:
+                        site_af = _MT_AF_FALLBACK
                     is_carrier = _mt_lineage_carrier(
                         mt_lineage_id, variant["pos"], site_af,
                     )

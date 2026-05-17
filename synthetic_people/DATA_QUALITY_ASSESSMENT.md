@@ -604,18 +604,40 @@ coalescent), so two members of the "same family" had different MT.
   passes through the collapse as a no-op.
 
 **Empirical contract:** any two persons in the same lineage have
-byte-identical MT records (chrom + pos + ref + alt + GT). The
-`mt_no_heterozygous` gate (M13.2) was already GREEN post-M13.3
-(haploid emission); M13.5 adds the stronger between-person
-consistency. A follow-up validator could surface the new
-"within-lineage MT consistency" property explicitly.
+**identical MT GTs at every MT site** (same chrom + pos + ref +
+alt + GT, same record set). The contract specifically covers GT
+content — DP / GQ / AD are still drawn per-person from each
+person's own RNG / sample-depth, so the FORMAT columns differ
+byte-wise even when the GT agrees. This matches what real WGS
+batches look like (lineage members share variants but have
+independent coverage profiles). The `mt_no_heterozygous` gate
+(M13.2) was already GREEN post-M13.3 (haploid emission); M13.5
+adds the stronger between-person GT consistency. A follow-up
+validator could surface the new "within-lineage MT consistency"
+property explicitly.
+
+**Deferred:** DP / GQ / AD sync within lineage. Real lineages
+share MT *sequence* but coverage / quality vary per sample, so
+desync is biologically defensible. If a downstream tool needs
+full byte-identical MT rows, the writer could share the noise-
+model RNG across same-lineage members at MT sites; not currently
+on the critical path.
+
+**Deferred:** multi-allelic MT. The override uses ``afs[0]`` and
+emits allele 1 only — allele 2+ are never selected even when
+their AF is non-zero. Rare in practice for human MT (most
+polymorphisms are biallelic); a follow-up could sample across
+all alternate alleles weighted by per-allele AF.
 
 Tests:
 
-- 5 new in `test_resume.py::ResumeFreshStartTest` (draw +
-  persist + deterministic-at-fixed-seed + auto-pick + edge cases),
-  1 new in `ResumeMismatchedParamsTest`
-  (`mt_lineages_mismatch_raises`), plus 1 fixture update.
+- 4 new in `test_resume.py::ResumeFreshStartTest`
+  (`test_mt_lineage_ids_drawn_and_persisted`,
+  `test_mt_lineages_auto_picks_when_zero`,
+  `test_mt_lineages_auto_picks_at_least_one`,
+  `test_mt_lineage_ids_deterministic_at_fixed_seed`), 1 new in
+  `ResumeMismatchedParamsTest` (`test_mt_lineages_mismatch_raises`),
+  plus 1 fixture update.
 - 5 new in `test_writer_haploid.py::WritePersonVcfMtClonalTest`
   end-to-end (same lineage → same GT, different lineages can
   diverge, AF=0 / AF=1 endpoints, no-override when lineage_id is

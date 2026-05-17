@@ -160,6 +160,17 @@ def _person_worker(i: int, sid: str, seed: int) -> tuple:
             if _ploidy_for(c["chrom"], sex, build, c["pos"]) != 0
             and not (c["chrom"] == "Y"
                      and _is_in_par("Y", c["pos"], build))
+            # PR #112 review (Copilot): exclude MT candidates too —
+            # M13.5 overrides every per-person MT GT with the
+            # lineage-deterministic call, so the highlighted MT
+            # variant's GT would no longer match what
+            # ``manifest.json[people][i].highlighted.gt`` records.
+            # MT is also clonally inherited within a lineage, so
+            # "this specific person's highlighted variant" doesn't
+            # cleanly carry the same meaning on MT. ClinVar MT
+            # entries are rare; excluding them avoids the manifest
+            # / VCF divergence entirely.
+            and c["chrom"] not in ("MT", "M", "chrMT", "chrM")
         ]
         if not candidate_pool:
             # PR #108 review (Copilot): if every candidate is on a
@@ -1136,6 +1147,31 @@ def _check_deps(verbose: bool = True) -> int:
     return 1 if missing_bins else 0
 
 
+def _mt_lineages_arg(value: str) -> int:
+    """Argparse ``type=`` for ``--mt-lineages``.
+
+    Mirrors the Pydantic ``CohortConfig.mt_lineages`` constraint
+    (``ge=0``) so the CLI rejects negative values instead of
+    silently funnelling them into ``_effective_mt_lineages``'s
+    auto-pick branch (``requested <= 0`` falls through to the
+    ``max(1, n // 10)`` default — invalid input would look like
+    a successful auto-pick run).
+    """
+    try:
+        n = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"--mt-lineages must be a non-negative integer; "
+            f"got {value!r}"
+        ) from exc
+    if n < 0:
+        raise argparse.ArgumentTypeError(
+            f"--mt-lineages must be ≥ 0 (0 = auto-pick "
+            f"max(1, n // 10)); got {n}"
+        )
+    return n
+
+
 def _male_fraction_arg(value: str) -> float:
     """Argparse ``type=`` for ``--male-fraction``.
 
@@ -1252,7 +1288,7 @@ def _parser(script_dir: Path) -> argparse.ArgumentParser:
                         "Per-person sex assignment is recorded at the "
                         "top level of `manifest.json` as `sex: [\"m\", "
                         "\"f\", ...]`, parallel-indexed to `samples`.")
-    p.add_argument("--mt-lineages", type=int, default=0,
+    p.add_argument("--mt-lineages", type=_mt_lineages_arg, default=0,
                    help="[M13.5] Number of distinct maternal lineages "
                         "to draw people from. Persons sharing a "
                         "lineage share their MT sequence. 0 (default) "

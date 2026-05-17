@@ -478,27 +478,31 @@ class WritePersonVcfMtClonalTest(unittest.TestCase):
 
     def _write(self, name: str, mt_gt: str,
                mt_lineage_id: int | None,
-               site_af: float = 1.0) -> dict:
-        """Write a single-person VCF with one MT record and return
-        the parsed result. ``site_af=1.0`` ensures the deterministic
-        lineage call always lands on alt — useful for tests that
-        care about lineage-vs-lineage divergence rather than
-        AF-driven ratios."""
+               site_af: float = 1.0,
+               extra_mt_records: list[dict] | None = None) -> list[dict]:
+        """Write a single-person VCF with the given MT record(s) and
+        return the parsed MT rows.
+
+        Returns a list of ``{"chrom", "pos", "gt"}`` for every MT
+        record emitted, so tests can assert both single-row
+        properties (GT after override) and multi-row contracts
+        (same record set across persons). PR #112 review:
+        previously this helper called ``_write_and_read`` and then
+        re-emitted via a second ``write_person_vcf`` call, doing
+        every test's external bgzip/tabix/bcftools work twice.
+        Now it's a single shot.
+        """
+        import random
         mt_record = _record("MT", 100, mt_gt)
         mt_record["afs"] = [site_af]
+        background = [mt_record]
+        if extra_mt_records:
+            background.extend(extra_mt_records)
         person = {
             "sample_id": name,
             "highlighted": _record("22", 1_000_000, "0|0"),
-            "background": [mt_record],
+            "background": background,
         }
-        out = _write_and_read(
-            self.dir, person, sex="m",
-            # _write_and_read doesn't accept mt_lineage_id; inline
-            # a one-shot call below for the same effect.
-        )
-        # Re-emit because _write_and_read doesn't expose
-        # mt_lineage_id. Re-implement just enough here:
-        import random
         out_path = self.dir / f"{name}.vcf.gz"
         write_person_vcf(
             out_path, person, "GRCh38",
@@ -509,11 +513,16 @@ class WritePersonVcfMtClonalTest(unittest.TestCase):
             ["bcftools", "view", "-H", str(out_path)],
             capture_output=True, text=True, check=True,
         )
+        mt_rows: list[dict] = []
         for line in proc.stdout.splitlines():
             parts = line.split("\t")
             if parts[0] == "MT":
-                return {"gt": parts[9].split(":")[0]}
-        return {}
+                mt_rows.append({
+                    "chrom": parts[0],
+                    "pos": int(parts[1]),
+                    "gt": parts[9].split(":")[0],
+                })
+        return mt_rows
 
     def test_same_lineage_two_persons_same_mt_gt(self):
         # M13.5 contract: two persons sharing a mt_lineage_id emit
@@ -521,7 +530,30 @@ class WritePersonVcfMtClonalTest(unittest.TestCase):
         # per-person MTs for them.
         a = self._write("a", mt_gt="0|0", mt_lineage_id=42)
         b = self._write("b", mt_gt="1|1", mt_lineage_id=42)
-        self.assertEqual(a["gt"], b["gt"])
+        self.assertEqual(len(a), 1)
+        self.assertEqual(len(b), 1)
+        self.assertEqual(a[0]["gt"], b[0]["gt"])
+
+    def test_same_lineage_same_record_set(self):
+        # PR #112 review (Copilot): the load-bearing M13.5 contract
+        # is that two persons in the same lineage have IDENTICAL
+        # MT record sets, not just identical GT at sites that
+        # happen to be in both. Pin that by giving person A a hom-
+        # ref simulator GT and person B a hom-alt simulator GT —
+        # both must emit the same set of (pos, gt) pairs after the
+        # write-time override.
+        extra_a = [_record("MT", 200, "0|0"), _record("MT", 300, "0|0")]
+        extra_b = [_record("MT", 200, "1|1"), _record("MT", 300, "1|1")]
+        a = self._write("a", mt_gt="0|0", mt_lineage_id=7,
+                        extra_mt_records=extra_a)
+        b = self._write("b", mt_gt="1|1", mt_lineage_id=7,
+                        extra_mt_records=extra_b)
+        # Same set of (pos, gt) pairs — IDENTICAL MT records.
+        self.assertEqual(
+            sorted((r["pos"], r["gt"]) for r in a),
+            sorted((r["pos"], r["gt"]) for r in b),
+            "same-lineage MT record sets must match",
+        )
 
     def test_different_lineages_can_differ(self):
         # The companion property: at high AF (0.5) the determinism
@@ -535,7 +567,7 @@ class WritePersonVcfMtClonalTest(unittest.TestCase):
         for lid in range(20):
             r = self._write(f"p{lid}", mt_gt="0|0",
                             mt_lineage_id=lid, site_af=0.5)
-            same.append(r["gt"])
+            same.append(r[0]["gt"])
         gts = set(same)
         self.assertEqual(
             gts, {"0", "1"},
@@ -546,20 +578,51 @@ class WritePersonVcfMtClonalTest(unittest.TestCase):
         # AF=0 → every lineage is hom-ref-haploid ("0").
         r = self._write("z", mt_gt="1|1",
                         mt_lineage_id=0, site_af=0.0)
-        self.assertEqual(r["gt"], "0")
+        self.assertEqual(r[0]["gt"], "0")
 
     def test_site_af_one_yields_alt(self):
-        # AF=1 → every lineage is hom-alt-haploid ("1").
+        # AF=1 → every lineage is hom-alt-haploid ("1"). PR #112
+        # review (Copilot): pre-fix this could fail at the AF=1
+        # boundary when the hash landed on exactly 0xFFFFFFFF (the
+        # divisor was 0xFFFFFFFF so the ratio was 1.0, and ``<
+        # 1.0`` returned False). Now the divisor is ``2**32`` so
+        # AF=1 always yields a carrier.
         r = self._write("o", mt_gt="0|0",
                         mt_lineage_id=0, site_af=1.0)
-        self.assertEqual(r["gt"], "1")
+        self.assertEqual(r[0]["gt"], "1")
 
     def test_no_override_when_lineage_id_none(self):
         # Back-compat: mt_lineage_id=None preserves M13.3 behaviour
         # (collapse simulator's diploid MT GT to first allele).
         r = self._write("u", mt_gt="0|1", mt_lineage_id=None)
         # M13.3 first-allele collapse: "0|1" → "0".
-        self.assertEqual(r["gt"], "0")
+        self.assertEqual(r[0]["gt"], "0")
+
+    def test_site_af_none_uses_fallback(self):
+        # PR #112 review (Copilot): on the streamed coalescent
+        # path, derive_persons_batch hands ``afs=[None]`` to
+        # write_person_vcf for every record. Without a fallback
+        # the override would always emit GT=0 for every MT site
+        # across every person — breaking the cohort's MT signal
+        # entirely. The fallback (~0.1) restores a realistic mix.
+        # Drive the override with ``site_af=None`` (the streamed-
+        # path shape) and assert SOME lineages carry the alt.
+        # 50 lineages at fallback AF 0.1 → expected ~5 carriers.
+        results = []
+        for lid in range(50):
+            r = self._write(
+                f"af_none_{lid}", mt_gt="0|0",
+                mt_lineage_id=lid, site_af=None,
+            )
+            results.append(r[0]["gt"])
+        gts = set(results)
+        # Both outcomes present — the fallback is doing something
+        # other than uniformly emitting "0".
+        self.assertEqual(
+            gts, {"0", "1"},
+            f"AF=None fallback collapsed every lineage to one GT: "
+            f"{results}",
+        )
 
 
 class HighlightedRecordReachesVcfTest(unittest.TestCase):

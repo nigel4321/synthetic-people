@@ -220,12 +220,22 @@ def derive_persons_batch(cohort_bcf_paths: list,
             # allocation cost dramatically.
             afs = [None] * len(alts)
 
+            # M13.5: MT records must reach every per-person record
+            # list regardless of the original simulator GT so the
+            # lineage-clonality override in ``write_person_vcf`` can
+            # rewrite each person's MT GT. Without this carve-out a
+            # lineage carrier whose original simulator GT was hom-
+            # ref would miss the MT record entirely, breaking the
+            # "same-lineage → same MT record set" contract.
+            is_mt = chrom in ("MT", "M", "chrMT", "chrM")
             for sid, gt in zip(sample_ids, gts):
                 # `bcftools view -e 'GT="ref"'` matches 0/0 and 0|0
                 # only; missing genotypes (./. / .|.) survive. The
                 # per-person fan-out preserved that semantics, so
                 # mirror it here.
-                if not gt or gt == "0|0" or gt == "0/0":
+                if not is_mt and (
+                    not gt or gt == "0|0" or gt == "0/0"
+                ):
                     continue
                 rec = {
                     "chrom": chrom,
@@ -309,8 +319,17 @@ def _derive_from_one_bcf(bcf_path: Path, sample_id: str) -> list:
         ["bcftools", "view", "-s", sample_id, str(bcf_path)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
+    # M13.5: don't drop hom-ref MT records — the lineage-clonality
+    # override in ``write_person_vcf`` needs every MT site to be
+    # present in every person's per-person record list, regardless
+    # of the original simulator GT. Without this carve-out, a
+    # lineage carrier whose original simulator GT happened to be
+    # hom-ref would never see the MT record, breaking the
+    # "same-lineage → same MT record set" contract.
     drop_ref = subprocess.Popen(
-        ["bcftools", "view", "-e", 'GT="ref"'],
+        ["bcftools", "view", "-e",
+         'GT="ref" && CHROM!="MT" && CHROM!="M"'
+         ' && CHROM!="chrMT" && CHROM!="chrM"'],
         stdin=subset.stdout,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True,
