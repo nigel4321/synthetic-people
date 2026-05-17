@@ -124,6 +124,11 @@ def _person_worker(i: int, sid: str, seed: int) -> tuple:
     error_rate = state["error_rate"]
     dropout_rate = state["dropout_rate"]
     person_ancestry = state["person_ancestry"]
+    # M13.3: per-person sex enables haploid emission for chrX non-PAR
+    # in males, chrY non-PAR in males, chrY drops for females, and MT
+    # collapses to single-allele for everyone.
+    person_sexes = state.get("person_sexes")
+    sex = person_sexes[i] if person_sexes else None
 
     hi = dict(rng.choice(candidates))
     hi["gt"] = rng.choices(("0|1", "1|1"), weights=(0.7, 0.3))[0]
@@ -166,6 +171,7 @@ def _person_worker(i: int, sid: str, seed: int) -> tuple:
         dropout_rate=dropout_rate,
         stats=person_stats,
         truth_writer=tw,
+        sex=sex,
     )
     tw.close()
 
@@ -1954,6 +1960,10 @@ def _run_cohort_streamed(args, chromosomes: list, rng: random.Random,
         "error_rate": args.error_rate,
         "dropout_rate": args.dropout_rate,
         "person_ancestry": [],   # admixture not on the streamed path
+        # M13.3: per-person sex for haploid emission. ``resume.sexes``
+        # is the canonical source (deterministic per-seed, persisted
+        # across resumes) on the streamed coalescent path.
+        "person_sexes": resume.sexes,
     })
 
     fanout_workers = resolve_workers(args.workers)
@@ -2672,6 +2682,11 @@ def main(argv: list[str] | None = None) -> int:
         "error_rate": args.error_rate,
         "dropout_rate": args.dropout_rate,
         "person_ancestry": person_ancestry,
+        # M13.3: per-person sex from ``person_sexes`` drawn earlier
+        # in main() — same _draw_sexes helper that resume.sexes
+        # uses on the streamed path, so the two code paths emit
+        # consistent sex assignments at the same --seed.
+        "person_sexes": person_sexes,
     })
 
     use_pool = workers > 1 and args.n > 1

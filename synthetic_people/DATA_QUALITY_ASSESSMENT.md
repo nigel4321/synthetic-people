@@ -404,13 +404,58 @@ Implementation:
 - Pre-M13.1 batches (no `manifest['sex']`) report status="skipped"
   on every gate rather than spuriously failing.
 
-#### M13.3 — Haploid emission ⏳
+#### M13.3 — Haploid emission **shipped 2026-05-17 (per-person VCFs)**
 
-- Producers (materialised + streamed + admixture) read ploidy
-  via `ploidy_for(chrom, sex, build, pos)` and emit single-
-  allele GTs (`"0"` / `"1"`) on haploid positions.
-- Cohort site shape carries ploidy; writers emit haploid GT in
-  BCF + VCF formats.
+Wires `ploidy_for(chrom, sex, build, pos)` into `write_person_vcf`
+so per-person VCFs emit:
+
+- **Single-allele GT** on haploid positions: chrX non-PAR in males,
+  chrY non-PAR in males, MT in everyone.
+- **No record at all** for chrY in females (chromosome absent
+  biologically).
+- **Diploid GT** elsewhere (autosomes, chrX in females, PAR
+  positions in males) — today's pre-M13.3 behaviour preserved.
+
+`AN` follows ploidy (1 for haploid, 2 for diploid); `AC` /
+per-alt counts collapse to the haploid allele's contribution; `AF`
+uses `AC / AN`. The first haplotype is picked deterministically
+when collapsing diploid → haploid; this is biologically natural
+for MT (clonal — both haplotypes are the same by M13.5's design)
+and chrY (the paternal Y), and a deterministic-but-arbitrary
+choice for chrX non-PAR in males. Backwards-compat: when `sex` is
+not passed (legacy callers, pre-M13.1 batches), pre-M13.3 diploid
+behaviour is preserved.
+
+**Effect on the M13.2 gates** — all three flip from FAIL → GREEN:
+
+- `y_het_in_males` — non-PAR chrY records emit single-allele GT,
+  so `_gt_is_heterozygous` returns False by definition.
+- `female_y_absence` — chrY records are dropped at write time, so
+  no chrY ever reaches a female VCF.
+- `mt_no_heterozygous` — MT records emit single-allele GT, so no
+  heterozygous MT calls are possible (M13.5 will additionally
+  enforce clonal *inheritance* across the maternal lineage).
+
+**What's NOT in this PR (intentional scope limit):**
+
+- **Cohort BCF (the intermediate) stays diploid-everywhere.** Per-
+  person VCFs are derived via `bcftools view -s SAMPLE` and then
+  pass through `write_person_vcf` which applies the ploidy filter
+  on the way out. The user-visible output is correct; the cohort
+  BCF as an intermediate file is biologically inaccurate for chrX
+  non-PAR / chrY / MT. A follow-up PR can make the cohort BCF
+  variable-ploidy (BCF supports per-sample variable ploidy), but
+  that's a much bigger writer change than M13.3 needs to be.
+- **msprime simulation stays diploid for every chrom.** The
+  haploid-emission collapse happens at GT write time, not at
+  simulation time. A future PR could ask msprime to simulate
+  `ploidy=1` for genuinely haploid contigs and gain a slightly
+  more correct coalescent structure, but the per-record output
+  difference is minor for the discrimination tests we care about.
+
+Tests: 9 new in `tests/test_writer_haploid.py` covering each
+ploidy/sex combination end-to-end (write → `bcftools view -H` →
+assert GT format + AN value).
 
 #### M13.4 — PAR1/PAR2 copy mechanism ⏳
 

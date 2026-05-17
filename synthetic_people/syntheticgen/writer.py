@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 
 from .background import alt_dosages
-from .builds import BUILDS
+from .builds import BUILDS, ploidy_for
 from .errors import (
     DEFAULT_DROPOUT_RATE,
     DEFAULT_GT_ERROR_RATE,
@@ -39,7 +39,8 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
                      error_rate: float = 0.0,
                      dropout_rate: float = 0.0,
                      stats: dict | None = None,
-                     truth_writer: TruthBedWriter | None = None) -> Path:
+                     truth_writer: TruthBedWriter | None = None,
+                     sex: str | None = None) -> Path:
     """Write a single-sample bgzipped+indexed VCF.
 
     Each record carries simulated DP/GQ/AD alongside GT. The per-sample
@@ -61,6 +62,30 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
         per golden record (highlighted / ClinVar / COSMIC / SV / rsID)
         and a row per noise event (FLIP / DROPOUT). The caller is
         responsible for `.close()`-ing the writer to flush.
+
+    M13.3 haploid emission (2026-05-17):
+      * `sex` — ``"m"`` / ``"f"`` / ``None``. When set, per-record
+        ploidy is looked up via :func:`builds.ploidy_for` and the
+        emitted GT is collapsed accordingly:
+
+          - **ploidy 0** (chrY in females): the record is dropped
+            entirely. The truth-BED writer also skips it — a record
+            that didn't reach the VCF can't be a missed call against
+            it.
+          - **ploidy 1** (chrX non-PAR in males, chrY non-PAR in
+            males, MT in everyone): GT collapses to a single-allele
+            field (e.g. ``"1"`` rather than ``"1|1"``). The first
+            haplotype is kept; this is biologically natural for MT
+            (clonal) and chrY (haploid) and a deterministic choice
+            for chrX-in-males. AN drops to 1, AD stays a count over
+            n_alleles. The DP/GQ noise model is unchanged.
+          - **ploidy 2** (autosomes, chrX in females, PAR positions
+            in males): today's diploid behaviour.
+
+        When `sex` is None the function preserves pre-M13.3 behaviour
+        and emits diploid GTs for every record — back-compat for any
+        caller that hasn't been updated to plumb per-person sex
+        through yet.
     """
     contigs = BUILDS[build]["contigs"]
     contig_order = {c: i for i, c in enumerate(contigs)}
@@ -97,16 +122,42 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
                                   line_buffering=False)
             fh.write(build_header(build, person["sample_id"]))
             for variant, gt, is_hi in records:
+                # M13.3: per-record ploidy filtering. When ``sex`` is
+                # supplied, drop chrY records for females and collapse
+                # haploid records to a single-allele GT.
+                if sex is not None:
+                    ploidy = ploidy_for(
+                        variant["chrom"], sex, build, variant["pos"],
+                    )
+                    if ploidy == 0:
+                        # chrY in females — record doesn't exist
+                        # biologically; drop before AD draw + truth
+                        # writer to avoid wasted work.
+                        continue
+                    if ploidy == 1:
+                        # Collapse diploid GT to single-allele. Pick
+                        # the first haplotype; for MT this is fine
+                        # (clonal), for chrY-in-males this is the
+                        # paternal haplotype, for chrX non-PAR in
+                        # males the choice is arbitrary but
+                        # deterministic.
+                        first = gt.replace("/", "|").split("|", 1)[0]
+                        gt = first
+                else:
+                    ploidy = 2
+
                 alts = variant["alts"]
                 n_alts = len(alts)
                 n_alleles = n_alts + 1  # +1 for REF
 
                 # AC is per-alt (Number=A); AN is total allele count
-                # (fixed at 2 for a diploid single-sample).
+                # (1 for haploid emission, 2 for diploid).
                 per_alt_dosage = alt_dosages(gt, n_alts)
                 ac_str = ",".join(str(d) for d in per_alt_dosage)
-                af_str = ",".join(f"{d/2:.1f}" for d in per_alt_dosage)
-                info_parts = [f"AC={ac_str}", "AN=2", f"AF={af_str}"]
+                af_str = ",".join(f"{d/ploidy:.1f}"
+                                  for d in per_alt_dosage)
+                info_parts = [f"AC={ac_str}", f"AN={ploidy}",
+                              f"AF={af_str}"]
                 if is_hi:
                     info_parts.append("HIGHLIGHT")
                 # Annotation overlays (M7) are picked up regardless of
