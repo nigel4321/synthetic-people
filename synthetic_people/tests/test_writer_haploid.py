@@ -318,8 +318,6 @@ class HighlightedRecordReachesVcfTest(unittest.TestCase):
         #
         # Drive ``_person_worker`` directly with a candidate pool
         # that's entirely chrY and a female sex assignment.
-        import random
-        from unittest import mock
         from syntheticgen import cli as cli_module
         candidates = [
             self._hi_candidate("Y", 20_000_000),
