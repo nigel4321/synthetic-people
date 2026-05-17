@@ -556,7 +556,7 @@ Mapping missing checks back to §7's M-milestones:
 - **M18 (trios)** unblocks: Mendelian consistency.
 
 **Status of the Category-1 checks that didn't need a milestone
-unlock** — all shipped:
+unlock** — eight shipped, one still open (phasing consistency):
 
 - ~~per-region density~~ (Tier 2 #6, 2026-05-13)
 - ~~per-chrom stats~~ (Tier 1 #3, 2026-05-12)
