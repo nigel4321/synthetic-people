@@ -130,7 +130,28 @@ def _person_worker(i: int, sid: str, seed: int) -> tuple:
     person_sexes = state.get("person_sexes")
     sex = person_sexes[i] if person_sexes else None
 
-    hi = dict(rng.choice(candidates))
+    # M13.3 review (Copilot): the highlighted candidate must be a
+    # variant the person's per-record-ploidy will actually emit.
+    # Without this filter a female could draw a chrY ClinVar
+    # candidate that ``write_person_vcf`` then drops (ploidy=0) —
+    # the manifest + golden BED would still list a HIGHLIGHTED row
+    # for a variant that's absent from the VCF. Filter the pool to
+    # ``ploidy_for(...) != 0`` for the person's sex.
+    candidate_pool = candidates
+    if sex is not None:
+        from .builds import ploidy_for as _ploidy_for
+        candidate_pool = [
+            c for c in candidates
+            if _ploidy_for(c["chrom"], sex, build, c["pos"]) != 0
+        ]
+        if not candidate_pool:
+            # Defensive: if every candidate is on chrY and the person
+            # is female, we'd have an empty pool. Fall back to the
+            # full list and accept the highlighted-record-dropped
+            # behaviour — better than crashing. Should never happen
+            # for a ClinVar-scoped run with autosomes simulated.
+            candidate_pool = candidates
+    hi = dict(rng.choice(candidate_pool))
     hi["gt"] = rng.choices(("0|1", "1|1"), weights=(0.7, 0.3))[0]
     # Phase 5g batched-extraction path: when the parent has pre-staged
     # this batch's per-person record dicts in ``batch_backgrounds``,

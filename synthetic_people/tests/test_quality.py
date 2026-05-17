@@ -157,6 +157,61 @@ class TestGQ(unittest.TestCase):
                     self.assertLessEqual(gq, 99)
 
 
+class TestHaploidGtSupport(unittest.TestCase):
+    """M13.3 review (Copilot PR #107): quality helpers must treat
+    haploid GTs ("0" / "1") as homozygous-equivalent for the AD draw
+    and GQ recompute. Pre-fix _parse_gt_alleles fell back to (0, 0)
+    for any non-2-part input, so a haploid alt call ("1") emitted by
+    write_person_vcf got AD that looked hom-ref — inconsistent with
+    the called GT."""
+
+    def test_parse_gt_alleles_haploid_alt(self):
+        from syntheticgen.quality import _parse_gt_alleles
+        # Single token "1" must parse as (1, 1), not (0, 0).
+        self.assertEqual(_parse_gt_alleles("1"), (1, 1))
+
+    def test_parse_gt_alleles_haploid_ref(self):
+        from syntheticgen.quality import _parse_gt_alleles
+        self.assertEqual(_parse_gt_alleles("0"), (0, 0))
+
+    def test_parse_gt_alleles_haploid_multiallelic(self):
+        from syntheticgen.quality import _parse_gt_alleles
+        # Haploid alt-2 (multi-allelic at a haploid locus).
+        self.assertEqual(_parse_gt_alleles("2"), (2, 2))
+
+    def test_haploid_alt_ad_looks_hom_alt(self):
+        # Pre-fix: AD for haploid "1" looked hom-ref (all reads on
+        # the ref slot). Now it looks hom-alt — every read on the
+        # alt slot — consistent with the called GT.
+        rng = random.Random(7)
+        for _ in range(50):
+            ad = ad_from_gt("1", 2, 30, rng)
+            self.assertEqual(ad[0], 0,
+                             "haploid '1' should have no ref reads")
+            self.assertEqual(ad[1], 30,
+                             "haploid '1' should put all reads on alt")
+
+    def test_haploid_ref_ad_looks_hom_ref(self):
+        rng = random.Random(7)
+        for _ in range(50):
+            ad = ad_from_gt("0", 2, 30, rng)
+            self.assertEqual(ad[0], 30)
+            self.assertEqual(ad[1], 0)
+
+    def test_haploid_alt_gq_high_when_reads_agree(self):
+        # GQ for a haploid alt with all reads on alt should be high
+        # (confident call). Pre-fix it would have been 0 because the
+        # support formula used ad[0] (ref slot) on a (0, 0) parse.
+        gq = gq_from_ad("1", (0, 40))
+        self.assertGreater(gq, 80)
+
+    def test_haploid_alt_gq_low_when_reads_disagree(self):
+        # The mirror: 0 alt reads on a haploid "1" call should be
+        # near 0 (high disagreement).
+        gq = gq_from_ad("1", (40, 0))
+        self.assertLess(gq, 10)
+
+
 class TestDrawSiteQuality(unittest.TestCase):
     def test_tuple_consistency(self):
         rng = random.Random(7)
