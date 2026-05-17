@@ -145,12 +145,25 @@ def _person_worker(i: int, sid: str, seed: int) -> tuple:
             if _ploidy_for(c["chrom"], sex, build, c["pos"]) != 0
         ]
         if not candidate_pool:
-            # Defensive: if every candidate is on chrY and the person
-            # is female, we'd have an empty pool. Fall back to the
-            # full list and accept the highlighted-record-dropped
-            # behaviour — better than crashing. Should never happen
-            # for a ClinVar-scoped run with autosomes simulated.
-            candidate_pool = candidates
+            # PR #108 review (Copilot): if every candidate is on a
+            # chrom this person's ploidy will drop (e.g. every
+            # candidate on chrY for a female), fail fast with a
+            # clear error rather than reverting to the full list —
+            # the silent fallback would reintroduce the exact bug
+            # this filter was added to prevent (highlighted record
+            # absent from VCF but still referenced in manifest +
+            # golden BED). The user can widen --clinvar-sig or pass
+            # a broader candidate source if they hit this.
+            raise RuntimeError(
+                f"highlighted-candidate pool empty for sex={sex!r} "
+                f"on build={build!r}: every one of "
+                f"{len(candidates)} ClinVar candidates lands on a "
+                f"chromosome this person's ploidy drops (e.g. "
+                f"every candidate on chrY for a female cohort "
+                f"member). Widen --clinvar-sig or supply a broader "
+                f"candidate source so at least one candidate is "
+                f"emitted-by-this-sex."
+            )
     hi = dict(rng.choice(candidate_pool))
     hi["gt"] = rng.choices(("0|1", "1|1"), weights=(0.7, 0.3))[0]
     # Phase 5g batched-extraction path: when the parent has pre-staged

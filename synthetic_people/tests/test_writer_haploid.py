@@ -239,30 +239,29 @@ class WritePersonVcfHaploidTest(unittest.TestCase):
                     self.assertEqual(r["an"], "2")
 
 
-@unittest.skipUnless(_HAVE_BCFTOOLS and _HAVE_BGZIP and _HAVE_TABIX,
-                     "bcftools + bgzip + tabix required")
 class HighlightedRecordReachesVcfTest(unittest.TestCase):
-    """PR #107 review (Copilot): the highlighted variant must not
-    land on a chromosome the person's ploidy will drop. Worker now
-    pre-filters the candidate pool — pin both halves of that:
+    """PR #107 + PR #108 review (Copilot): the highlighted variant
+    must not land on a chromosome the person's ploidy will drop.
+    Worker pre-filters the candidate pool by
+    ``ploidy_for(...) != 0``; if the filter empties the pool, the
+    worker fails fast with a clear error (PR #108 review — the
+    earlier silent fallback to the unfiltered pool reintroduced
+    the very bug the filter was added to prevent).
 
-    1. A female passed a candidate pool that's entirely chrY would
-       fall back to the unfiltered pool (defensive — never lose the
-       highlighted slot entirely).
-    2. A female passed a mixed pool gets a candidate from the
-       allowed subset; the highlighted record reaches her VCF.
+    Three behaviours pinned below:
 
-    We test this at the ``_person_worker`` level by driving the
-    filter logic directly rather than spinning up a whole cli.main
-    run.
+    1. Mixed pool + female → chrY candidates excluded, autosomes
+       survive, draws never land on chrY.
+    2. Mixed pool + male → every candidate kept (chrY non-PAR is
+       ploidy=1 for males).
+    3. All-chrY pool + female → ``_person_worker`` raises
+       ``RuntimeError`` with a clear error message.
+
+    No bcftools subprocesses involved — these tests exercise only
+    the filter logic + the fail-fast path. No ``skipUnless``
+    decorator needed (PR #108 review: don't unnecessarily skip
+    tests that don't shell out).
     """
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.dir = Path(self.tmp.name)
-
-    def tearDown(self):
-        self.tmp.cleanup()
 
     def _hi_candidate(self, chrom: str, pos: int) -> dict:
         return {
@@ -272,8 +271,9 @@ class HighlightedRecordReachesVcfTest(unittest.TestCase):
 
     def test_female_with_mixed_pool_never_gets_chry_highlight(self):
         # Drive the filter logic directly to make this deterministic.
-        # 1000 trials with a 50/50 mix of chrY and chr22 candidates;
-        # post-filter the female pool must contain no chrY entries.
+        # 100 random draws over a 50/50 chrY + chr22 candidate set;
+        # post-filter the female pool must contain no chrY entries
+        # and the draws never land on chrY.
         import random
         from syntheticgen.builds import ploidy_for
         candidates = [
@@ -288,11 +288,8 @@ class HighlightedRecordReachesVcfTest(unittest.TestCase):
             c for c in candidates
             if ploidy_for(c["chrom"], sex, build, c["pos"]) != 0
         ]
-        # Every chrY candidate must be excluded.
         self.assertTrue(all(c["chrom"] != "Y" for c in filtered))
-        # The chr22 candidates must survive — the pool isn't empty.
         self.assertEqual(len(filtered), 2)
-        # Sanity: random draws over many trials never produce chrY.
         rng = random.Random(42)
         for _ in range(100):
             c = rng.choice(filtered)
@@ -312,6 +309,53 @@ class HighlightedRecordReachesVcfTest(unittest.TestCase):
             if ploidy_for(c["chrom"], "m", "GRCh38", c["pos"]) != 0
         ]
         self.assertEqual(len(filtered), 2)
+
+    def test_empty_pool_for_female_raises_in_worker(self):
+        # PR #108 review (Copilot): the empty-pool fallback used to
+        # silently revert to the unfiltered pool, reintroducing the
+        # exact bug the filter was added to prevent. Now it raises
+        # ``RuntimeError`` with a clear actionable message.
+        #
+        # Drive ``_person_worker`` directly with a candidate pool
+        # that's entirely chrY and a female sex assignment.
+        import random
+        from unittest import mock
+        from syntheticgen import cli as cli_module
+        candidates = [
+            self._hi_candidate("Y", 20_000_000),
+            self._hi_candidate("Y", 25_000_000),
+        ]
+        # Minimum viable worker state: only the fields the candidate-
+        # pool-filter path touches are populated. The worker will
+        # raise before any of the unset fields get consulted.
+        cli_module._PERSON_WORKER_STATE.clear()
+        cli_module._PERSON_WORKER_STATE.update({
+            "candidates": candidates,
+            "cohort_sites": None,
+            "cohort_bcfs": None,
+            "build": "GRCh38",
+            "output_dir": Path("/tmp"),
+            "truth_dir": Path("/tmp"),
+            "contig_order": {"Y": 23, "22": 21},
+            "svs_per_person": 0,
+            "sv_length_min": 50,
+            "sv_length_max": 1000,
+            "sv_chrom_span": 1000,
+            "sv_chromosomes": ["Y"],
+            "error_rate": 0.0,
+            "dropout_rate": 0.0,
+            "person_ancestry": [],
+            "person_sexes": ["f"],
+        })
+        try:
+            with self.assertRaises(RuntimeError) as ctx:
+                cli_module._person_worker(0, "F001", seed=42)
+            msg = str(ctx.exception)
+            self.assertIn("highlighted-candidate pool empty", msg)
+            self.assertIn("sex='f'", msg)
+            self.assertIn("--clinvar-sig", msg)
+        finally:
+            cli_module._PERSON_WORKER_STATE.clear()
 
 
 if __name__ == "__main__":
