@@ -75,12 +75,30 @@ def _binomial(n: int, p: float, rng: random.Random) -> int:
 
 
 def _parse_gt_alleles(gt: str) -> tuple[int, int]:
-    """Parse a phased GT like `"0|2"` into an `(a, b)` pair of allele indices.
+    """Parse a GT into an ``(a, b)`` pair of allele indices.
 
-    Non-numeric tokens (`.`) degrade to 0 — good enough for the quality
-    model which only needs dosage information.
+    Handles three input shapes:
+
+    - **Diploid phased** (``"0|2"``): returns the two allele indices.
+    - **Haploid** (``"1"``) — M13.3 chrX non-PAR in males, chrY non-
+      PAR in males, MT in everyone. Returned as ``(k, k)`` so the
+      AD-draw + GQ-recompute treat the single haplotype as
+      homozygous-equivalent at the quality-model level. This keeps
+      AD consistent with the emitted GT (haploid alt → AD looks
+      hom-alt, not mistakenly hom-ref).
+    - **Non-numeric / malformed** (``"."`` etc.): degrades to
+      ``(0, 0)``. The quality model only needs dosage info so the
+      hom-ref fallback is safe.
     """
     parts = gt.split("|")
+    if len(parts) == 1:
+        # Haploid: interpret single-allele "k" as (k, k) for quality
+        # purposes — same dosage shape as a homozygous diploid.
+        try:
+            k = int(parts[0])
+            return k, k
+        except ValueError:
+            return 0, 0
     if len(parts) != 2:
         return 0, 0
     try:

@@ -452,6 +452,17 @@ behaviour is preserved.
   `ploidy=1` for genuinely haploid contigs and gain a slightly
   more correct coalescent structure, but the per-record output
   difference is minor for the discrimination tests we care about.
+- **M9 sequencing-error model is silent on haploid calls.**
+  `errors.maybe_flip_gt` explicitly returns "leave alone" for any
+  non-2-part GT (`syntheticgen/errors.py:87`), so chrY non-PAR
+  / chrX non-PAR (males) / MT records emitted post-M13.3 don't
+  receive `--error-rate` GT flips. The manifest's realised FDR
+  will under-report on those chromosomes by exactly the haploid-
+  record share of total calls. Surfaced by Copilot review on
+  PR #107 as suppressed-low-confidence and acknowledged here.
+  A follow-up PR can add a `_HAPLOID_FLIPS` table (just `0 ↔ 1`)
+  + truth-writer wiring; for M13.3's scope (flip the M13.2 gates
+  green) it's not on the critical path.
 
 Tests: 9 new in `tests/test_writer_haploid.py` covering each
 ploidy/sex combination end-to-end (write → `bcftools view -H` →
