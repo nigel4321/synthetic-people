@@ -436,7 +436,7 @@ class TestCohortSexChromGates(unittest.TestCase):
                          mt_records=50, mt_het=0),
         ]
         sex = {"m1": "m", "f1": "f"}
-        out = cohort_sex_chrom_gates(samples, sex)
+        out = cohort_sex_chrom_gates(samples, sex, build="GRCh38")
         self.assertTrue(out["sample_sex_known"])
         self.assertEqual(out["y_het_in_males"]["status"], "pass")
         self.assertEqual(out["female_y_absence"]["status"], "pass")
@@ -449,7 +449,9 @@ class TestCohortSexChromGates(unittest.TestCase):
         samples = [
             self._male("m1", y_non_par=100, y_non_par_het=50),
         ]
-        out = cohort_sex_chrom_gates(samples, {"m1": "m"})
+        out = cohort_sex_chrom_gates(
+            samples, {"m1": "m"}, build="GRCh38",
+        )
         gate = out["y_het_in_males"]
         self.assertEqual(gate["status"], "fail")
         self.assertEqual(gate["non_par_records"], 100)
@@ -461,7 +463,9 @@ class TestCohortSexChromGates(unittest.TestCase):
         # Gate should report skipped, not pass (vacuous "no
         # heterozygous Y records" is true but uninformative).
         samples = [self._male("m1"), self._female("f1")]
-        out = cohort_sex_chrom_gates(samples, {"m1": "m", "f1": "f"})
+        out = cohort_sex_chrom_gates(
+            samples, {"m1": "m", "f1": "f"}, build="GRCh38",
+        )
         self.assertEqual(out["y_het_in_males"]["status"], "skipped")
 
     def test_female_y_absence_fails_when_y_records_present(self):
@@ -508,8 +512,29 @@ class TestCohortSexChromGates(unittest.TestCase):
         # (no non-PAR Y data to judge), not "fail".
         samples = [self._male("m1", y_records=500,
                                y_non_par=0, y_non_par_het=0)]
-        out = cohort_sex_chrom_gates(samples, {"m1": "m"})
+        out = cohort_sex_chrom_gates(
+            samples, {"m1": "m"}, build="GRCh38",
+        )
         self.assertEqual(out["y_het_in_males"]["status"], "skipped")
+
+    def test_y_het_gate_skipped_when_build_unknown(self):
+        # PR #105 review (Copilot): without ``build``, ``is_in_par``
+        # can't run and a chrY het could be in PAR (legitimate in
+        # males) or non-PAR (regression). Skip the gate rather than
+        # false-fail. The other two gates still run.
+        samples = [
+            self._male("m1", y_non_par=100, y_non_par_het=50,
+                      mt_records=10, mt_het=3),
+            self._female("f1", y_records=10),
+        ]
+        out = cohort_sex_chrom_gates(
+            samples, {"m1": "m", "f1": "f"}, build=None,
+        )
+        self.assertEqual(out["y_het_in_males"]["status"], "skipped")
+        # female_y_absence + mt_no_heterozygous don't need PAR info
+        # — they should still report fail.
+        self.assertEqual(out["female_y_absence"]["status"], "fail")
+        self.assertEqual(out["mt_no_heterozygous"]["status"], "fail")
 
 
 class TestCheckRefAgainstFasta(unittest.TestCase):
@@ -754,6 +779,44 @@ class TestSummariseVcfSexChromCounters(unittest.TestCase):
         ])
         self.assertEqual(s.n_mt_records, 2)
         self.assertEqual(s.n_mt_het, 1)
+
+    def test_chrm_treated_as_mt(self):
+        # PR #105 review (Copilot): UCSC-style ``chrM`` (and bare
+        # ``M``) both denote the mitochondrial contig and must be
+        # counted alongside GRCh38-style ``MT``. The codebase's own
+        # _SPECIAL_ORDER table treats them equivalently.
+        s = self._summarise([
+            self._record("chrM", 100, "0|1"),
+            self._record("M", 200, "1|1"),
+            self._record("MT", 300, "0|0"),
+        ])
+        self.assertEqual(s.n_mt_records, 3)
+        self.assertEqual(s.n_mt_het, 1)
+
+    def test_multi_allelic_het_counted_on_chry(self):
+        # PR #105 review (Copilot): ``1|2`` has dosage 2 (both
+        # haplotypes non-ref) but is still heterozygous in the
+        # "two different alleles" sense the sex-chrom gates need.
+        # Pre-fix the gate undercounted these; the new
+        # _gt_is_heterozygous helper catches them.
+        s = self._summarise([
+            self._record("Y", 20_000_000, "1|2"),
+        ])
+        self.assertEqual(s.n_y_non_par_het, 1)
+
+    def test_multi_allelic_het_counted_on_mt(self):
+        s = self._summarise([
+            self._record("MT", 100, "1|2"),
+        ])
+        self.assertEqual(s.n_mt_het, 1)
+
+    def test_haploid_gt_not_counted_as_het(self):
+        # Post-M13.3 chrY non-PAR in males should emit single-allele
+        # GTs (e.g. ``"1"``). Those are NOT heterozygous and must
+        # not be counted as such.
+        s = self._summarise([self._record("Y", 20_000_000, "1")])
+        self.assertEqual(s.n_y_non_par_records, 1)
+        self.assertEqual(s.n_y_non_par_het, 0)
 
     def test_autosomes_dont_touch_sex_chrom_counters(self):
         # chr22 records must not pollute the Y or MT counters.
