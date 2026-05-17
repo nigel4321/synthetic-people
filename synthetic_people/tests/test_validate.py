@@ -47,6 +47,7 @@ from syntheticgen.validate import (
     check_ref_against_fasta,
     cohort_chrom_stats,
     cohort_overlay_density,
+    cohort_sex_chrom_gates,
     het_hom_ratio,
     titv_from_stats,
 )
@@ -385,6 +386,132 @@ class TestCohortOverlayDensity(unittest.TestCase):
         self.assertEqual(out["cosmic"]["fraction"], 0.0)
 
 
+class TestCohortSexChromGates(unittest.TestCase):
+    """M13.2: three pass/fail sex-chromosome validation gates.
+    They're expected to FAIL on today's M13.1-era output and turn
+    GREEN after M13.3 wires haploid emission. The tests below
+    construct ``SampleStats`` directly with the relevant counters
+    pre-populated so the aggregator logic is exercised in isolation
+    from the per-VCF walker."""
+
+    def _male(self, name: str, y_non_par: int = 0,
+              y_non_par_het: int = 0,
+              mt_records: int = 0, mt_het: int = 0,
+              y_records: int | None = None) -> SampleStats:
+        s = SampleStats(name=name)
+        s.n_y_non_par_records = y_non_par
+        s.n_y_non_par_het = y_non_par_het
+        s.n_y_records = y_records if y_records is not None else y_non_par
+        s.n_mt_records = mt_records
+        s.n_mt_het = mt_het
+        return s
+
+    def _female(self, name: str, y_records: int = 0,
+                mt_records: int = 0, mt_het: int = 0) -> SampleStats:
+        s = SampleStats(name=name)
+        s.n_y_records = y_records
+        s.n_mt_records = mt_records
+        s.n_mt_het = mt_het
+        return s
+
+    def test_skipped_when_sample_sex_unknown(self):
+        # Pre-M13.1 batches have no ``manifest['sex']``. The whole
+        # gate set must report "skipped" cleanly so a legacy batch
+        # doesn't surface as a false-positive failure.
+        out = cohort_sex_chrom_gates(
+            [self._male("m1"), self._female("f1")], None,
+        )
+        self.assertFalse(out["sample_sex_known"])
+        for gate in ("y_het_in_males", "female_y_absence",
+                     "mt_no_heterozygous"):
+            self.assertEqual(out[gate]["status"], "skipped")
+
+    def test_all_three_gates_pass_on_clean_input(self):
+        # The shape M13.3+ should hit: no Y het in males, no Y in
+        # females, no het MT.
+        samples = [
+            self._male("m1", y_non_par=100, y_non_par_het=0,
+                      mt_records=50, mt_het=0),
+            self._female("f1", y_records=0,
+                         mt_records=50, mt_het=0),
+        ]
+        sex = {"m1": "m", "f1": "f"}
+        out = cohort_sex_chrom_gates(samples, sex)
+        self.assertTrue(out["sample_sex_known"])
+        self.assertEqual(out["y_het_in_males"]["status"], "pass")
+        self.assertEqual(out["female_y_absence"]["status"], "pass")
+        self.assertEqual(out["mt_no_heterozygous"]["status"], "pass")
+
+    def test_y_het_in_males_fails_on_diploid_output(self):
+        # Today's reality: M13.1 records sex but the simulator still
+        # treats chrY as diploid in males, so ~50 % of non-PAR Y
+        # records are heterozygous by chance. Pin the failure path.
+        samples = [
+            self._male("m1", y_non_par=100, y_non_par_het=50),
+        ]
+        out = cohort_sex_chrom_gates(samples, {"m1": "m"})
+        gate = out["y_het_in_males"]
+        self.assertEqual(gate["status"], "fail")
+        self.assertEqual(gate["non_par_records"], 100)
+        self.assertEqual(gate["heterozygous_records"], 50)
+        self.assertAlmostEqual(gate["het_fraction"], 0.5)
+
+    def test_y_het_skipped_when_no_male_y_records(self):
+        # Cohort with --chromosomes 22 only — no Y simulated at all.
+        # Gate should report skipped, not pass (vacuous "no
+        # heterozygous Y records" is true but uninformative).
+        samples = [self._male("m1"), self._female("f1")]
+        out = cohort_sex_chrom_gates(samples, {"m1": "m", "f1": "f"})
+        self.assertEqual(out["y_het_in_males"]["status"], "skipped")
+
+    def test_female_y_absence_fails_when_y_records_present(self):
+        # Today's reality: chrY is simulated regardless of sex, so
+        # female VCFs carry chrY records.
+        samples = [
+            self._female("f1", y_records=200),
+            self._female("f2", y_records=200),
+        ]
+        out = cohort_sex_chrom_gates(samples, {"f1": "f", "f2": "f"})
+        gate = out["female_y_absence"]
+        self.assertEqual(gate["status"], "fail")
+        self.assertEqual(gate["y_records"], 400)
+        self.assertEqual(gate["n_females"], 2)
+
+    def test_female_y_skipped_in_all_male_cohort(self):
+        samples = [self._male("m1")]
+        out = cohort_sex_chrom_gates(samples, {"m1": "m"})
+        self.assertEqual(out["female_y_absence"]["status"], "skipped")
+
+    def test_mt_no_heterozygous_fails_when_het_calls_present(self):
+        # MT should never be het regardless of sex. Today's diploid
+        # simulator produces het calls.
+        samples = [
+            self._male("m1", mt_records=100, mt_het=30),
+            self._female("f1", mt_records=100, mt_het=25),
+        ]
+        out = cohort_sex_chrom_gates(samples, {"m1": "m", "f1": "f"})
+        gate = out["mt_no_heterozygous"]
+        self.assertEqual(gate["status"], "fail")
+        self.assertEqual(gate["records"], 200)
+        self.assertEqual(gate["heterozygous"], 55)
+        self.assertAlmostEqual(gate["het_fraction"], 55 / 200)
+
+    def test_mt_skipped_when_mt_not_simulated(self):
+        samples = [self._male("m1"), self._female("f1")]
+        out = cohort_sex_chrom_gates(samples, {"m1": "m", "f1": "f"})
+        self.assertEqual(out["mt_no_heterozygous"]["status"], "skipped")
+
+    def test_par_y_het_does_not_fail_the_gate(self):
+        # Gate counts only non-PAR Y records. A male sample with a
+        # huge ``n_y_records`` but zero ``n_y_non_par_records`` and
+        # zero ``n_y_non_par_het`` should be reported as "skipped"
+        # (no non-PAR Y data to judge), not "fail".
+        samples = [self._male("m1", y_records=500,
+                               y_non_par=0, y_non_par_het=0)]
+        out = cohort_sex_chrom_gates(samples, {"m1": "m"})
+        self.assertEqual(out["y_het_in_males"]["status"], "skipped")
+
+
 class TestCheckRefAgainstFasta(unittest.TestCase):
     """Tier 1: REF-matches-FASTA gate. Today's synthetic output
     uses fabricated REF so the gate fails on every record — the
@@ -569,6 +696,86 @@ class TestSummariseVcfOverlayCounters(unittest.TestCase):
         ])
         self.assertEqual(stats.n_with_rs, 1)
         self.assertEqual(stats.n_with_clnsig, 1)
+
+
+class TestSummariseVcfSexChromCounters(unittest.TestCase):
+    """M13.2: ``summarise_vcf`` must classify chrY records into
+    PAR / non-PAR and count MT heterozygotes correctly. Same
+    iter_records-patch trick as the overlay-counter tests so we
+    exercise the production walker."""
+
+    def _record(self, chrom: str, pos: int, gt: str) -> Record:
+        return Record(
+            chrom=chrom, pos=pos, ref="A", alt="C", gt=gt,
+            dp=30, gq=40, ad_ref=15, ad_alt=15,
+            info=_parse_info(""),
+        )
+
+    def _summarise(self, records: list,
+                   build: str | None = "GRCh38") -> SampleStats:
+        from syntheticgen.validate import summarise_vcf
+        with patch(
+            "syntheticgen.validate.iter_records",
+            return_value=iter(records),
+        ):
+            return summarise_vcf(
+                Path("/nonexistent.vcf.gz"), name="t", build=build,
+            )
+
+    def test_chry_non_par_records_counted(self):
+        # GRCh38 chrY non-PAR is anywhere outside [10_001, 2_781_479]
+        # and [56_887_903, 57_217_415]. pos=20_000_000 is comfortably
+        # in non-PAR.
+        s = self._summarise([self._record("Y", 20_000_000, "0|1")])
+        self.assertEqual(s.n_y_records, 1)
+        self.assertEqual(s.n_y_non_par_records, 1)
+        self.assertEqual(s.n_y_non_par_het, 1)
+
+    def test_chry_par_records_excluded_from_non_par(self):
+        # GRCh38 PAR1: 10_001-2_781_479. pos=1_000_000 is in PAR1.
+        s = self._summarise([self._record("Y", 1_000_000, "0|1")])
+        self.assertEqual(s.n_y_records, 1)
+        self.assertEqual(s.n_y_non_par_records, 0)
+        self.assertEqual(s.n_y_non_par_het, 0)
+
+    def test_chry_chr_prefix_normalised(self):
+        # FASTA-side ``chrY`` and cli-side ``Y`` must be treated
+        # identically by the gate counters.
+        s = self._summarise([self._record("chrY", 20_000_000, "0|1")])
+        self.assertEqual(s.n_y_records, 1)
+        self.assertEqual(s.n_y_non_par_records, 1)
+
+    def test_mt_records_and_het_counted(self):
+        # Two MT records, one het + one hom-alt. ``n_mt_het`` should
+        # only count the het.
+        s = self._summarise([
+            self._record("MT", 100, "0|1"),
+            self._record("MT", 200, "1|1"),
+        ])
+        self.assertEqual(s.n_mt_records, 2)
+        self.assertEqual(s.n_mt_het, 1)
+
+    def test_autosomes_dont_touch_sex_chrom_counters(self):
+        # chr22 records must not pollute the Y or MT counters.
+        s = self._summarise([self._record("22", 1_000_000, "0|1")])
+        self.assertEqual(s.n_y_records, 0)
+        self.assertEqual(s.n_y_non_par_records, 0)
+        self.assertEqual(s.n_mt_records, 0)
+
+    def test_build_none_treats_all_y_as_non_par(self):
+        # Legacy callers (validate_batch on pre-M13.1 batches that
+        # had no manifest['build']) should still get Y records
+        # counted — just without the PAR distinction. The fallback
+        # collapses every Y record into the non-PAR bucket so the
+        # cohort_sex_chrom_gates summary still reports something
+        # useful, while the manifest-aware path (which knows the
+        # build) gets the precise PAR / non-PAR split.
+        s = self._summarise(
+            [self._record("Y", 1_000_000, "0|1")],  # PAR1 pos
+            build=None,
+        )
+        self.assertEqual(s.n_y_records, 1)
+        self.assertEqual(s.n_y_non_par_records, 1)  # PAR collapsed
 
 
 @unittest.skipUnless(HAS_NUMPY, "numpy required")

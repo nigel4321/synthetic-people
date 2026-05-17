@@ -364,16 +364,45 @@ emission) is the load-bearing simulator change.
   but the simulator continues to treat every chromosome as
   diploid. M13.3 wires the ploidy lookup into the producers.
 
-#### M13.2 — Validation gates ⏳
+#### M13.2 — Validation gates **shipped 2026-05-17**
 
-Tier-1-first pattern: ship the validators before the simulator
-change so they're the empirical gate when M13.3+ lands.
+Tier-1-first pattern: shipped the validators before the simulator
+change so they're the empirical gate when M13.3+ lands. All three
+currently report FAIL on M13.1-era output (every chromosome is
+still simulated as diploid); each one turns GREEN when the
+corresponding M13.3 / M13.5 wiring lands. That FAIL → GREEN flip
+is the empirical proof point — not the implementation diff.
 
-- Y heterozygosity ≈ 0 in males (any non-PAR Y position with a
-  heterozygous GT in a male is a regression).
-- Female Y absence (no chrY records in female VCFs).
-- MT GT homogeneity (every MT call should be `0` / `1` — never
-  `0|1`-style heterozygous).
+- **Y heterozygosity in males.** Counts non-PAR chrY records with
+  heterozygous GTs across male VCFs. Today: ~50 % het rate by
+  chance because chrY is simulated as diploid. Post-M13.3: 0 (Y
+  emits haploid GT in males).
+- **Female chrY absence.** Counts chrY records in female VCFs.
+  Today: full chrY coverage in every female. Post-M13.3: 0 (chrY
+  dropped for females).
+- **MT no-heterozygous.** Counts heterozygous MT calls across all
+  samples. Today: ~50 % MT het rate (MT simulated as diploid).
+  Post-M13.5: 0 (MT haploid + clonally inherited).
+
+Implementation:
+
+- `syntheticgen/validate.py`: 5 new counters on `SampleStats`
+  (`n_y_records`, `n_y_non_par_records`, `n_y_non_par_het`,
+  `n_mt_records`, `n_mt_het`) plus `cohort_sex_chrom_gates`
+  aggregator.
+- `summarise_vcf` takes a new `build` kwarg so the PAR / non-PAR
+  split uses the correct coordinates (calls `is_in_par` from
+  `builds.py`).
+- `validate_batch.py` reads `manifest['sex']` (M13.1) + `build`,
+  calls the aggregator, surfaces the three gate results in
+  `summary.json["sex_chrom_gates"]` plus a Markdown report
+  section.
+- 15 unit tests across two new classes
+  (`TestCohortSexChromGates` + `TestSummariseVcfSexChromCounters`)
+  pinning pass / fail / skipped paths, PAR-classification boundary
+  cases, and chr-prefix normalisation.
+- Pre-M13.1 batches (no `manifest['sex']`) report status="skipped"
+  on every gate rather than spuriously failing.
 
 #### M13.3 — Haploid emission ⏳
 
@@ -642,12 +671,12 @@ Choose-your-own-adventure, ordered by catch-rate per cost.
 
 #### Tier 3 — wait for the corresponding feature
 
-10. Sex-chromosome ploidy checks — **M13.2 is the gate-shipping
-    step** (next; lands before M13.3's haploid emission per the
-    Tier-1-first pattern). M13.1 already landed the
-    prerequisites (per-person sex in `manifest.json[sex]`, PAR
-    coordinates, `ploidy_for` helper). M13.2 will surface Y-het
-    in males, female-Y absence, MT homogeneity.
+10. ~~Sex-chromosome ploidy checks~~ — **shipped 2026-05-17 as
+    M13.2.** Three pass/fail gates surface Y-het in males,
+    female-Y absence, MT no-heterozygous in
+    `summary.json["sex_chrom_gates"]`. All three FAIL on today's
+    M13.1-era output (every chromosome still simulated as diploid)
+    and turn GREEN after M13.3 / M13.5.
 11. PCA-vs-1000G projection — wait for M17.
 12. Mendelian consistency — wait for M18.
 

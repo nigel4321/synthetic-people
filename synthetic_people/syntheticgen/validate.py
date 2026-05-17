@@ -179,6 +179,16 @@ class SampleStats:
     dp_samples: list = field(default_factory=list)
     gq_samples: list = field(default_factory=list)
     ad_het_ref_frac_samples: list = field(default_factory=list)
+    # M13.2 sex-chromosome gate counters (2026-05-17). Populated
+    # during ``summarise_vcf`` when ``build`` is supplied so the
+    # PAR / non-PAR split is correct. ``cohort_sex_chrom_gates``
+    # aggregates these against ``manifest.sex[]`` to produce the
+    # three pass/fail gates that M13.3 will turn green.
+    n_y_records: int = 0            # total chrY records (any pos)
+    n_y_non_par_records: int = 0    # subset of chrY outside PAR1/PAR2
+    n_y_non_par_het: int = 0        # of n_y_non_par_records, heterozygous
+    n_mt_records: int = 0
+    n_mt_het: int = 0               # heterozygous MT calls — always wrong
 
 
 # Cap how many records contribute to the DP/GQ/AD-ratio sample
@@ -240,12 +250,27 @@ def _gt_dosage(gt: str) -> int:
     return (1 if a > 0 else 0) + (1 if b > 0 else 0)
 
 
-def summarise_vcf(vcf_path: Path, name: str | None = None) -> SampleStats:
-    """Walk a VCF and return aggregate counts."""
+def summarise_vcf(
+    vcf_path: Path, name: str | None = None,
+    build: str | None = None,
+) -> SampleStats:
+    """Walk a VCF and return aggregate counts.
+
+    ``build`` is required for the M13.2 sex-chromosome gate counters
+    (``n_y_non_par_*`` and ``n_mt_*``) because PAR boundaries are
+    build-specific. When ``build`` is None those counters are still
+    populated where build-independent (e.g. ``n_y_records`` /
+    ``n_mt_records``) but PAR / non-PAR splits collapse — every chrY
+    record gets classified as non-PAR. Callers running the
+    sex-chromosome gates must pass ``build``.
+    """
     if name is None:
         name = vcf_path.stem.replace(".vcf", "")
     s = SampleStats(name=name)
     quality_samples_taken = 0
+    # Local import to avoid a cycle through builds.py if validate.py
+    # ever gets imported from inside the cli's import chain.
+    from .builds import is_in_par
     for rec in iter_records(vcf_path):
         s.n_records += 1
         chrom_bucket = s.by_chrom[rec.chrom]
@@ -294,6 +319,7 @@ def summarise_vcf(vcf_path: Path, name: str | None = None) -> SampleStats:
             s.sv_by_type[svtype] += 1
 
         # Dosage / het-hom / dropout
+        is_het = False
         if _is_dropout(rec.gt):
             s.n_dropout += 1
             chrom_bucket["n_dropout"] += 1
@@ -305,9 +331,30 @@ def summarise_vcf(vcf_path: Path, name: str | None = None) -> SampleStats:
             elif d == 1:
                 s.n_het += 1
                 chrom_bucket["n_het"] += 1
+                is_het = True
             elif d == 2:
                 s.n_hom_alt += 1
                 chrom_bucket["n_hom_alt"] += 1
+
+        # M13.2 sex-chromosome gate counters. Normalise the chrom
+        # spelling (FASTA-side ``chr22`` vs cli's ``22``) before
+        # comparing — the cli emits unprefixed names today but VCFs
+        # from external tools may use either convention.
+        chrom_norm = rec.chrom[3:] if rec.chrom.startswith("chr") else rec.chrom
+        if chrom_norm == "Y":
+            s.n_y_records += 1
+            in_par = (
+                is_in_par("Y", rec.pos, build) if build is not None
+                else False  # without a build, treat all Y as non-PAR
+            )
+            if not in_par:
+                s.n_y_non_par_records += 1
+                if is_het:
+                    s.n_y_non_par_het += 1
+        elif chrom_norm == "MT":
+            s.n_mt_records += 1
+            if is_het:
+                s.n_mt_het += 1
 
         # AF (if present in INFO)
         af_str = rec.info.get("AF")
@@ -422,6 +469,160 @@ def cohort_chrom_stats(samples: Iterable[SampleStats]) -> dict:
         )
     # Sort by canonical chromosome order: 1-22, X, Y, MT, other.
     return dict(sorted(out.items(), key=_chrom_sort_key))
+
+
+def cohort_sex_chrom_gates(
+    samples: Iterable[SampleStats],
+    sample_sex: dict[str, str] | None,
+) -> dict:
+    """M13.2: aggregate the three sex-chromosome validation gates.
+
+    Three checks, all currently expected to FAIL on M13.1-era output
+    (since the simulator still treats every chromosome as diploid).
+    M13.3 will turn them green; this function is the empirical gate
+    that proves M13.3 actually wired the ploidy lookup through.
+
+    Args:
+      samples: per-person ``SampleStats`` from ``summarise_vcf``.
+        Each one must have been produced with ``build=...`` passed
+        through, otherwise the PAR / non-PAR split is meaningless
+        and the function reports ``status="skipped"``.
+      sample_sex: ``{sample_name: "m"|"f"}`` from the manifest's
+        top-level ``sex`` list (parallel-indexed to ``samples``).
+        Pass ``None`` for legacy pre-M13.1 batches; the function
+        reports ``status="skipped"`` because the sex labels are
+        what determines which gate applies to which sample.
+
+    Returns a dict with three sub-results, each shaped like::
+
+        {
+          "status": "pass" | "fail" | "skipped",
+          "summary": "<one-line human-readable>",
+          ... gate-specific counters ...
+        }
+
+    Plus a top-level ``"sample_sex_known": bool`` to make the skip
+    reason discoverable in the JSON.
+    """
+    if sample_sex is None:
+        return {
+            "sample_sex_known": False,
+            "y_het_in_males": {
+                "status": "skipped",
+                "summary": "no manifest.sex (pre-M13.1 batch)",
+            },
+            "female_y_absence": {
+                "status": "skipped",
+                "summary": "no manifest.sex (pre-M13.1 batch)",
+            },
+            "mt_no_heterozygous": {
+                "status": "skipped",
+                "summary": "no manifest.sex needed but reporting "
+                           "skipped for symmetry with the other "
+                           "two gates",
+            },
+        }
+
+    # Gate 1: Y heterozygosity ≈ 0 in males. Aggregate non-PAR Y
+    # heterozygous-call counts across every male sample. Today's
+    # diploid-everywhere output produces ~50 % het rate by chance
+    # at every Y position; M13.3 emits haploid GT and this drops
+    # to 0.
+    male_y_non_par = 0
+    male_y_non_par_het = 0
+    # Gate 2: Female chrY absence. Aggregate Y record counts across
+    # every female. Today's output includes Y for both sexes; M13.3
+    # will drop Y entirely for females.
+    female_y_records = 0
+    n_females_seen = 0
+    # Gate 3: MT no-heterozygous. Heterozygous MT calls are wrong
+    # regardless of sex (MT is haploid and clonally inherited).
+    mt_records = 0
+    mt_het = 0
+
+    for s in samples:
+        sex = sample_sex.get(s.name)
+        if sex == "m":
+            male_y_non_par += s.n_y_non_par_records
+            male_y_non_par_het += s.n_y_non_par_het
+        elif sex == "f":
+            n_females_seen += 1
+            female_y_records += s.n_y_records
+        mt_records += s.n_mt_records
+        mt_het += s.n_mt_het
+
+    def _gate_y_het() -> dict:
+        if male_y_non_par == 0:
+            return {
+                "status": "skipped",
+                "summary": "no non-PAR chrY records in male VCFs "
+                           "(chromosome not simulated, or empty)",
+                "non_par_records": 0,
+                "heterozygous_records": 0,
+            }
+        het_frac = male_y_non_par_het / male_y_non_par
+        # Tolerance: post-M13.3 the rate should be exactly 0. Any
+        # non-trivial fraction is a regression. We use 1 % to absorb
+        # any future floating-point or edge-case noise without
+        # accepting silent regressions.
+        passed = male_y_non_par_het == 0
+        return {
+            "status": "pass" if passed else "fail",
+            "summary": (
+                f"{male_y_non_par_het} of {male_y_non_par} "
+                f"non-PAR chrY records in male VCFs are het "
+                f"({het_frac:.1%}); expected 0"
+            ),
+            "non_par_records": male_y_non_par,
+            "heterozygous_records": male_y_non_par_het,
+            "het_fraction": het_frac,
+        }
+
+    def _gate_female_y() -> dict:
+        if n_females_seen == 0:
+            return {
+                "status": "skipped",
+                "summary": "no female samples in cohort",
+                "y_records": 0,
+            }
+        passed = female_y_records == 0
+        return {
+            "status": "pass" if passed else "fail",
+            "summary": (
+                f"{female_y_records} chrY records across "
+                f"{n_females_seen} female VCFs; expected 0"
+            ),
+            "y_records": female_y_records,
+            "n_females": n_females_seen,
+        }
+
+    def _gate_mt() -> dict:
+        if mt_records == 0:
+            return {
+                "status": "skipped",
+                "summary": "MT not simulated in this cohort",
+                "records": 0,
+                "heterozygous": 0,
+            }
+        het_frac = mt_het / mt_records
+        passed = mt_het == 0
+        return {
+            "status": "pass" if passed else "fail",
+            "summary": (
+                f"{mt_het} of {mt_records} MT records are het "
+                f"({het_frac:.1%}); expected 0 (MT is haploid)"
+            ),
+            "records": mt_records,
+            "heterozygous": mt_het,
+            "het_fraction": het_frac,
+        }
+
+    return {
+        "sample_sex_known": True,
+        "y_het_in_males": _gate_y_het(),
+        "female_y_absence": _gate_female_y(),
+        "mt_no_heterozygous": _gate_mt(),
+    }
 
 
 def cohort_overlay_density(samples: Iterable[SampleStats]) -> dict:

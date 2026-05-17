@@ -43,6 +43,7 @@ from syntheticgen.validate import (  # noqa: E402
     cohort_pca,
     cohort_per_region_density,
     cohort_quality_metrics,
+    cohort_sex_chrom_gates,
     het_hom_ratio,
     ld_decay,
     summarise_vcf,
@@ -160,9 +161,15 @@ def main(argv: list[str] | None = None) -> int:
           file=sys.stderr)
 
     # --- per-sample summaries ---
+    # ``build`` is plumbed into summarise_vcf so the M13.2 sex-
+    # chromosome counters get the correct PAR / non-PAR split. Falls
+    # back to None for pre-M13.1 batches whose manifest doesn't carry
+    # ``build``; the gates report "skipped" in that case rather than
+    # mis-counting.
+    build = manifest.get("build") if manifest else None
     samples = []
     for v in person_vcfs:
-        s = summarise_vcf(v)
+        s = summarise_vcf(v, build=build)
         samples.append(s)
         print(f"  {s.name}: records={s.n_records} snv={s.n_snv} "
               f"indel={s.n_indel} sv={s.n_sv} het={s.n_het} "
@@ -187,6 +194,28 @@ def main(argv: list[str] | None = None) -> int:
     # DATA_QUALITY_ASSESSMENT.md §A.4 Tier 2 for the rationale.
     region_density = cohort_per_region_density(samples)
     quality_metrics = cohort_quality_metrics(samples)
+
+    # M13.2 sex-chromosome validation gates. Three pass/fail checks
+    # that today's M13.1-era output is expected to FAIL (every chrom
+    # is still simulated as diploid). They become the empirical gate
+    # for M13.3's haploid emission wiring. Pulls per-person sex from
+    # ``manifest['sex']`` (parallel-indexed to ``manifest['samples']``);
+    # falls back to None for pre-M13.1 batches, which reports
+    # status="skipped" instead of mis-failing.
+    if manifest and "sex" in manifest and "samples" in manifest:
+        sample_sex = dict(zip(manifest["samples"], manifest["sex"]))
+    else:
+        sample_sex = None
+    sex_chrom_gates = cohort_sex_chrom_gates(samples, sample_sex)
+    for gate_name in ("y_het_in_males", "female_y_absence",
+                      "mt_no_heterozygous"):
+        gate = sex_chrom_gates.get(gate_name, {})
+        status = gate.get("status", "skipped")
+        print(
+            f"  M13.2 {gate_name}: {status.upper()} — "
+            f"{gate.get('summary', '')}",
+            file=sys.stderr,
+        )
 
     # Tier 1: REF-matches-FASTA gate — only when the caller passes
     # --reference-fasta. Today's synthetic REF is fabricated so
@@ -320,6 +349,10 @@ def main(argv: list[str] | None = None) -> int:
         "f_statistic": f_statistic,
         "ancestry_tracts": ancestry_tracts,
         "mutation_spectrum": mutation_spectrum_json,
+        # M13.2: Y-het in males / female Y-absence / MT-no-heterozygous.
+        # Currently expected to FAIL on M13.1-era output and turn green
+        # after M13.3 wires haploid emission through the producers.
+        "sex_chrom_gates": sex_chrom_gates,
         "ld_decay": ld,
         "pca": {
             "components": args.pca_components,
@@ -621,6 +654,33 @@ def _build_markdown_report(batch_dir: Path, summary: dict,
             "*Today's synthetic output uses fabricated REF "
             "(`rng.choice('ACGT')`); this section will report "
             "failures until M12 wires in the real FASTA.*"
+        )
+        lines.append("")
+
+    # M13.2: sex-chromosome validation gates. Expected to FAIL today;
+    # turn green after M13.3 ships haploid emission.
+    scg = summary.get("sex_chrom_gates") or {}
+    if scg:
+        lines += ["## Sex-chromosome gates (M13.2)", "",
+                  "Gate | Status | Summary",
+                  "---|---|---"]
+        for gate_name, label in (
+            ("y_het_in_males", "Y heterozygosity in males"),
+            ("female_y_absence", "Female chrY absence"),
+            ("mt_no_heterozygous", "MT no-heterozygous"),
+        ):
+            g = scg.get(gate_name, {})
+            status = g.get("status", "skipped").upper()
+            summary_text = g.get("summary", "")
+            lines.append(
+                f"{label} | {status} | {summary_text}"
+            )
+        lines.append("")
+        lines.append(
+            "*Today's simulator still treats every chromosome as "
+            "diploid, so these gates are expected to FAIL until "
+            "M13.3 wires haploid emission for chrX non-PAR / chrY "
+            "(in males) and MT through the producers.*"
         )
         lines.append("")
 
