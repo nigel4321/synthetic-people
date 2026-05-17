@@ -493,7 +493,8 @@ Implementation:
   2. **For males**, mirrors each chrX PAR record onto chrY at the
      translated position. The clone shares GT/REF/ALT/INFO with
      the chrX original; only `chrom` and `pos` change. The mirror
-     is never flagged HIGHLIGHTED (only the chrX original carries
+     is never flagged with the `HIGHLIGHT` INFO tag (only the chrX
+     original carries
      the highlight tag — downstream consumers would otherwise see
      two highlighted rows for one biological variant).
 - Females are unchanged — chrY entirely absent per M13.3.
@@ -519,6 +520,28 @@ Tests:
   VCFs are correct (the user-visible output), but the intermediate
   cohort BCF stays diploid-everywhere with independent X/Y PAR
   simulation. Same scope deferral as M13.3's cohort-BCF note.
+- **SV records skipped from mirroring.** SVs carry coordinate-
+  bearing INFO fields (`END`, `SVLEN`) that don't survive a
+  chrom/pos swap without translation; the SV span can also extend
+  past the PAR boundary. M13.4 skips SVs from the mirror to avoid
+  emitting a chrY record with chrX-coordinate `END`. A follow-up
+  can wire a full SV mirror with translated `END` + boundary
+  check.
+- **Multi-base indels not boundary-checked.** A chrX PAR indel
+  whose REF/ALT extend past the PAR boundary will still be
+  mirrored onto chrY using just its start position. Rare in
+  practice for ClinVar-scoped runs; a follow-up can add a
+  `pos + max(len(ref), max(len(alt) for alt in alts)) - 1`
+  check against the PAR end.
+- **Error model decouples chrX original and chrY mirror.** When
+  `--error-rate` / `--dropout-rate` are nonzero, the noise model
+  is applied independently to the chrX record and its chrY
+  mirror — so a 0.1 % GT flip can land on one side but not the
+  other, breaking PAR consistency. The M13.2 gates pass either
+  way (haploid emission only flips the non-PAR gates). At
+  default error rates this affects <0.1 % of PAR records;
+  surfaced by Copilot review on PR #110 and acknowledged as a
+  deferred follow-up.
 
 #### M13.5 — MT clonal inheritance ⏳
 

@@ -128,9 +128,9 @@ def par_x_to_y_pos(x_pos: int, build: str) -> int | None:
     - **GRCh38 PAR1**: chrX 10_001-2_781_479 maps 1-to-1 to chrY
       10_001-2_781_479 (the assembly defines them at identical bp).
     - **GRCh38 PAR2**: chrX 155_701_383-156_030_895 maps to chrY
-      56_887_903-57_217_415 — same span (329_512 bp) but at the end
-      of each chromosome's distinct length, so coordinates differ
-      by a fixed offset.
+      56_887_903-57_217_415 — same span (329_513 bp, inclusive of
+      both endpoints) but at the end of each chromosome's distinct
+      length, so coordinates differ by a fixed offset.
     - **GRCh37**: PAR1 chrX 60_001-2_699_520 vs chrY 10_001-2_649_520
       — both spans have the same length but DIFFERENT start bp on
       X vs Y, so even PAR1 needs translation. PAR2 same pattern.
@@ -142,9 +142,14 @@ def par_x_to_y_pos(x_pos: int, build: str) -> int | None:
     par_regions = BUILDS.get(build, {}).get("par_regions", {})
     x_pars = par_regions.get("X", [])
     y_pars = par_regions.get("Y", [])
-    # PARs are listed in the same order on both chroms (PAR1 then
-    # PAR2). If the data tables ever diverge, the assertion below
-    # surfaces it rather than silently mis-translating.
+    # PAR tables list PAR1 first then PAR2 on each chrom. A
+    # length-mismatch between X and Y here means the build's PAR
+    # data is malformed (only one chrom has both PARs declared);
+    # return None defensively rather than mistranslate. We don't
+    # assert lengths-match-per-PAR here because the assembly's PAR
+    # spans ARE supposed to match between X and Y by definition —
+    # if they don't, the upstream coordinate table is wrong and a
+    # bp-level mistranslation isn't the right error to throw.
     if len(x_pars) != len(y_pars):
         return None
     for (x_lo, x_hi), (y_lo, y_hi) in zip(x_pars, y_pars):

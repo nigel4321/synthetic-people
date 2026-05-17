@@ -200,6 +200,24 @@ class ParXToYPosTest(unittest.TestCase):
         self.assertEqual(par_x_to_y_pos(60_001, "GRCh37"), 10_001)
         self.assertEqual(par_x_to_y_pos(2_699_520, "GRCh37"), 2_649_520)
 
+    def test_grch37_par2_offset_translation(self):
+        # PR #110 review (Copilot): test coverage was missing for
+        # GRCh37 PAR2.
+        # GRCh37 PAR2: X 154_931_044-155_260_560 ↔ Y 59_034_050-
+        # 59_363_566. Same span (329_517 bp inclusive) but
+        # different start bp on each chrom.
+        self.assertEqual(
+            par_x_to_y_pos(154_931_044, "GRCh37"), 59_034_050,
+        )
+        self.assertEqual(
+            par_x_to_y_pos(155_260_560, "GRCh37"), 59_363_566,
+        )
+        # Midpoint sanity.
+        self.assertEqual(
+            par_x_to_y_pos(155_000_000, "GRCh37"),
+            59_034_050 + (155_000_000 - 154_931_044),
+        )
+
     def test_returns_none_outside_par(self):
         # chrX non-PAR position → no chrY mirror.
         self.assertIsNone(

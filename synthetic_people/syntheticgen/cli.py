@@ -130,19 +130,29 @@ def _person_worker(i: int, sid: str, seed: int) -> tuple:
     person_sexes = state.get("person_sexes")
     sex = person_sexes[i] if person_sexes else None
 
-    # M13.3 review (Copilot): the highlighted candidate must be a
-    # variant the person's per-record-ploidy will actually emit.
-    # Without this filter a female could draw a chrY ClinVar
-    # candidate that ``write_person_vcf`` then drops (ploidy=0) —
-    # the manifest + golden BED would still list a HIGHLIGHTED row
-    # for a variant that's absent from the VCF. Filter the pool to
-    # ``ploidy_for(...) != 0`` for the person's sex.
+    # The highlighted candidate must be a variant the person's
+    # per-record-ploidy will actually emit. Two filters apply:
+    #
+    #   - M13.3 review: exclude ``ploidy_for(...) == 0`` (chrY for
+    #     females) — otherwise ``write_person_vcf`` drops the record
+    #     but the manifest + golden BED still reference it.
+    #   - M13.4 / PR #110 review: exclude chrY PAR candidates for
+    #     any sex. M13.4 drops simulator-generated chrY PAR records
+    #     and replaces them with chrX-PAR mirrors, so a "highlighted
+    #     chrY PAR variant" gets dropped silently. ClinVar PAR
+    #     entries with chrY coordinates have equivalent chrX
+    #     entries; the worker just picks the chrX one.
     candidate_pool = candidates
     if sex is not None:
-        from .builds import ploidy_for as _ploidy_for
+        from .builds import (
+            is_in_par as _is_in_par,
+            ploidy_for as _ploidy_for,
+        )
         candidate_pool = [
             c for c in candidates
             if _ploidy_for(c["chrom"], sex, build, c["pos"]) != 0
+            and not (c["chrom"] == "Y"
+                     and _is_in_par("Y", c["pos"], build))
         ]
         if not candidate_pool:
             # PR #108 review (Copilot): if every candidate is on a

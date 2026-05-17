@@ -130,6 +130,19 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
                     continue
                 if not is_in_par("X", variant["pos"], build):
                     continue
+                # PR #110 review (Copilot, suppressed): SV records
+                # carry coordinate-bearing INFO fields (END, SVLEN)
+                # that don't survive a chrom/pos swap without
+                # translation, AND the SV span can extend past the
+                # PAR boundary entirely. Indels with multi-base
+                # REF/ALT have the same boundary-overrun risk on
+                # smaller scale. Skip SVs from mirroring; document
+                # indels as a deferred edge case in
+                # DATA_QUALITY_ASSESSMENT.md §M13.4. The PAR-
+                # consistency guarantee thus applies to SNVs +
+                # 1-base indels only.
+                if variant.get("svtype"):
+                    continue
                 y_pos = par_x_to_y_pos(variant["pos"], build)
                 if y_pos is None:
                     continue

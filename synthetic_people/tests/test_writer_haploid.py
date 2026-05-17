@@ -158,7 +158,7 @@ class WritePersonVcfHaploidTest(unittest.TestCase):
         #
         # PAR diploid emission is now exercised via chrX PAR
         # records being mirrored onto chrY — see
-        # ``test_male_chrx_par_mirrored_onto_chry`` in
+        # ``test_male_chrx_par1_mirrored_onto_chry`` in
         # ``WritePersonVcfParCopyTest`` below.
         person = {
             "sample_id": "m002",
@@ -379,6 +379,69 @@ class WritePersonVcfParCopyTest(unittest.TestCase):
         # Haploid (M13.3) — not "|"-separated.
         self.assertNotIn("|", y[0]["gt"])
 
+    def test_mirror_does_not_carry_highlight_info(self):
+        # PR #110 review (Copilot): the chrY PAR mirror must NEVER
+        # carry the HIGHLIGHT INFO flag — only the chrX original
+        # does — otherwise a single biological variant emits TWO
+        # highlighted rows. Pin that with a dedicated INFO check.
+        person = {
+            "sample_id": "m_hi_par",
+            # Highlighted = chrX PAR1 variant. The chrX row should
+            # carry HIGHLIGHT; the mirrored chrY row must NOT.
+            "highlighted": _record("X", 1_500_000, "0|1"),
+            "background": [],
+        }
+        # We need the raw VCF text, not the parsed dict, to inspect
+        # INFO contents — re-run bcftools view -H with the full
+        # INFO column visible.
+        import random
+        out_path = self.dir / f"{person['sample_id']}.vcf.gz"
+        write_person_vcf(out_path, person, "GRCh38",
+                         random.Random(42), sex="m", dp_mean=30.0)
+        proc = subprocess.run(
+            ["bcftools", "view", "-H", str(out_path)],
+            capture_output=True, text=True, check=True,
+        )
+        x_lines = [
+            ln for ln in proc.stdout.splitlines()
+            if ln.split("\t")[0] == "X"
+        ]
+        y_lines = [
+            ln for ln in proc.stdout.splitlines()
+            if ln.split("\t")[0] == "Y"
+        ]
+        self.assertEqual(len(x_lines), 1)
+        self.assertEqual(len(y_lines), 1)
+        self.assertIn("HIGHLIGHT", x_lines[0].split("\t")[7])
+        self.assertNotIn("HIGHLIGHT", y_lines[0].split("\t")[7])
+
+    def test_sv_records_not_mirrored(self):
+        # PR #110 review (suppressed): SVs carry coordinate-bearing
+        # INFO (END, SVLEN) that don't survive a chrom/pos swap
+        # without translation, and the SV span can extend past the
+        # PAR boundary. Skip mirroring for SVs to avoid emitting a
+        # nonsensical chrY record with chrX-coordinate END.
+        sv_variant = _record("X", 1_000_000, "0|1")
+        sv_variant.update({
+            "svtype": "DEL",
+            "svlen": -500,
+            "end": 1_000_500,
+            "cipos": (-50, 50),
+            "alts": ["<DEL>"],
+        })
+        person = {
+            "sample_id": "m_sv",
+            "highlighted": _record("22", 1_000_000, "0|0"),
+            "background": [sv_variant],
+        }
+        out = _write_and_read(self.dir, person, sex="m")
+        y = [r for r in out if r["chrom"] == "Y"]
+        self.assertEqual(
+            len(y), 0,
+            f"SV record was mirrored onto chrY (END would be at "
+            f"chrX coordinates): {y}",
+        )
+
     def test_no_par_copy_when_sex_unset(self):
         # Back-compat: sex=None should preserve pre-M13.4 behaviour
         # — chrY records pass through, no chrX-to-chrY mirroring.
@@ -454,19 +517,54 @@ class HighlightedRecordReachesVcfTest(unittest.TestCase):
             self.assertNotEqual(c["chrom"], "Y")
 
     def test_male_with_chry_candidate_keeps_record(self):
-        # The companion case: a MALE pool with a chrY candidate
-        # filters to keep the chrY entry (ploidy=1 in male non-PAR,
-        # not 0). Confirms the filter only excludes ploidy==0.
-        from syntheticgen.builds import ploidy_for
+        # The companion case: a MALE pool with a chrY NON-PAR
+        # candidate filters to keep the chrY entry (ploidy=1 in
+        # male non-PAR, not 0). Confirms the filter only excludes
+        # ploidy==0 — and M13.4's additional chrY-PAR exclusion
+        # (next test) doesn't fire for non-PAR positions.
+        from syntheticgen.builds import is_in_par, ploidy_for
         candidates = [
             self._hi_candidate("Y", 20_000_000),  # non-PAR
             self._hi_candidate("22", 1_000_000),
         ]
+        sex = "m"
+        build = "GRCh38"
         filtered = [
             c for c in candidates
-            if ploidy_for(c["chrom"], "m", "GRCh38", c["pos"]) != 0
+            if ploidy_for(c["chrom"], sex, build, c["pos"]) != 0
+            and not (c["chrom"] == "Y"
+                     and is_in_par("Y", c["pos"], build))
         ]
         self.assertEqual(len(filtered), 2)
+
+    def test_male_chry_par_candidate_filtered_out(self):
+        # PR #110 review (Copilot): a male could draw a chrY PAR
+        # ClinVar candidate that has ploidy=2 in males (PAR is
+        # diploid), so the M13.3 ploidy filter alone doesn't catch
+        # it. But M13.4 drops chrY PAR records — so the highlighted
+        # variant disappears silently. The M13.4 filter excludes
+        # chrY PAR candidates from the highlighted draw entirely.
+        from syntheticgen.builds import is_in_par, ploidy_for
+        candidates = [
+            # Three chrY PAR candidates (all in PAR1 on GRCh38)
+            self._hi_candidate("Y", 100_000),
+            self._hi_candidate("Y", 1_500_000),
+            self._hi_candidate("Y", 2_500_000),
+            # One chr22 candidate as the only valid option
+            self._hi_candidate("22", 1_000_000),
+        ]
+        sex = "m"
+        build = "GRCh38"
+        filtered = [
+            c for c in candidates
+            if ploidy_for(c["chrom"], sex, build, c["pos"]) != 0
+            and not (c["chrom"] == "Y"
+                     and is_in_par("Y", c["pos"], build))
+        ]
+        # All three chrY PAR candidates must be excluded; only
+        # the chr22 candidate survives.
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["chrom"], "22")
 
     def test_empty_pool_for_female_raises_in_worker(self):
         # PR #108 review (Copilot): the empty-pool fallback used to
