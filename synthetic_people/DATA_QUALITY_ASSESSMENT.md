@@ -468,12 +468,57 @@ Tests: 9 new in `tests/test_writer_haploid.py` covering each
 ploidy/sex combination end-to-end (write → `bcftools view -H` →
 assert GT format + AN value).
 
-#### M13.4 — PAR1/PAR2 copy mechanism ⏳
+#### M13.4 — PAR1/PAR2 copy mechanism **shipped 2026-05-17 (write-time mirror)**
 
-- Simulate PAR regions on chrX coordinates only; materialize
-  identical variants on chrY at the matching coordinates in
-  males. Ensures PAR positions stay consistent between the
-  two chromosomes the way they would in real meiosis.
+PAR1 / PAR2 sequence is biologically IDENTICAL between chrX and
+chrY (that's why they recombine in male meiosis), so a variant at
+any chrX PAR position must also appear at the corresponding chrY
+PAR position in males. Pre-M13.4 the simulator generated chrX and
+chrY independently, so the chrY PAR records carried genotypes
+that disagreed with chrX PAR at the same locus — a fidelity gap
+any PAR-aware downstream tool would catch.
+
+Implementation:
+
+- New `builds.par_x_to_y_pos(x_pos, build)` translates a chrX PAR
+  position to its chrY counterpart. PAR1 / PAR2 spans match
+  between X and Y on each build; start positions differ (PAR1
+  on GRCh38 is the only no-op case — GRCh37 PAR1 has a 50_000 bp
+  offset, and both builds' PAR2 has its own offset). Returns
+  `None` for any chrX position outside both PARs.
+- `write_person_vcf` now does two post-record-assembly things
+  when `sex` is supplied:
+  1. **Drops chrY PAR records** the simulator produced — those
+     would diverge from the matching chrX PAR variants.
+  2. **For males**, mirrors each chrX PAR record onto chrY at the
+     translated position. The clone shares GT/REF/ALT/INFO with
+     the chrX original; only `chrom` and `pos` change. The mirror
+     is never flagged HIGHLIGHTED (only the chrX original carries
+     the highlight tag — downstream consumers would otherwise see
+     two highlighted rows for one biological variant).
+- Females are unchanged — chrY entirely absent per M13.3.
+
+Tests:
+
+- 8 new in `WritePersonVcfParCopyTest` covering PAR1 / PAR2
+  mirror, non-PAR-not-mirrored, female-no-mirror, simulator-
+  generated chrY PAR dropped, chrY non-PAR preserved (M13.3 still
+  applies), back-compat when `sex=None`.
+- 5 new in `ParXToYPosTest` covering GRCh38 PAR1 (identity),
+  GRCh38 PAR2 offset, GRCh37 PAR1 offset, None outside PAR, None
+  for unknown build.
+
+**What's NOT in this PR (intentional scope limit):**
+
+- **msprime is still asked to simulate chrY independently.** The
+  drop-and-mirror happens at write time, so the simulator still
+  generates and discards chrY PAR variants. Slight CPU waste per
+  cohort run. A future PR could skip PAR regions on chrY at sim
+  time entirely.
+- **Cohort BCF still carries the wrong chrY PAR data.** Per-person
+  VCFs are correct (the user-visible output), but the intermediate
+  cohort BCF stays diploid-everywhere with independent X/Y PAR
+  simulation. Same scope deferral as M13.3's cohort-BCF note.
 
 #### M13.5 — MT clonal inheritance ⏳
 

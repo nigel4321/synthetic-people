@@ -27,6 +27,7 @@ from syntheticgen.builds import (  # noqa: E402
     GRCH37_PAR_REGIONS,
     GRCH38_PAR_REGIONS,
     is_in_par,
+    par_x_to_y_pos,
     ploidy_for,
 )
 
@@ -157,6 +158,61 @@ class PloidyForTest(unittest.TestCase):
             ploidy_for("1", "male")
         with self.assertRaises(ValueError):
             ploidy_for("X", "")
+
+
+class ParXToYPosTest(unittest.TestCase):
+    """M13.4: chrX PAR position → chrY PAR position translation.
+    Used by ``write_person_vcf`` to mirror chrX PAR variants onto
+    chrY at the build-correct coordinate. Lock the math on both
+    PARs of both builds so a future PAR-table update doesn't
+    silently break the mirror.
+    """
+
+    def test_grch38_par1_is_identity(self):
+        # GRCh38 PAR1: chrX 10_001-2_781_479 ↔ chrY 10_001-2_781_479.
+        # Same start bp on both chroms, so translation is no-op.
+        self.assertEqual(par_x_to_y_pos(10_001, "GRCh38"), 10_001)
+        self.assertEqual(par_x_to_y_pos(2_781_479, "GRCh38"), 2_781_479)
+        self.assertEqual(par_x_to_y_pos(1_000_000, "GRCh38"), 1_000_000)
+
+    def test_grch38_par2_offset_translation(self):
+        # GRCh38 PAR2: chrX 155_701_383-156_030_895 (span 329_513 bp)
+        # ↔ chrY 56_887_903-57_217_415 (same span, different start).
+        # Offset = Y_start - X_start = 56_887_903 - 155_701_383 =
+        # -98_813_480. So X→Y subtracts that amount.
+        self.assertEqual(
+            par_x_to_y_pos(155_701_383, "GRCh38"), 56_887_903,
+        )
+        self.assertEqual(
+            par_x_to_y_pos(156_030_895, "GRCh38"), 57_217_415,
+        )
+        # Midpoint sanity check.
+        self.assertEqual(
+            par_x_to_y_pos(155_800_000, "GRCh38"),
+            56_887_903 + (155_800_000 - 155_701_383),
+        )
+
+    def test_grch37_par1_offset_translation(self):
+        # GRCh37 PAR1 differs between X and Y:
+        # X 60_001-2_699_520, Y 10_001-2_649_520. Same span
+        # (2_639_520 bp) but X starts at 60_001 while Y starts at
+        # 10_001 — translation has a -50_000 offset.
+        self.assertEqual(par_x_to_y_pos(60_001, "GRCh37"), 10_001)
+        self.assertEqual(par_x_to_y_pos(2_699_520, "GRCh37"), 2_649_520)
+
+    def test_returns_none_outside_par(self):
+        # chrX non-PAR position → no chrY mirror.
+        self.assertIsNone(
+            par_x_to_y_pos(80_000_000, "GRCh38"),
+        )
+        # Position before PAR1 (theoretical — chrX starts at 1).
+        self.assertIsNone(par_x_to_y_pos(1, "GRCh38"))
+        # Position between PAR1 and PAR2.
+        self.assertIsNone(par_x_to_y_pos(100_000_000, "GRCh38"))
+
+    def test_returns_none_for_unknown_build(self):
+        # Defensive: future custom build without par_regions.
+        self.assertIsNone(par_x_to_y_pos(1_000_000, "CHM13"))
 
 
 if __name__ == "__main__":

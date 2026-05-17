@@ -115,6 +115,47 @@ def is_in_par(chrom: str, pos: int, build: str) -> bool:
     return False
 
 
+def par_x_to_y_pos(x_pos: int, build: str) -> int | None:
+    """Translate a chrX PAR position to its corresponding chrY PAR
+    position (M13.4 PAR1/PAR2 copy mechanism).
+
+    PAR1 and PAR2 are regions where the sequence on chrX and chrY is
+    biologically IDENTICAL — that's why they recombine in male
+    meiosis. A variant at any chrX PAR position should also exist at
+    the corresponding chrY PAR position. The coordinate translation
+    is build-specific:
+
+    - **GRCh38 PAR1**: chrX 10_001-2_781_479 maps 1-to-1 to chrY
+      10_001-2_781_479 (the assembly defines them at identical bp).
+    - **GRCh38 PAR2**: chrX 155_701_383-156_030_895 maps to chrY
+      56_887_903-57_217_415 — same span (329_512 bp) but at the end
+      of each chromosome's distinct length, so coordinates differ
+      by a fixed offset.
+    - **GRCh37**: PAR1 chrX 60_001-2_699_520 vs chrY 10_001-2_649_520
+      — both spans have the same length but DIFFERENT start bp on
+      X vs Y, so even PAR1 needs translation. PAR2 same pattern.
+
+    Returns the chrY coordinate when ``x_pos`` is in either PAR;
+    returns ``None`` for any chrX position outside both PAR ranges
+    (caller should treat as "no chrY mirror needed for this site").
+    """
+    par_regions = BUILDS.get(build, {}).get("par_regions", {})
+    x_pars = par_regions.get("X", [])
+    y_pars = par_regions.get("Y", [])
+    # PARs are listed in the same order on both chroms (PAR1 then
+    # PAR2). If the data tables ever diverge, the assertion below
+    # surfaces it rather than silently mis-translating.
+    if len(x_pars) != len(y_pars):
+        return None
+    for (x_lo, x_hi), (y_lo, y_hi) in zip(x_pars, y_pars):
+        if x_lo <= x_pos <= x_hi:
+            # Offset translation: same span on Y, possibly different
+            # start. For GRCh38 PAR1, x_lo == y_lo so the offset is
+            # zero and the translation is a no-op.
+            return y_lo + (x_pos - x_lo)
+    return None
+
+
 def ploidy_for(
     chrom: str, sex: str, build: str = "GRCh38",
     pos: int | None = None,

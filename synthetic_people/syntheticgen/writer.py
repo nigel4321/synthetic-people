@@ -8,7 +8,7 @@ import subprocess
 from pathlib import Path
 
 from .background import alt_dosages
-from .builds import BUILDS, ploidy_for
+from .builds import BUILDS, is_in_par, par_x_to_y_pos, ploidy_for
 from .errors import (
     DEFAULT_DROPOUT_RATE,
     DEFAULT_GT_ERROR_RATE,
@@ -94,6 +94,53 @@ def write_person_vcf(out_path: Path, person: dict, build: str,
     records.append((person["highlighted"], person["highlighted"]["gt"], True))
     for bg in person["background"]:
         records.append((bg, bg["gt"], False))
+
+    # M13.4 PAR1/PAR2 copy mechanism. PAR sequence is biologically
+    # identical between chrX and chrY (that's why they recombine in
+    # male meiosis), so a variant at any chrX PAR position must also
+    # exist at the corresponding chrY PAR position in males. Today's
+    # simulator generates chrX and chrY independently, so:
+    #
+    #   1. Drop any chrY records the simulator produced in PAR — they
+    #      diverge from chrX PAR variants and are biologically wrong.
+    #   2. For males, mirror each chrX PAR record onto chrY at the
+    #      translated position (``par_x_to_y_pos``). The clone keeps
+    #      the same GT, REF, ALT, INFO — the only differences are
+    #      ``chrom`` and ``pos``. The clone is never marked as the
+    #      highlighted record (only the original chrX copy carries
+    #      ``HIGHLIGHT``); otherwise downstream consumers would see
+    #      two highlighted rows for one biological variant.
+    #   3. Females don't get a chrY mirror — chrY is absent in females
+    #      (ploidy_for chrY/f → 0; M13.3 already drops chrY entirely).
+    #
+    # Without M13.4 the chrY PAR records in male VCFs would carry
+    # independently-simulated genotypes that contradict the chrX PAR
+    # at the same locus — a known fidelity gap that downstream
+    # PAR-aware tools would catch.
+    if sex is not None:
+        records = [
+            r for r in records
+            if not (r[0]["chrom"] == "Y"
+                    and is_in_par("Y", r[0]["pos"], build))
+        ]
+        if sex == "m":
+            mirrors: list[tuple[dict, str, bool]] = []
+            for variant, gt, _is_hi in records:
+                if variant["chrom"] != "X":
+                    continue
+                if not is_in_par("X", variant["pos"], build):
+                    continue
+                y_pos = par_x_to_y_pos(variant["pos"], build)
+                if y_pos is None:
+                    continue
+                y_variant = dict(variant)
+                y_variant["chrom"] = "Y"
+                y_variant["pos"] = y_pos
+                # PAR mirror is never the highlighted variant — the
+                # original chrX copy carries HIGHLIGHT, and the chrY
+                # row is just the biological consequence.
+                mirrors.append((y_variant, gt, False))
+            records.extend(mirrors)
     records.sort(key=lambda r: _contig_sort_key(
         r[0]["chrom"], r[0]["pos"], contig_order))
 

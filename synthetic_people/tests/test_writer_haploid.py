@@ -149,9 +149,17 @@ class WritePersonVcfHaploidTest(unittest.TestCase):
         # AN must reflect ploidy 1.
         self.assertEqual(y[0]["an"], "1")
 
-    def test_male_chry_par_emits_diploid_gt(self):
-        # GRCh38 chrY PAR1: 10_001-2_781_479. pos=1_000_000 is in
-        # PAR; PAR is diploid in males so GT stays "X|Y".
+    def test_male_chry_par_input_records_are_dropped(self):
+        # M13.4 changes the semantics: chrY PAR records from the
+        # simulator are now dropped (they'd diverge from the
+        # biologically-identical chrX PAR variants). Without a
+        # chrX PAR input to mirror from, the male VCF has no chrY
+        # PAR records at all.
+        #
+        # PAR diploid emission is now exercised via chrX PAR
+        # records being mirrored onto chrY — see
+        # ``test_male_chrx_par_mirrored_onto_chry`` in
+        # ``WritePersonVcfParCopyTest`` below.
         person = {
             "sample_id": "m002",
             "highlighted": _record("22", 1_000_000, "0|0"),
@@ -159,9 +167,10 @@ class WritePersonVcfHaploidTest(unittest.TestCase):
         }
         out = _write_and_read(self.dir, person, sex="m")
         y = [r for r in out if r["chrom"] == "Y"]
-        self.assertEqual(len(y), 1)
-        self.assertIn("|", y[0]["gt"])
-        self.assertEqual(y[0]["an"], "2")
+        self.assertEqual(
+            len(y), 0,
+            "chrY PAR record from simulator must be dropped (M13.4)",
+        )
 
     # --- ploidy=1: chrX non-PAR in males → haploid ---
 
@@ -237,6 +246,155 @@ class WritePersonVcfHaploidTest(unittest.TestCase):
                     self.assertIn("|", r["gt"],
                                   f"non-diploid GT on autosome: {r}")
                     self.assertEqual(r["an"], "2")
+
+
+@unittest.skipUnless(_HAVE_BCFTOOLS and _HAVE_BGZIP and _HAVE_TABIX,
+                     "bcftools + bgzip + tabix required")
+class WritePersonVcfParCopyTest(unittest.TestCase):
+    """M13.4: PAR1 / PAR2 copy mechanism. chrX PAR variants are
+    mirrored onto chrY at the build-correct translated position
+    for males; chrY PAR records from the simulator are dropped;
+    females are unchanged (chrY entirely absent).
+
+    These tests exercise the post-record-assembly pre-emission
+    transformation in ``write_person_vcf`` end-to-end (write →
+    ``bcftools view -H`` → assert chrom/pos pairs)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_male_chrx_par1_mirrored_onto_chry(self):
+        # GRCh38 PAR1: chrX 10_001-2_781_479 ↔ chrY 10_001-2_781_479
+        # (identical bp on this build). A chrX PAR1 variant must
+        # appear on chrY at the same position in males.
+        person = {
+            "sample_id": "m_par1",
+            "highlighted": _record("22", 1_000_000, "0|0"),
+            "background": [_record("X", 1_000_000, "0|1")],
+        }
+        out = _write_and_read(self.dir, person, sex="m")
+        x = [r for r in out if r["chrom"] == "X"]
+        y = [r for r in out if r["chrom"] == "Y"]
+        self.assertEqual(len(x), 1, "chrX original must survive")
+        self.assertEqual(len(y), 1, "chrY mirror must be emitted")
+        # Same position (PAR1 maps 1:1 on GRCh38).
+        self.assertEqual(y[0]["pos"], 1_000_000)
+        # Same GT, diploid, AN=2 (PAR in male is diploid).
+        self.assertEqual(y[0]["gt"], x[0]["gt"])
+        self.assertEqual(y[0]["an"], "2")
+
+    def test_male_chrx_par2_mirrored_with_offset(self):
+        # GRCh38 PAR2: chrX 155_701_383-156_030_895 ↔ chrY
+        # 56_887_903-57_217_415. The lengths match but the start
+        # positions don't, so the mirror needs an offset translation.
+        # pos=155_800_000 on chrX → expected chrY pos:
+        #   56_887_903 + (155_800_000 - 155_701_383) = 56_986_520
+        person = {
+            "sample_id": "m_par2",
+            "highlighted": _record("22", 1_000_000, "0|0"),
+            "background": [_record("X", 155_800_000, "0|1")],
+        }
+        out = _write_and_read(self.dir, person, sex="m")
+        y = [r for r in out if r["chrom"] == "Y"]
+        self.assertEqual(len(y), 1)
+        self.assertEqual(y[0]["pos"], 56_986_520)
+
+    def test_male_chrx_non_par_NOT_mirrored_onto_chry(self):
+        # chrX non-PAR has no counterpart on chrY — it's a male-
+        # specific X region. No chrY mirror should be emitted.
+        person = {
+            "sample_id": "m_nonpar",
+            "highlighted": _record("22", 1_000_000, "0|0"),
+            "background": [_record("X", 80_000_000, "0|1")],
+        }
+        out = _write_and_read(self.dir, person, sex="m")
+        y = [r for r in out if r["chrom"] == "Y"]
+        self.assertEqual(len(y), 0, f"chrY mirror leaked from non-PAR: {y}")
+
+    def test_female_chrx_par_NOT_mirrored_onto_chry(self):
+        # Females have no chrY at all (M13.3 drops it). The PAR
+        # mirror must NOT reintroduce chrY for them.
+        person = {
+            "sample_id": "f_par",
+            "highlighted": _record("22", 1_000_000, "0|0"),
+            "background": [_record("X", 1_000_000, "0|1")],
+        }
+        out = _write_and_read(self.dir, person, sex="f")
+        chroms = {r["chrom"] for r in out}
+        self.assertNotIn("Y", chroms,
+                         f"chrY mirror leaked into female VCF: {out}")
+
+    def test_male_chry_par_from_simulator_dropped(self):
+        # A chrY PAR record from independent simulator output must
+        # be dropped, because PAR is supposed to be IDENTICAL to
+        # chrX PAR — the independent simulator value would diverge.
+        # Without any chrX PAR record to mirror from, the male VCF
+        # has no chrY PAR records.
+        person = {
+            "sample_id": "m_y_par_only",
+            "highlighted": _record("22", 1_000_000, "0|0"),
+            "background": [_record("Y", 1_000_000, "0|1")],
+        }
+        out = _write_and_read(self.dir, person, sex="m")
+        y = [r for r in out if r["chrom"] == "Y"]
+        self.assertEqual(len(y), 0)
+
+    def test_male_chry_par_replaced_by_chrx_par_mirror(self):
+        # Both inputs present: chrX PAR + chrY PAR at the same
+        # position. The chrY input is dropped; the chrX value is
+        # mirrored. Net effect: chrY records carry the chrX GT,
+        # not the original chrY GT.
+        person = {
+            "sample_id": "m_both_par",
+            "highlighted": _record("22", 1_000_000, "0|0"),
+            "background": [
+                _record("X", 1_000_000, "0|1"),  # X PAR1 variant
+                _record("Y", 1_000_000, "1|1"),  # different GT
+            ],
+        }
+        out = _write_and_read(self.dir, person, sex="m")
+        y = [r for r in out if r["chrom"] == "Y"]
+        self.assertEqual(len(y), 1)
+        # GT comes from the chrX record (0|1), not the dropped chrY
+        # input (which was 1|1).
+        self.assertEqual(y[0]["gt"], "0|1")
+
+    def test_male_chry_non_par_preserved(self):
+        # Non-PAR chrY records (which only exist on chrY, no chrX
+        # counterpart) are NOT dropped by M13.4 — M13.3's haploid
+        # emission handles them. Pin that here so a future refactor
+        # doesn't over-aggressively drop non-PAR Y too.
+        person = {
+            "sample_id": "m_y_nonpar",
+            "highlighted": _record("22", 1_000_000, "0|0"),
+            "background": [_record("Y", 20_000_000, "0|1")],  # non-PAR
+        }
+        out = _write_and_read(self.dir, person, sex="m")
+        y = [r for r in out if r["chrom"] == "Y"]
+        self.assertEqual(len(y), 1)
+        # Haploid (M13.3) — not "|"-separated.
+        self.assertNotIn("|", y[0]["gt"])
+
+    def test_no_par_copy_when_sex_unset(self):
+        # Back-compat: sex=None should preserve pre-M13.4 behaviour
+        # — chrY records pass through, no chrX-to-chrY mirroring.
+        person = {
+            "sample_id": "anon",
+            "highlighted": _record("22", 1_000_000, "0|0"),
+            "background": [
+                _record("X", 1_000_000, "0|1"),  # chrX PAR — would mirror in male
+                _record("Y", 1_000_000, "1|1"),  # chrY PAR — would be dropped in any-sex
+            ],
+        }
+        out = _write_and_read(self.dir, person, sex=None)
+        y = [r for r in out if r["chrom"] == "Y"]
+        # The original chrY record survives — no PAR drop.
+        self.assertEqual(len(y), 1)
+        self.assertEqual(y[0]["gt"], "1|1")
 
 
 class HighlightedRecordReachesVcfTest(unittest.TestCase):
