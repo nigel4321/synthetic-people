@@ -162,10 +162,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- per-sample summaries ---
     # ``build`` is plumbed into summarise_vcf so the M13.2 sex-
-    # chromosome counters get the correct PAR / non-PAR split. Falls
-    # back to None for pre-M13.1 batches whose manifest doesn't carry
-    # ``build``; the gates report "skipped" in that case rather than
-    # mis-counting.
+    # chromosome counters get the correct PAR / non-PAR split, AND
+    # into cohort_sex_chrom_gates so the y_het_in_males gate can
+    # skip cleanly when PAR coordinates aren't known. Falls back to
+    # None for pre-M13.1 batches whose manifest doesn't carry
+    # ``build``; the Y-het gate reports "skipped" (PAR-vs-non-PAR
+    # undecidable) while female_y_absence + mt_no_heterozygous still
+    # run because they don't depend on PAR.
     build = manifest.get("build") if manifest else None
     samples = []
     for v in person_vcfs:
@@ -206,7 +209,9 @@ def main(argv: list[str] | None = None) -> int:
         sample_sex = dict(zip(manifest["samples"], manifest["sex"]))
     else:
         sample_sex = None
-    sex_chrom_gates = cohort_sex_chrom_gates(samples, sample_sex)
+    sex_chrom_gates = cohort_sex_chrom_gates(
+        samples, sample_sex, build=build,
+    )
     for gate_name in ("y_het_in_males", "female_y_absence",
                       "mt_no_heterozygous"):
         gate = sex_chrom_gates.get(gate_name, {})

@@ -250,6 +250,28 @@ def _gt_dosage(gt: str) -> int:
     return (1 if a > 0 else 0) + (1 if b > 0 else 0)
 
 
+def _gt_is_heterozygous(gt: str) -> bool:
+    """True iff ``gt`` is a diploid call whose two allele indices differ.
+
+    Distinct from ``_gt_dosage(gt) == 1`` because ``_gt_dosage`` is a
+    per-ALT collapse that misses multi-allelic heterozygotes: a
+    ``1|2`` call has dosage 2 (both haplotypes non-ref) but is still
+    heterozygous in the literal "two different alleles" sense, and
+    that's what the M13.2 sex-chromosome gates need to flag.
+
+    Returns False for dropouts, haploid calls (single allele field —
+    e.g. post-M13.3 male chrY non-PAR), and unparseable input. The
+    strictly defensive interpretation is the right one here: a
+    record we can't classify shouldn't trip a regression gate.
+    """
+    if "." in gt:
+        return False
+    parts = gt.replace("/", "|").split("|")
+    if len(parts) != 2:
+        return False
+    return parts[0] != parts[1]
+
+
 def summarise_vcf(
     vcf_path: Path, name: str | None = None,
     build: str | None = None,
@@ -319,7 +341,6 @@ def summarise_vcf(
             s.sv_by_type[svtype] += 1
 
         # Dosage / het-hom / dropout
-        is_het = False
         if _is_dropout(rec.gt):
             s.n_dropout += 1
             chrom_bucket["n_dropout"] += 1
@@ -331,15 +352,23 @@ def summarise_vcf(
             elif d == 1:
                 s.n_het += 1
                 chrom_bucket["n_het"] += 1
-                is_het = True
             elif d == 2:
                 s.n_hom_alt += 1
                 chrom_bucket["n_hom_alt"] += 1
 
-        # M13.2 sex-chromosome gate counters. Normalise the chrom
-        # spelling (FASTA-side ``chr22`` vs cli's ``22``) before
-        # comparing — the cli emits unprefixed names today but VCFs
-        # from external tools may use either convention.
+        # M13.2 sex-chromosome gate counters. Use allele-pair
+        # comparison (not dosage) for ``is_het`` so multi-allelic
+        # heterozygotes like ``1|2`` get counted — those have
+        # ``_gt_dosage(...) == 2`` because both haplotypes are non-
+        # ref, but they're still heterozygous in the strict "two
+        # different alleles" sense the sex-chrom gates care about.
+        is_het = _gt_is_heterozygous(rec.gt)
+        # Normalise the chrom spelling. Two pre-existing conventions:
+        # (a) chr prefix on / off — cli emits ``22`` / ``Y``, FASTA-
+        # native VCFs use ``chr22`` / ``chrY``; (b) MT contig name —
+        # GRCh38 uses ``MT``, UCSC-style uses ``M`` / ``chrM``. The
+        # ``_SPECIAL_ORDER = {"MT": 25, "M": 25}`` table below treats
+        # both as mitochondrial; match that here.
         chrom_norm = rec.chrom[3:] if rec.chrom.startswith("chr") else rec.chrom
         if chrom_norm == "Y":
             s.n_y_records += 1
@@ -351,7 +380,7 @@ def summarise_vcf(
                 s.n_y_non_par_records += 1
                 if is_het:
                     s.n_y_non_par_het += 1
-        elif chrom_norm == "MT":
+        elif chrom_norm in ("MT", "M"):
             s.n_mt_records += 1
             if is_het:
                 s.n_mt_het += 1
@@ -474,6 +503,7 @@ def cohort_chrom_stats(samples: Iterable[SampleStats]) -> dict:
 def cohort_sex_chrom_gates(
     samples: Iterable[SampleStats],
     sample_sex: dict[str, str] | None,
+    build: str | None = None,
 ) -> dict:
     """M13.2: aggregate the three sex-chromosome validation gates.
 
@@ -484,14 +514,19 @@ def cohort_sex_chrom_gates(
 
     Args:
       samples: per-person ``SampleStats`` from ``summarise_vcf``.
-        Each one must have been produced with ``build=...`` passed
-        through, otherwise the PAR / non-PAR split is meaningless
-        and the function reports ``status="skipped"``.
       sample_sex: ``{sample_name: "m"|"f"}`` from the manifest's
         top-level ``sex`` list (parallel-indexed to ``samples``).
-        Pass ``None`` for legacy pre-M13.1 batches; the function
+        Pass ``None`` for legacy pre-M13.1 batches; every gate
         reports ``status="skipped"`` because the sex labels are
         what determines which gate applies to which sample.
+      build: reference build (``"GRCh37"`` / ``"GRCh38"``), needed
+        for the PAR / non-PAR split on chrY. When ``None``, the
+        ``y_het_in_males`` gate reports ``status="skipped"`` because
+        PAR positions can't be distinguished — a chrY het in PAR is
+        legitimate in males (PAR is diploid), so without PAR
+        coordinates we'd risk a false fail. The other two gates
+        (female_y_absence, mt_no_heterozygous) don't depend on PAR
+        and still run.
 
     Returns a dict with three sub-results, each shaped like::
 
@@ -501,12 +536,13 @@ def cohort_sex_chrom_gates(
           ... gate-specific counters ...
         }
 
-    Plus a top-level ``"sample_sex_known": bool`` to make the skip
-    reason discoverable in the JSON.
+    Plus top-level ``"sample_sex_known": bool`` + ``"build": str|None``
+    to make skip reasons discoverable in the JSON.
     """
     if sample_sex is None:
         return {
             "sample_sex_known": False,
+            "build": build,
             "y_het_in_males": {
                 "status": "skipped",
                 "summary": "no manifest.sex (pre-M13.1 batch)",
@@ -552,6 +588,16 @@ def cohort_sex_chrom_gates(
         mt_het += s.n_mt_het
 
     def _gate_y_het() -> dict:
+        if build is None:
+            return {
+                "status": "skipped",
+                "summary": "no build available — can't distinguish "
+                           "PAR (diploid in males, het allowed) from "
+                           "non-PAR (haploid in males, het is a "
+                           "regression)",
+                "non_par_records": male_y_non_par,
+                "heterozygous_records": male_y_non_par_het,
+            }
         if male_y_non_par == 0:
             return {
                 "status": "skipped",
@@ -561,10 +607,10 @@ def cohort_sex_chrom_gates(
                 "heterozygous_records": 0,
             }
         het_frac = male_y_non_par_het / male_y_non_par
-        # Tolerance: post-M13.3 the rate should be exactly 0. Any
-        # non-trivial fraction is a regression. We use 1 % to absorb
-        # any future floating-point or edge-case noise without
-        # accepting silent regressions.
+        # Post-M13.3 haploid emission means chrY non-PAR records carry
+        # a single allele field, so ``_gt_is_heterozygous`` returns
+        # False for every record by definition. The pass criterion is
+        # exact zero — no floating-point noise to absorb.
         passed = male_y_non_par_het == 0
         return {
             "status": "pass" if passed else "fail",
@@ -619,6 +665,7 @@ def cohort_sex_chrom_gates(
 
     return {
         "sample_sex_known": True,
+        "build": build,
         "y_het_in_males": _gate_y_het(),
         "female_y_absence": _gate_female_y(),
         "mt_no_heterozygous": _gate_mt(),
