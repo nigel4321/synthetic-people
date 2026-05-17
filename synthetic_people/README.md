@@ -177,9 +177,9 @@ Every per-person VCF picks up a handful of SVs by default:
 Type mix: ~50% `DEL`, ~30% `DUP`, ~20% `INV`. `INFO/SVLEN` is negative
 for `DEL` and positive for `DUP` / `INV`; `INFO/END = POS + |SVLEN|`;
 `INFO/CIPOS = -50,50` (every SV is currently flagged "imprecise").
-Anchor `REF` is a random standard base — the real GRCh38 reference
-isn't on disk in M8; M11 will wire the reference FASTA in for
-exact-anchor reporting.
+Anchor `REF` is the real base from the build's reference FASTA when
+M12 is active (default since 2026-05-14); pass `--no-reference-fasta`
+to fall back to the legacy fabricated-REF path.
 
 `out/manifest.json` gains an `svs` block recording per-person count,
 length range, and cohort-total SVs emitted; per-person entries record
@@ -201,7 +201,7 @@ the truth-state DP/AD have been drawn:
 |---|---|
 | `--error-rate 0.001` | Probability of a per-call genotype flip (false positive / negative). 0 disables. |
 | `--dropout-rate 0.0005` | Probability of a coverage dropout. Emits `./.:0:0:0,0`. 0 disables. |
-| `--art` | Heavy path: ART read simulation + `bcftools call`. Currently rejected with a clear message; needs the M11 GRCh38 reference FASTA. |
+| `--art` | Heavy path: ART read simulation + `bcftools call`. Currently rejected with a clear message; wiring it on is a separate workstream — M12 ships the FASTA cache but the ART pipeline itself isn't hooked up yet. |
 
 Mechanics: GT is perturbed *after* the AD draw, so the recomputed GQ
 reflects the disagreement between reads and call. Hom→het is the
@@ -739,12 +739,12 @@ INV — with proper VCF 4.2 symbolic ALTs and the full SV INFO tag set.
 `generate_person_svs(rng, chromosomes, chrom_length_bp, n_svs,
 length_min_bp, length_max_bp)` draws lengths log-uniformly on
 [min, max] (default 50 bp – 10 kb) with type weights 50/30/20%
-(DEL/DUP/INV). Anchor `REF` is a single standard base placeholder —
-the real GRCh38 FASTA isn't loaded in M8. SVs are emitted as part of
-each person's `background` record list and flow through the standard
-writer, which detects `variant["svtype"]` and emits
-`SVTYPE / SVLEN / END / CIPOS` after the AC/AN/AF/HIGHLIGHT/CLNSIG
-fields.
+(DEL/DUP/INV). Anchor `REF` was a placeholder in M8; M12
+(2026-05-14, default-on) now uses the real base from the GRCh38
+FASTA when active. SVs are emitted as part of each person's
+`background` record list and flow through the standard writer,
+which detects `variant["svtype"]` and emits `SVTYPE / SVLEN / END
+/ CIPOS` after the AC/AN/AF/HIGHLIGHT/CLNSIG fields.
 
 3-person × 1 Mb chr22 exit check (seed 42,
 `--svs-per-person 5`): each VCF carries exactly 5 SVs;
@@ -767,8 +767,9 @@ one allele to REF. `maybe_dropout` zeros DP/AD/GQ and emits `./.`.
 
 Writer threads `error_rate`, `dropout_rate`, and an optional `stats`
 dict; CLI accumulates per-person counters into a manifest `errors`
-block. Heavy-path `--art` is gated and rejected for now: it needs
-the M11 GRCh38 reference FASTA to feed read simulation.
+block. Heavy-path `--art` is gated and rejected for now: M12 ships
+the FASTA cache but the ART pipeline itself hasn't been wired up
+yet.
 
 3-person × 1 Mb chr22 exit check (seed 42, `--error-rate 0.01
 --dropout-rate 0.005`): **realised FDR 1.55%** vs requested 1.50%;
@@ -851,37 +852,81 @@ noise BEDs carry 0–2 rows. Manifest exposes the new
 `golden_bed` / `noise_bed` / `n_golden` / `n_noise` fields per
 person.
 
+### M12 — Reference-aware REF (default-on since 2026-05-14)
+
+`syntheticgen/reference.py` wraps `pysam.FastaFile` loading +
+chromosome-name resolution (`"22"` / `"chr22"` either way), + a
+preflight `validate_fasta` check that catches "wrong FASTA" before
+the simulator runs. The cli auto-fetches the build's Ensembl primary
+FASTA into `<--cache-dir>/reference/<build>.fa` on first run and
+reuses the cache on subsequent runs (same two-stage `.part` rename
+pattern as ClinVar; idempotent). `--no-reference-fasta` opts out for
+smoke runs / seed-pinned tests that don't need real REF; explicit
+`--reference-fasta <path>` (or the YAML field
+`cohort.reference_fasta`) is the override for users with a FASTA
+already on disk.
+
+All four REF-picking sites in the simulator (materialised path,
+streaming pass 1 + 2, admixture inline producer) route through a
+shared `_pick_ref` helper that consults the FASTA when present and
+falls back to `rng.choice("ACGT")` otherwise. The rng draw happens
+unconditionally so the master rng's consumption order stays stable
+between paths — only the REF/ALT *content* changes, not the
+simulator's downstream rng trajectory.
+
+Validation gate: `validate_batch.py --reference-fasta <fa>` runs
+`bcftools norm --check-ref w` and reports mismatches. Pre-M12 the
+gate failed on every record (fabricated REF); post-M12 with the
+auto-fetched FASTA, a passing run is empirical evidence the wiring
+works.
+
+### M13.1 — Sex assignment foundation (shipped 2026-05-15)
+
+`builds.py` gains PAR1 / PAR2 coordinate tables for GRCh37 + GRCh38
+and the helpers `is_in_par(chrom, pos, build)` and `ploidy_for(chrom,
+sex, build, pos)`. `ploidy_for` returns 2 for autosomes; 2 for chrX
+in females; 1 for chrX non-PAR in males (2 inside PAR); 0 for chrY
+in females (chromosome absent); 1 for chrY non-PAR in males (2
+inside PAR); 1 for MT in both sexes; 2 by default for any unknown
+contig.
+
+Per-person sex is drawn from a dedicated rng (seeded from the
+master `--seed` XOR'd with a fixed salt for integer seeds; OS
+entropy when `--seed` is omitted) so the master rng is **not**
+advanced — a fixed-seed run reproduces pre-M13.1 simulator output
+bit-for-bit. The draw rate is controlled by `--male-fraction`
+(default 0.5; CLI ↔ YAML `cohort.male_fraction` in lock-step per the
+standard `cli > config > defaults` precedence). Sexes are persisted
+in `cohort.meta.json` (schema v2; pre-existing meta files surface as
+`ResumeMismatch` so the user runs `--no-resume` once to migrate)
+and exposed on the manifest as a top-level `sex: ["m", "f", ...]`
+list parallel-indexed to `samples` (always present regardless of
+`--mode`).
+
+**No simulation behaviour change yet** — every chromosome is still
+treated as diploid; M13.3 will wire ploidy / PAR / MT clonality
+into the producers. M13.1 lays the data + helpers + per-person
+sex disclosure.
+
 ---
 
 ## Test suite
 
-206 tests across twelve files; all passing with deps installed.
+650+ tests; all passing with deps installed. Full count + per-file
+scorecard live in `TEST_SUITE_REVIEW.md` (kept current).
 
 ```bash
 cd synthetic_people && ../.venv/bin/python -m unittest discover -s tests -v
 ```
 
-Without msprime / stdpopsim / demes / tskit / matplotlib / sklearn
-installed, the corresponding tests skip cleanly and **165/165**
-remaining still pass (`test_overlays.py`, `test_sv.py`,
-`test_errors.py`, and `test_truth.py` are pure-Python; numpy-only
-validate tests still run if numpy is on PATH; matplotlib/sklearn-gated
-subset of `test_validate.py` skips when those deps are absent).
-
-| File | Count | Coverage |
-|---|---|---|
-| `test_quality.py` | 12 | Poisson DP distribution, bi/multi-allelic AD (`sum==DP`, ref-bias on `0\|1` / `0\|2`, 50/50 split on `1\|2`), GQ range, depth-dependent cap, genotype consistency |
-| `test_multiallelic.py` | 5 | Bi-allelic HWE reduction, multi-allelic categorical, `1\|2`-style het rate, per-alt dosage vectors |
-| `test_titv.py` | 14 | Transition-partner table, transversion enumeration, case-insensitivity, `titv_ratio` corner cases (empty / no-Tv / indel skip), `choose_alt` uniformity, convergence at targets 0.5 / 1.0 / 2.1 / 3.0 (±5%), parameter validation |
-| `test_sfs.py` | 16 | `draw_minor_count` range + near-uniform at α→0, singleton fraction >55% at default α = 2.0, `draw_allele_counts` total bound, histogram aggregation, TSV round-trip, parameter validation |
-| `test_cohort.py` | 14 | `assign_haplotypes` exact-count preservation, random-slot placement, overflow rejection, cohort reproducibility under seed, every-site-variable invariant, coord-sharing across people, hom-ref drop-out |
-| `test_coalescent.py` | 10 | Output shape, monotone positions, realised AC = declared AC, no fixed sites, seed reproducibility, Ti/Tv ∈ [1.7, 2.6], multi-chromosome, error on unknown chromosome, stdpopsim end-to-end (`skipUnless` on msprime/stdpopsim import) |
-| `test_admixture.py` | 13 | Demography proportion validation, UK 3-ancestor topology, sites + per-person segments shape, full-chromosome coverage, realised AC = declared AC, BED round-trip, ancestry-fraction normalisation + empty input, multi-chromosome, seed reproducibility, aggregate ancestry tracks requested 60/25/15 within ±15% (`skipUnless` on msprime/demes/tskit import) |
-| `test_overlays.py` | 23 | ClinVar `annotate` (collision match, alt mismatch, no-match returns 0); ClinVar `inject` (density count, GT-block preservation, post-sort invariant, off-chromosome skip, zero-density no-op); rsID `_normalise_rsid` (ID-prefixed, bare-digit, INFO/RS fallback, semicolon and comma lists, missing-returns-empty); rsID `inject_rsids` (density, GT preservation, sort invariant, reserve_indices exclusion, zero-density no-op); COSMIC inject (ID + gene + REF/ALT swap, zero-density no-op); ClinVar + rsID overlay disjointness via reserve_indices |
-| `test_sv.py` | 22 | `_draw_length` log-uniform skew + bounds + collapsed-range + invalid-range; `_build_sv_record` SVLEN sign by type, anchor base validity, CIPOS default, unknown-SVTYPE rejection; `generate_person_svs` count, zero-returns-empty, well-formed records, length bounds honoured, END inside chrom span, multi-chromosome distribution, type distribution within ±0.07 of (0.50, 0.30, 0.20), seed reproducibility, different-seed divergence, too-small-chrom and empty-chromosome rejection |
-| `test_errors.py` | 18 | `maybe_flip_gt` zero/negative-rate no-op, full-rate always-flips, realised flip rate ~1% on 10k draws, biallelic-only flip targets, hom→het 0.7-weight bias, het 0|1 50/50 split between hom-ref and hom-alt, `1\|2` multi-allelic collapse to REF, unparseable GT pass-through, seed reproducibility; `maybe_dropout` zero/full-rate, realised rate, seed reproducibility; `new_error_stats` shape, `merge_stats` in-place add + missing-key seeding; default-constants lock-in |
-| `test_validate.py` | 39 | `_parse_info` empty / single / multiple / flag forms; SNV / indel / SV classification; GT dosage hom-ref/het/hom-alt/multi-allelic/missing; dropout detection; Ti/Tv aggregation + zero-Tv + empty corner cases; Het/Hom ratio + zero-hom + zero-both; indel/SV aggregation; AF histogram bin placement + empty; `_r2_pair` perfect-corr / perfect-anticorr / uncorrelated / constant-vector / few-samples / missing-mask; `ld_decay` shape + short-vs-long ordering; cohort PCA on a clear 2-cluster signal (PC1 > 95% variance) + insufficient-columns guard; PNG smoke tests for every plot helper (LD / AF / indel / PCA-handles-None) |
-| `test_truth.py` | 20 | `classify_golden` priority (HIGHLIGHTED > CLINVAR > COSMIC > SV > RSID), `.` clnsig treated as missing, unannotated row returns None, GOLDEN_CATEGORIES priority lock-in; `golden_bed_line` half-open SNV interval, deletion ref-extends-end, SV uses explicit end, payload escapes tab / semicolon / newline, ClinVar payload carries clnsig / clndn; `noise_bed_line` flip records both GTs, dropout records `./.`; `TruthBedWriter` sorts by `(contig_order, chrom, start)` on close, count tracking, context-manager protocol, empty writer creates empty files, parent-dir creation |
+The suite skips cleanly on hosts without msprime / stdpopsim / demes
+/ tskit / matplotlib / sklearn; the pure-Python subset
+(`test_overlays.py`, `test_sv.py`, `test_errors.py`,
+`test_truth.py`, plus numpy-only validate paths) still passes.
+`pysam` became a hard dep in M12 (auto-fetch + `pysam.FastaFile`
+mmap loader), and `pyarrow` is installed explicitly in CI so the
+`@skipUnless(HAS_PYARROW, ...)` arrow-streaming round-trip / parity
+tests don't silently hide failures.
 
 Per-milestone exit check: `nextflow_pipeline/bin/qc_validate.py --vcf
 <person.vcf.gz> --name <id> --out <out.json> --strict` (exit 1 on any
@@ -891,19 +936,28 @@ hard failure).
 
 ## Known gaps
 
-Tracked in `IMPLEMENTATION_PLAN.md`:
+Tracked in `IMPLEMENTATION_PLAN.md` and `DATA_QUALITY_ASSESSMENT.md`
+(the latter holds the M-numbered roadmap):
 
+- **Sex-chromosome ploidy not yet applied** — M13.1 (2026-05-15)
+  ships per-person sex assignment + PAR / ploidy lookup helpers,
+  but every chromosome is still simulated as diploid. M13.3 wires
+  the ploidy lookup into the producers so chrX non-PAR / chrY /
+  MT emit haploid GTs. M13.2 (validation gates) lands first.
 - **Heavy `--art` path** — ART read simulation + `bcftools call`
-  is gated and exits with a clear message. Wiring it on requires the
-  GRCh38 reference FASTA on disk (multi-GB download); deferred until
-  there's a concrete need beyond the lightweight noise model.
-- **Exact SV anchor REF** — currently a random standard base
-  placeholder; same FASTA dependency as `--art`.
+  is gated and exits with a clear message. M12 ships the FASTA
+  cache so the dep is in place; the ART pipeline itself isn't
+  hooked up yet.
 - **HapMap recombination map** — coalescent path uses uniform
   recombination, so short-range r² caps at ~0.55 vs the spec's
   aspirational 0.9. `HapMapII_GRCh38` hit a stdpopsim "missing data"
   error on sub-chromosome regions; revisit when running full-chrom
-  sims.
+  sims. M14 will revisit alongside the context-aware μ work.
+- **Mutation spectrum is degenerate today** — Tier 2 #5
+  (2026-05-15) ships the 96-channel spectrum diagnostic; today's
+  `BinaryMutationModel` produces a flat-ish distribution. M14
+  will swap to `JC69` + per-trinucleotide-context μ and the
+  spectrum should then match COSMIC SBS1.
 
 ## CLI reference
 
@@ -927,7 +981,10 @@ Tracked in `IMPLEMENTATION_PLAN.md`:
 | `--sv-length-max` | [M8] Maximum SV length in bp | `10000` |
 | `--error-rate` | [M9] Per-call probability of a GT flip (lightweight noise model) | `0.001` |
 | `--dropout-rate` | [M9] Per-call probability of a coverage dropout (`./.:0:0:0,0`) | `0.0005` |
-| `--art` | [M9, heavy] ART read simulation + `bcftools call`. Currently rejected; needs M11 reference FASTA | `False` |
+| `--art` | [M9, heavy] ART read simulation + `bcftools call`. Currently rejected; M12 ships the FASTA cache but the ART pipeline itself isn't wired up yet | `False` |
+| `--reference-fasta` | [M12] Path to a reference FASTA matching `--build`. When unset (default), the cli auto-fetches the Ensembl primary assembly into `<--cache-dir>/reference/<build>.fa` on first run | `None` (auto-fetch) |
+| `--no-reference-fasta` | [M12] Opt out of the auto-fetch + auto-load; emitted REF reverts to `rng.choice("ACGT")` legacy path. Useful for smoke runs / seed-pinned tests | `False` |
+| `--male-fraction` | [M13.1] Probability each person is drawn as male. `0.2` → ~20% male, `0.8` → ~80% male. Must be in `[0.0, 1.0]` | `0.5` |
 | `--chromosomes` | [coalescent] List, range, or mix (e.g. `22`, `19,20,21,22`, `1-22`, `1-3,5,19-22,X`) | `22` |
 | `--chr-length-mb` | [coalescent] Simulated prefix per chrom | `5.0` |
 | `--demo-model` | [coalescent] stdpopsim model id; `none` for uniform | `OutOfAfrica_3G09` |

@@ -86,7 +86,8 @@ The phases compose, not compete:
 | **5f'** | Constant-term chunk-RAM calibration (open) | Auto-derate sees per-worker constant cost | None — bug fix |
 | **5g.1/.2 ✓** | **Batched per-person fanout extraction** | Fanout ~10× fewer bcftools invocations | None — drop-in |
 | **5g.3** | Disk-spilled fanout batch handoff (planned) | Decouples B from W RAM ceiling | +staging disk |
-| **5d.1** | Streaming-mmap cohort intermediate (Apache Arrow) — viability spikes ✓ | **`n = 1M`** — parent RAM becomes O(1) per variant | New dep (`pyarrow`) + ~200-300 GB scratch disk per chrom |
+| **5d.1 ✓** | **Streaming-mmap cohort intermediate (Apache Arrow)** | **`n = 1M`** — parent RAM becomes O(1) per variant | New dep (`pyarrow`) + ~200-300 GB scratch disk per chrom |
+| **bcftools merge ✓** | `--threads min(4, workers)` on cohort merge + index | Cohort merge wall ~1.3-2× faster at real-cohort scale | None — drop-in (PR #89) |
 | **5d.2** | Direct binary BCF via pysam (optional) | Writer throughput at `n = 1M+` | New compiled dep |
 | **6** | **SQLite for side-state (truth / ancestry / manifest)** | Filesystem at 100k | +schema |
 
@@ -1582,8 +1583,16 @@ product call from the user first.
 
 ## Phase 5d — streaming-mmap cohort intermediate (path to n=1M)
 
-**Status (2026-05-09):** **viability spikes complete; both PASSED.
-Phase 5d.1 implementation green-lit.**
+**Status (2026-05-15):** **Phase 5d.1 shipped.** `--cohort-mode
+arrow-streaming` is in production; the cli + cohort writer code
+paths under `syntheticgen/cohort_arrow*.py` + `bcf_writer.py`
+implement the streamed mmap'd Arrow IPC handoff described in this
+section. Phase 5d.2 (pysam direct BCF writer) remains optional —
+ship only after measuring whether the BCF-write phase is still
+>25 % of cohort wall at n=100k+ in production.
+
+**Original status note (2026-05-09):** viability spikes complete;
+both PASSED. Phase 5d.1 implementation green-lit.
 
 Scope expanded substantially after memprof26 demonstrated that
 Phase 5e Phase A's "parent holds the sites list, workers fork-share

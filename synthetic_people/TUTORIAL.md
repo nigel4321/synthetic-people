@@ -34,6 +34,7 @@ are written to be run from the repository root
 8. [Reproducibility and seeding](#8-reproducibility-and-seeding)
 9. [Performance and scaling](#9-performance-and-scaling)
 10. [Configuration files (optional)](#10-configuration-files-optional)
+    - 10½. [Reference FASTA, sex assignment, mutation spectrum](#10-reference-fasta-sex-assignment-mutation-spectrum)
 11. [Troubleshooting](#11-troubleshooting)
 12. [Glossary](#12-glossary)
 
@@ -135,6 +136,20 @@ out_hello/validation/
 └── pca.png
 ```
 
+Pass `--reference-fasta` to `validate_batch.py` (or rely on the same
+cached FASTA the cli's M12 default-on path uses) and you also get:
+
+```
+out_hello/validation/
+└── mutation_spectrum.json         ← Tier 2 #5: 96-channel SNV
+                                      spectrum (deferred: SBS1 cosine
+                                      similarity, bar-chart plot)
+```
+
+…plus a `ref_check` entry in `summary.json` reporting whether
+`bcftools norm --check-ref` passes against the FASTA (it should
+post-M12; pre-M12 it failed on every record by construction).
+
 The `manifest.json` is the canonical index. Read it whenever you need
 to know what happened in a run:
 
@@ -149,7 +164,19 @@ print('FDR  :', m['errors']['realised_fdr'])"
 
 Per-person entries surface the highlighted ClinVar variant, ancestry
 fractions (admixture mode), realised error counts, and the paths to
-the truth BEDs.
+the truth BEDs. The manifest's top-level `sex` field is a list of
+`"m"` / `"f"` strings, parallel-indexed to `samples` — added by
+M13.1 (2026-05-15). Inspect with:
+
+```bash
+.venv/bin/python -c "import json; m=json.load(open('out_hello/manifest.json'));
+print('males :', sum(s=='m' for s in m['sex']));
+print('females :', sum(s=='f' for s in m['sex']))"
+```
+
+Note: M13.1 records sex but the simulator still treats every
+chromosome as diploid. M13.3 will wire the ploidy lookup into the
+producers (haploid chrY in males, chrY absent in females, etc.).
 
 ---
 
@@ -1220,6 +1247,89 @@ unknown schema versions with a clear message, so a future incompat-
 ible change can never silently mis-interpret an old config — you'll
 be told to update the schema and check the changelog. Today the
 only supported value is `1`.
+
+---
+
+## 10½. Reference FASTA, sex assignment, mutation spectrum
+
+Recent milestones added a handful of cohort-level knobs that don't
+fit cleanly under any §5 recipe. This section is the cheat sheet.
+
+### Reference FASTA — `--reference-fasta` (M12, default-on)
+
+Since 2026-05-14 the cli auto-fetches the build's Ensembl primary
+FASTA into `<--cache-dir>/reference/<build>.fa` on first run and
+reuses the cache afterwards. Every emitted `REF` is the real base
+at that position, so output VCFs pass `bcftools norm --check-ref`.
+
+```bash
+# Default — auto-fetches (~900 MB compressed, ~3 GB decompressed)
+# on first run. Reuses cache afterwards.
+.venv/bin/python synthetic_people/generate_people.py \
+    --n 5 --seed 42 \
+    --chromosomes 22 --chr-length-mb 0.5 \
+    --cache-dir ~/.cache/synthetic-people-data
+
+# Skip the auto-fetch entirely (smoke runs, seed-pinned tests, CI
+# matrices where the 3 GB FASTA would dominate wall time):
+.venv/bin/python synthetic_people/generate_people.py \
+    --n 5 --seed 42 --no-reference-fasta \
+    --chromosomes 22 --chr-length-mb 0.5
+
+# Bring your own FASTA (already on disk, with a .fai index next to it):
+.venv/bin/python synthetic_people/generate_people.py \
+    --n 5 --seed 42 \
+    --reference-fasta /path/to/GRCh38.fa
+```
+
+YAML equivalent: `cohort.reference_fasta: /path/to/GRCh38.fa` (set
+to `null` to use auto-fetch, the default). There's no YAML field for
+`--no-reference-fasta` — pass that on the CLI.
+
+### Sex assignment — `--male-fraction` (M13.1)
+
+```bash
+# Balanced cohort (default — equivalent to omitting the flag)
+--male-fraction 0.5
+
+# Mostly female (20 % male)
+--male-fraction 0.2
+
+# Mostly male (80 % male)
+--male-fraction 0.8
+```
+
+Validation: must be a finite float in `[0.0, 1.0]`; out-of-range
+values fail at parse time. The drawn sexes land in
+`manifest.json[sex]` parallel-indexed to `samples`. The simulator
+itself doesn't yet use sex (M13.1 is foundation-only); M13.3 will
+wire it through ploidy / PAR / MT clonality.
+
+YAML equivalent: `cohort.male_fraction: 0.2` — CLI wins on conflict
+per the standard `cli > config > defaults` precedence. Changing
+`male_fraction` between runs against the same `--output-dir`
+triggers `ResumeMismatch` (it's part of the cohort identity); pass
+`--no-resume` to migrate.
+
+### Mutation spectrum — `validate_batch.py --reference-fasta` (Tier 2 #5)
+
+When you pass `--reference-fasta` to `validate_batch.py`, the
+validator also emits `mutation_spectrum.json` — a 96-channel
+trinucleotide-context binning of every biallelic SNV in the cohort
+BCFs. Useful for M14 development (today the distribution is
+roughly flat; post-M14 with `JC69` + per-trinucleotide-context μ
+it should match COSMIC SBS1).
+
+```bash
+.venv/bin/python validate_batch.py out_hello/ \
+    --reference-fasta ~/.cache/synthetic-people-data/reference/GRCh38.fa
+```
+
+Output: `out_hello/validation/mutation_spectrum.json` with 96
+entries in canonical SigProfiler order (`A[C>A]A`, `A[C>A]C`, …,
+`T[T>G]T`), each carrying `count` + `fraction`. Deferred to a
+follow-up PR: SBS1 cosine-similarity comparison + matplotlib bar
+chart + Markdown report section.
 
 ---
 
