@@ -292,6 +292,86 @@ Today's supported envelope, updated:
   user-side workaround: `chr_length_mb` ≤ 10, overlay density 0,
   `--mode cohort`).
 
+### 6.2 Empirical scaling ceiling for per-person fan-out (2026-05-19)
+
+§ 6.1 captured the *cohort-phase* ceiling at n=1M. A separate
+ceiling sits in the **per-person fan-out** that runs after the
+cohort BCFs are written. A user-driven run at **n=100 000**, full
+WGS (chromosomes 1-22 + X @ 70 Mb per chrom), `--cohort-mode
+arrow-streaming`, **completed the cohort phase in ~4 days** but
+the fan-out projected to **~4 years** at the default
+`--fanout-batch-size 4`:
+
+```
+person VCFs: 1/100,000 written
+  (0.0/s, elapsed 1h 3m 58s, eta 106601h 12m 43s)
+```
+
+Retry with `--fanout-batch-size 100 --workers 12` was OOM-killed
+during stage B pool spawn; dmesg `Killed process … anon-rss:
+30 GB` per worker, `constraint=CONSTRAINT_NONE, global_oom`.
+
+Root cause is **algorithmic, not representational**, and is
+separate from the § 6.1 cohort-phase ceiling:
+
+1. `derive_persons_batch` (`cohort_derivation.py:131`) scans
+   the full cohort BCF set **once per batch**. At
+   `n / B = 100k / 4 = 25 000` batches × ~64 min/batch the
+   wall time is quadratic in `n` because cohort BCF size is
+   itself linear in `n`.
+2. Bigger `B` doesn't help past a small ceiling because of the
+   CPython refcount-defeats-fork-COW pattern: every PyObject's
+   refcount header lives in the same page as object data, so
+   read access in workers writes to the page and COW promotes
+   it to private. Real per-worker anon-RSS at B=100 was ~30 GB
+   — the OOM-killer observed it correctly.
+
+**The fix is Phase 5g.4 — single-pass cohort-to-person dispatch**
+(planned; see `PERFORMANCE_PLAN.md` §5g.4). Scans cohort BCFs
+exactly once total during the per-person phase, writes per-person
+staging streams as it goes, then per-person workers consume their
+local staging files. Expected wall time at n=100k drops from
+~3 years → ~1–3 days (~500–1000× speedup). The dominant cost
+after 5g.4 lands is per-person VCF emit CPU, which is local and
+parallel.
+
+**Data-quality contract for 5g.4: byte-equivalence with the
+current `arrow-streaming` fan-out.** The dispatch refactor only
+changes how records are *routed* between cohort and per-person
+VCFs; the simulator's stochastic content (msprime ancestry,
+per-person seeds, DP/GQ/AD noise model, MT lineage carrier
+draws, SV overlay placement) is untouched. The validation gate
+on PR-B is empty per-person VCF diff at n=100 and n=1000
+between `arrow-streaming` and the new `dispatch` mode. **The
+PR does not merge until that diff is empty.**
+
+Standing risks to track during implementation (each is a
+quality-degradation surface if mishandled — none are inherent
+to the algorithm):
+
+- M13.5 MT clonal-inheritance carve-out must be preserved
+  (every MT record reaches every person regardless of
+  simulator GT).
+- `afs=[None]` shape must survive staging so
+  `write_person_vcf`'s MT lineage fallback (AF=0.1) still
+  fires on the dispatch path.
+- Full `_INFO_FIELDS_TO_CARRY` set must carry through staging,
+  or ClinVar / COSMIC / SV overlay metadata silently drops.
+- Per-person record ordering must remain genome-sorted to
+  preserve RNG-state determinism inside `write_person_vcf`.
+
+Today's supported envelope for **fan-out**, updated:
+
+- **n ≤ ~10 000, full WGS, default fanout settings** —
+  comfortable; current `derive_persons_batch` path completes
+  in hours.
+- **n ≤ ~50 000, full WGS** — requires manual tuning
+  (`--fanout-batch-size` up, `--workers` down) and the
+  `gc.freeze()` quick-win patch (PR-C of Phase 5g.4) to stay
+  within a 32 GB RAM ceiling. Days-to-weeks wall time.
+- **n ≥ ~100 000** — needs Phase 5g.4 dispatch. Without it,
+  the fan-out is months-to-years even at optimal tuning.
+
 ---
 
 ## 7. Proposal — prioritised roadmap
