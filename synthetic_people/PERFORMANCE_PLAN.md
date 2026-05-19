@@ -1579,6 +1579,314 @@ product call from the user first.
   requirement; troubleshooting section for "fanout phase running
   out of disk".
 
+### Phase 5g.4 — single-pass cohort-to-person dispatch (planned)
+
+**Goal:** break the per-batch full-cohort-BCF scan that makes the
+current fan-out quadratic in `n`. After 5g.4, the cohort BCFs are
+scanned exactly **once total** during the per-person phase
+(regardless of `n`), and per-person VCFs are emitted from local
+staging streams.
+
+**Branch (when implementation starts):**
+`perf/phase5g.4-dispatch-prototype`
+
+#### Why this supersedes 5g.3
+
+Phase 5g.3 spills the *batch* dict to disk so that B and W can
+grow on small-RAM hosts. That's useful at n ≤ 10k where the
+per-batch scan cost is small relative to wall time. **It does not
+help at n ≥ 50k** because the dominant cost is the cohort BCF
+scan itself, which is repeated `n / B` times. At n=100k the
+per-batch wall time is ~60–80 min regardless of B (it's I/O- and
+decode-bound on the full cohort); making B bigger reduces batch
+*count*, not batch *cost*. 5g.4 eliminates the batch-and-rescan
+loop entirely.
+
+If engineering bandwidth is constrained, **skip 5g.3 in favor of
+5g.4.** 5g.3's disk-spill becomes architecturally redundant once
+5g.4 lands (the dispatch path never holds a batch dict in
+parent RAM in the first place). 5g.3 was sized for n=3k–10k
+users; 5g.4 is the n=100k+ path.
+
+#### The user observation that triggered this
+
+**Reported run (2026-05-18):** `--n 100000 --chr-length-mb 70
+--chromosomes 1-22,X --cohort-mode arrow-streaming` on a 32 GB
+host. Cohort phase completed in ~4 days. Per-person fan-out
+projected to **~4 years** at the default `--fanout-batch-size 4`:
+
+```
+person VCFs: 1/100,000 written
+  (0.0/s, elapsed 1h 3m 58s, eta 106601h 12m 43s)
+```
+
+User retry with `--fanout-batch-size 100 --workers 12` was OOM-
+killed during stage B pool spawn. Memprofile and dmesg
+confirmed the failure mode:
+
+| Event | Value |
+|---|---|
+| Parent RSS after stage A extract (B=100) | 29.4 GB |
+| Apparent total RSS at pool spawn (12 fork-children) | 382 GB |
+| Per-OOM-killed-worker `anon-rss` | 30.1 GB |
+| dmesg `constraint` | `CONSTRAINT_NONE, global_oom` |
+
+The fork-COW pages did not stay shared. CPython's per-object
+refcount header is in the same page as the object data, so every
+read access bumps the refcount and writes the page, which COW
+promotes to private within seconds of worker startup. Realistic
+fork-pool budget on a small-RAM host is therefore:
+
+```
+RAM_GB ≳ (1 + n_workers) × per_person_GB × B + ~4 GB system
+```
+
+**At the per-person bundle size measured in this run (~0.29 GB
+at n=100k × 70 Mb × 23 chroms):**
+
+| Workers | Safe B on 32 GB host | Batches | ETA |
+|---|---|---|---|
+| 1 | ~40 | 2,500 | ~111 days |
+| 4 | ~15 | 6,667 | ~296 days |
+| 12 | ~5 | 20,000 | ~890 days |
+
+Maximum B is what controls wall time (per-batch scan time is
+~constant in B), so **`workers=1, B=as-high-as-RAM-allows`** is
+the optimal tuning *for the current algorithm.* On a 32 GB host
+that yields ~4 months — the algorithmic floor today.
+
+#### Cheap parallel quick-win — `gc.freeze()` (Phase 5g.4.0)
+
+Before the dispatch refactor lands, a 3-line patch to
+`cli.py:_run_cohort_streamed` can recover a meaningful chunk of
+the lost COW sharing. Pattern:
+
+```python
+import gc
+# parent: just before pool spawn
+gc.collect()
+gc.freeze()
+with ProcessPoolExecutor(...) as ex:
+    ...
+```
+
+`gc.freeze()` (Python 3.7+) marks all currently-tracked objects
+as permanent so the garbage collector stops traversing them.
+Most of the refcount writes that defeat fork-COW come from GC
+generational sweeps, not from data access. Realistic gain on
+this workload: **~30–50 % more effective B for the same RAM**,
+i.e. roughly **2× speedup on small-RAM hosts** by enabling
+larger batches.
+
+This is a low-risk PR that can ship in days and is
+architecturally independent of 5g.4. **Ship it as
+`perf/gc-freeze-fanout` separately.** Caveats: workers still
+write refcounts on data access (e.g. `dict[key]` lookup bumps
+the looked-up value's refcount), so the win is partial; and any
+mutation of frozen objects post-freeze defeats it, so the
+`batch_backgrounds` build must complete before the freeze call.
+
+#### Architecture (Phase 5g.4 main work)
+
+1. **Dispatch pass (single scan).**
+   `dispatch_cohort_to_staging(cohort_bcf_paths, sample_ids,
+   staging_dir, chunk_chrom_at_a_time=True)` runs:
+   ```
+   bcftools query -s s1,s2,...,sN \
+     -f '%CHROM\t%POS\t%ID\t%REF\t%ALT\t%INFO[\t%GT]\n' \
+     cohort.chr<X>.bcf
+   ```
+   once **per chromosome BCF, with all N sample IDs in
+   `-s`**, not split into batches. Each row is parsed and the
+   per-sample GTs are dispatched into per-person append-mode
+   writers. Records the same per-person record shape that the
+   current `derive_persons_batch` parser emits.
+
+2. **Staging format.** One file per (person, chrom) for the
+   chunked variant; or one file per person for the non-chunked
+   variant. Compact packed binary preferred over TSV — per-
+   record cost ~12 bytes (4-byte pos + 1-byte GT + small
+   per-record payload) instead of the ~30 bytes a TSV line costs.
+   At n=100k × ~830k records/person that's ~10 GB total staging
+   (chunked) vs ~2.5 TB without chunking.
+
+3. **Per-chrom dispatch chunking.** Default mode: dispatch chr1,
+   emit chr1 fragment for every person, delete chr1 staging, then
+   chr2, etc. Each per-person final VCF is assembled from per-
+   chrom bgzip fragments via `bcftools concat` at the end. Peak
+   staging disk: ~per-chrom slice ≈ 400–800 GB at n=100k WGS.
+   With aggressive compression (zstd or bgzip on staging
+   fragments) that drops to ~200–400 GB.
+
+4. **FD-limit handling.** Opening 100k staging file handles
+   simultaneously exceeds typical `ulimit -n` of 1024–4096.
+   Dispatch in rotating windows of ~1000 persons at a time per
+   chrom-scan-pass; on a window flush, close the window's
+   writers and open the next 1000. Each chrom is rescanned per
+   window, so for a 1000-wide window at n=100k that's 100
+   re-scans per chrom (~25 chroms × 100 = 2500 scans total).
+   Even this is **vastly better** than today's `n / B` ≈ 25,000
+   re-scans at B=4. If the user has bumped `ulimit -n` to 1M,
+   collapse to a single window and a single scan per chrom.
+
+5. **Per-person VCF emit (stage B).** Workers each read their
+   own staging file(s), parse into the record dict shape that
+   `write_person_vcf` already consumes, and emit the per-person
+   VCF with DP/GQ/AD noise model layered identically to today.
+   Staging files are deleted on worker success.
+
+#### Expected wall time at n=100k
+
+| Phase | Approximate wall time | Bound |
+|---|---|---|
+| Cohort scan (single pass, all chroms) | ~5–15 min | NVMe sequential I/O |
+| Dispatch + staging write | ~1–3 hours | Sequential write of ~10 GB (chunked + compressed) |
+| Per-person VCF emit (parallel) | ~12–48 hours @ 8–16 workers | CPU on `write_person_vcf` |
+| **Total** | **~15–60 hours** | (vs ~3 years today) |
+
+**Order-of-magnitude: ~3 years → ~1–3 days. Roughly 500–1000×
+speedup.** The new bottleneck after 5g.4 is per-person VCF
+emit CPU (DP/GQ/AD draws + bgzip), which is exactly the right
+shape — local to each worker, parallelisable, doesn't scale
+with `n` per person.
+
+#### Disk cost
+
+| Mode | Peak staging disk | Notes |
+|---|---|---|
+| Per-chrom chunked + compressed | ~200–400 GB at n=100k WGS | Recommended default |
+| Per-chrom chunked, uncompressed | ~400–800 GB | Trade CPU for disk |
+| Whole-genome staging | ~2.5 TB at n=100k WGS | Avoid; only viable with very large scratch |
+| Whole-genome compressed | ~1 TB | Acceptable if disk is cheaper than per-chrom concat CPU |
+
+At n=1M the chunked-compressed numbers scale linearly: ~2–4 TB
+peak. Surface this clearly in `--help` and the docs.
+
+#### Data quality
+
+**Zero loss if implemented correctly. Output should be byte-
+identical to the current path.** The simulator's randomness
+(msprime, person_seeds, DP/GQ/AD noise, MT lineage carrier
+draws) is entirely determined by inputs that don't change.
+5g.4 only changes how records are *routed* between cohort BCFs
+and per-person VCFs.
+
+Implementation hazards that **must** be preserved or quality
+degrades:
+
+1. **Record ordering** — per-person records must reach
+   `write_person_vcf` in the same chrom/pos order as today.
+   Genome-sorted output from `bcftools query` per-chrom ensures
+   this trivially.
+2. **M13.5 MT clonal-inheritance contract** — every MT record
+   must reach every person regardless of original simulator GT
+   (`cohort_derivation.py:230-239`). The dispatch path must
+   carve MT out of the hom-ref skip filter exactly the same way.
+3. **`afs=[None]` semantics** — `write_person_vcf`'s MT lineage
+   carrier fallback (AF=0.1) depends on the `afs=[None]` shape
+   that today's `derive_persons_batch` emits. Staging must
+   preserve this field.
+4. **INFO field carriage** — staging must carry the full
+   `_INFO_FIELDS_TO_CARRY` set (`CLNSIG`, `CLNDN`, `COSMIC_ID`,
+   `COSMIC_GENE`, `SVTYPE`, `SVLEN`, `END`, `CIPOS`). Dropping
+   any of these silently degrades ClinVar / COSMIC / SV
+   overlay fidelity.
+5. **Resume determinism** — partial-then-restart must reproduce
+   identical record ordering. Keyed on (chrom, pos, alt_idx)
+   yields trivially identical content; checkpoint after each
+   chrom's dispatch completes.
+
+**Validation harness** is the gating criterion for ship:
+n=100 and n=1000 runs with `--cohort-mode arrow-streaming` and
+`--cohort-mode dispatch` produce **byte-identical** per-person
+VCFs (or, less strictly, identical (chrom, pos, ref, alt, GT,
+INFO) tuples per person). PR-B does not merge until the diff
+is empty across both n sizes.
+
+#### Phase 5g.4 tasks
+
+##### PR-A: `perf/phase5g.4-dispatch-prototype`
+
+- [ ] **`syntheticgen/cohort_dispatch.py` (new module):**
+  - `dispatch_cohort_to_staging(cohort_bcf_paths, sample_ids,
+    staging_dir, *, chunked=True, window_size=None)` — single-
+    pass scan and dispatch to per-person staging.
+  - `read_person_staging(staging_path) -> list[dict]` —
+    consumer that returns the same record-dict shape today's
+    `derive_persons_batch` returns.
+  - Compact packed staging format with `_INFO_FIELDS_TO_CARRY`
+    preserved.
+- [ ] **`syntheticgen/cli.py`:** new `--cohort-mode dispatch`
+  choice. When selected, replace the `_run_cohort_streamed`
+  per-batch loop with the dispatch+consume pipeline.
+- [ ] **`syntheticgen/resume.py`:** bump `_SCHEMA_VERSION` to 4.
+  Add `dispatch_state: dict[str, str]` (per-chrom dispatch
+  status: `pending` / `staged` / `consumed`). Preserve all v3
+  fields. Migration from v3 = "treat unknown dispatch_state as
+  empty, restart dispatch from scratch."
+- [ ] **`tests/test_cohort_dispatch.py`:**
+  - byte-equivalence against `derive_persons_batch` at n=10
+    and n=100 (the load-bearing test for "zero quality loss")
+  - per-chrom resume mid-dispatch
+  - disk-full mid-dispatch surfaces a clear error, no partial
+    staging silently left behind
+  - FD-limit handling: forced low ulimit (e.g. `resource.setrlimit`)
+    completes via window rotation
+  - MT carve-out preserved (same-lineage record-set contract
+    pinned by existing M13.5 tests)
+  - `afs=[None]` carry-through preserved (MT lineage fallback
+    still fires)
+  - `_INFO_FIELDS_TO_CARRY` full set carried (ClinVar / COSMIC /
+    SV overlay metadata round-trips)
+
+##### PR-B: `perf/phase5g.4-validation-and-promote` (stacked on PR-A)
+
+- [ ] **Larger-scale validation:** n=1000 byte-diff run vs
+  `arrow-streaming`; record the result in
+  `DATA_QUALITY_ASSESSMENT.md`.
+- [ ] **Benchmark numbers in this doc:** measured wall time at
+  n=10k and n=100k on the project's reference hardware.
+- [ ] **`--cohort-mode auto` promotion:** at `n ≥ 50000` (or
+  configurable threshold), auto picks `dispatch` over
+  `arrow-streaming`. Lower thresholds stay on `arrow-streaming`
+  until the dispatch path has more bake time.
+- [ ] **Docs:** README + TUTORIAL updates for the new mode and
+  staging-disk requirement; troubleshooting section for "dispatch
+  phase out of disk" and "FD limit too low."
+- [ ] **`PERFORMANCE_PLAN.md` revision:** flip 5g.4 status to
+  "shipped" with measured numbers; mark 5g.3 as superseded.
+
+##### PR-C: `perf/gc-freeze-fanout` (independent, can ship first)
+
+- [ ] **`syntheticgen/cli.py`:** add `gc.collect(); gc.freeze()`
+  before the `ProcessPoolExecutor` spawn in
+  `_run_cohort_streamed`'s stage B.
+- [ ] **`tests/test_cli_modes.py`:** smoke test that fan-out
+  still completes at n=10 with the freeze in place. Behavioral
+  parity, no determinism break.
+- [ ] **Note in this doc:** measured RAM savings on a small
+  reference run; updated effective-B table on a 32 GB host.
+
+#### Out of scope for 5g.4
+
+- **Per-person VCF emit speedup** (the new bottleneck after
+  5g.4). The `draw_site_quality` Knuth-poisson Python loop is
+  the next target — `numpy.random.poisson(lam, n)` is ~5–7×
+  faster, but breaks bit-exact reproducibility against today's
+  golden hashes (numpy's RNG stream differs from `random.Random`).
+  Tracked as a candidate future PR; needs a product call on
+  whether bit-exact replay matters more than wall-clock.
+- **In-memory Arrow transpose alternative** (the "Option 2"
+  we considered). Avoids disk staging but reintroduces the
+  memory-pressure failure mode the dispatch path was designed
+  to escape. **Explicitly ruled out** for the n=100k+ workload
+  this phase targets, per user direction (2026-05-19).
+- **Single-pass dispatch directly from msprime tree sequence**
+  (skipping cohort BCFs entirely). Would cut another ~4 days
+  off the n=100k path but requires re-plumbing the cohort →
+  overlay → per-person pipeline. Track as a future Phase 6+
+  candidate after 5g.4 has settled.
+
 ---
 
 ## Phase 5d — streaming-mmap cohort intermediate (path to n=1M)
